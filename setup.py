@@ -247,14 +247,14 @@ class CMakeBuild(build_ext):
 
     def get_proton_cmake_args(self):
         cmake_args = self.get_pybind11_cmake_args()
-        cupti_include_dir = get_env_with_keys(["TRITON_CUPTI_INCLUDE_PATH"])
-        if cupti_include_dir == "":
-            cupti_include_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "include")
-        cmake_args += ["-DCUPTI_INCLUDE_DIR=" + cupti_include_dir]
-        roctracer_include_dir = get_env_with_keys(["TRITON_ROCTRACER_INCLUDE_PATH"])
-        if roctracer_include_dir == "":
-            roctracer_include_dir = os.path.join(get_base_dir(), "third_party", "amd", "backend", "include")
-        cmake_args += ["-DROCTRACER_INCLUDE_DIR=" + roctracer_include_dir]
+        # cupti_include_dir = get_env_with_keys(["TRITON_CUPTI_INCLUDE_PATH"])
+        # if cupti_include_dir == "":
+        #     cupti_include_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "include")
+        # cmake_args += ["-DCUPTI_INCLUDE_DIR=" + cupti_include_dir]
+        # roctracer_include_dir = get_env_with_keys(["TRITON_ROCTRACER_INCLUDE_PATH"])
+        # if roctracer_include_dir == "":
+        #     roctracer_include_dir = os.path.join(get_base_dir(), "third_party", "amd", "backend", "include")
+        # cmake_args += ["-DROCTRACER_INCLUDE_DIR=" + roctracer_include_dir]
         return cmake_args
 
     def build_extension(self, ext):
@@ -276,7 +276,7 @@ class CMakeBuild(build_ext):
             "-DCMAKE_MAKE_PROGRAM=" +
             ninja_dir,  # Pass explicit path to ninja otherwise cmake may cache a temporary path
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-            "-DLLVM_ENABLE_WERROR=ON",
+            "-DLLVM_ENABLE_WERROR=OFF",
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + extdir,
             "-DTRITON_BUILD_PYTHON_MODULE=ON",
             "-DPython3_EXECUTABLE:FILEPATH=" + sys.executable,
@@ -351,7 +351,9 @@ class CMakeBuild(build_ext):
         ]
         cmake_args += [f"-D{option}={os.getenv(option)}" for option in passthrough_args if option in os.environ]
 
-        if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+        if len([b for b in backends if b.name in ["nvidia", "amd"]]) == 0:
+            cmake_args += ["-DTRITON_BUILD_PROTON=OFF"]
+        elif check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
             cmake_args += self.get_proton_cmake_args()
 
         if is_offline_build():
@@ -370,7 +372,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd", "cpu"]), *BackendInstaller.copy_externals()]
+backends = [*BackendInstaller.copy(["cpu"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
@@ -418,7 +420,7 @@ def get_packages():
             for x in os.listdir(backend.tools_dir):
                 yield f"triton.tools.extra.{x}"
 
-    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+    if check_env_flag("TRITON_BUILD_PROTON", "ON") and len([b for b in backends if b.name in ["nvidia", "amd"]]) > 0:  # Default ON
         yield "triton.profiler"
 
 
@@ -457,7 +459,7 @@ def add_link_to_proton():
 
 def add_links(external_only):
     add_link_to_backends(external_only=external_only)
-    if not external_only and check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+    if not external_only and check_env_flag("TRITON_BUILD_PROTON", "ON") and len([b for b in backends if b.name in ["nvidia", "amd"]]) > 0:  # Default ON
         add_link_to_proton()
 
 
@@ -507,7 +509,7 @@ class plugin_sdist(sdist):
 
 def get_entry_points():
     entry_points = {}
-    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+    if check_env_flag("TRITON_BUILD_PROTON", "ON") and len([b for b in backends if b.name in ["nvidia", "amd"]]) > 0:  # Default ON
         entry_points["console_scripts"] = [
             "proton-viewer = triton.profiler.viewer:main",
             "proton = triton.profiler.proton:main",

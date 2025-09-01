@@ -120,6 +120,8 @@ class CPUBackend(BaseBackend):
         self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
         self.cpu_name = llvm.get_cpu_name()
         self.cpu_features = llvm.get_cpu_features()
+        print(f"Detected CPU: arch={self.cpu_arch}, name={self.cpu_name}, features={self.cpu_features}")
+        
         if 'amx-tile' in self.cpu_features:
             if not cpu.enable_amx():
                 import warnings
@@ -198,6 +200,9 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
         cpu.passes.ttcpuir.add_optimize_masks(pm)
         passes.common.add_canonicalizer(pm)
+
+        # FIXME ADD DOT_SCALED OP LOWERING ？
+
         if (ukernels := opt.get_ukernels()):
             # For further analysis simplification
             cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)
@@ -219,7 +224,7 @@ class CPUBackend(BaseBackend):
         if 'avx512f' in self.cpu_features:
             cpu.passes.ttcpuir.add_convert_dot_to_fma(pm)
         cpu.passes.ttcpuir.add_convert_dot_generic(pm)
-        promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
+        promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features 
         # We don't have any lowering for mixed precision matmuls, so always use casts for now
         convert_mixed_precision_matmul = True
         # We don't have math lib functions for FP8, FP16, BF16. Promote such operations to FP32.
@@ -262,7 +267,7 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_debug_ops_to_llvmir(pm)
 
         vec_lib_requirements = {
-            VecLib.libsleef: {"neon", "sse", "avx"},
+            VecLib.libsleef: {"neon", "sse", "avx", "rvv"},
             VecLib.libmvec: {"avx512f"},
         }
         if (vec_lib := options.get_vec_lib()) and vec_lib_requirements[vec_lib] & self.cpu_features:
@@ -291,6 +296,8 @@ class CPUBackend(BaseBackend):
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
+        
+        # TODO FIXME DOT_scaled lowering is not supported yet
         llvm_mod = llvm.to_module(mod, context)
         if llvm_mod is None:
             raise RuntimeError("Failed to convert to LLVM IR")
@@ -319,8 +326,10 @@ class CPUBackend(BaseBackend):
             lib_dirs = cpu_driver.library_dirs
             libs = ["m", "TritonCPURuntime", "sleef"]
             ccflags = []
+            # triton.runtime.build._build 函数
             so = _build("kernel", asm_path, tmpdir, lib_dirs, cpu_driver.include_dirs, libs, ccflags)
             with open(so, "rb") as f:
+                # 打开生成的 .so 文件，以二进制方式读取其内容并返回。
                 return f.read()
 
     def add_stages(self, stages, options, language):

@@ -52,7 +52,7 @@ def _build(name: str, src: str, srcdir: str, library_dirs: list[str], include_di
     if cc is None:
         clang = shutil.which("clang")
         gcc = shutil.which("gcc")
-        cc = gcc if gcc is not None else clang
+        cc = clang if clang is not None else gcc
         if cc is None:
             raise RuntimeError(
                 "Failed to find C compiler. Please specify via CC environment variable or set triton.knobs.build.impl.")
@@ -65,8 +65,18 @@ def _build(name: str, src: str, srcdir: str, library_dirs: list[str], include_di
     custom_backend_dirs = knobs.build.backend_dirs
     include_dirs = include_dirs + [srcdir, py_include_dir, *custom_backend_dirs]
     # for -Wno-psabi, see https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111047
-    cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
+    cc_cmd = [cc, src, "-v", "-O3", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
 
+    # Add architecture-specific flags from environment variables
+    # This is crucial for cross-compilation or when host detection fails.
+    cpu_arch = os.environ.get("TRITON_CPU_ARCH")
+    cpu_abi = os.environ.get("TRITON_CPU_ABI")
+    if cpu_arch:
+        cc_cmd.append(f"-march={cpu_arch}")
+    if cpu_abi:
+        cc_cmd.append(f"-mabi={cpu_abi}")
+
+    # TODO 恢复
     libraries += ["gcc"]
     # Use dynamic lookup to load Python library on Mac
     if system == "Darwin":
@@ -104,8 +114,23 @@ def _build(name: str, src: str, srcdir: str, library_dirs: list[str], include_di
         if system == "Linux" and machine in ("aarch64", "arm64"):
             # On Arm backend, some CPU (neoverse-v2) needs to be specified through -mcpu
             cc_cmd += ["-mcpu=native"]
+        if system == "Linux" and machine == "riscv64":
+            # On RISC-V backend, we always compile for rv64gc
+            cc_cmd += ["-march=rv64gcv"]
+            if cpu_abi is None:
+                # Default to lp64d if TRITON_CPU_ABI is not set
+                cc_cmd += ["-mabi=lp64d"]
+                cc_cmd += ["-mcpu=spacemit-x60"]
     cc_cmd.extend(ccflags)
-    subprocess.check_call(cc_cmd, stdout=subprocess.DEVNULL)
+
+    proc = subprocess.run(cc_cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        error_log = proc.stdout + proc.stderr
+        raise RuntimeError(
+            f"Failed to compile Triton kernel. The command was:\n"
+            f"{' '.join(cc_cmd)}\n\n"
+            f"The error was:\n{error_log}"
+        )
     return so
 
 

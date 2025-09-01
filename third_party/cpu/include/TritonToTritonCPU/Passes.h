@@ -19,7 +19,7 @@ namespace triton {
 namespace cpu {
 
 #define GEN_PASS_DECL
-#include "cpu/include/TritonToTritonCPU/Passes.h.inc"
+#include "TritonToTritonCPU/Passes.h.inc"
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertElementwiseOps();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertElemManipOps();
@@ -42,7 +42,7 @@ std::unique_ptr<OperationPass<ModuleOp>>
 createScalarizeUsingForOpPass(bool skipGatherScatter);
 
 #define GEN_PASS_REGISTRATION
-#include "cpu/include/TritonToTritonCPU/Passes.h.inc"
+#include "TritonToTritonCPU/Passes.h.inc"
 
 template <typename T, typename... Ts>
 constexpr bool is_one_of_v = (std::is_same_v<T, Ts> || ...);

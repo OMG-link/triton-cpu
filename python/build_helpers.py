@@ -312,107 +312,108 @@ def download_and_copy(name, src_func, dst_path, override_path, version, url_func
 
 
 def download_and_copy_dependencies(helper_args: BuildHelperArgs):
-    nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.json")
-    with open(nvidia_version_path, "r") as nvidia_version_file:
-        # parse this json file to get the version of the nvidia toolchain
-        nvidia_toolchain_version = json.load(nvidia_version_file)
+    pass
+    # nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.json")
+    # with open(nvidia_version_path, "r") as nvidia_version_file:
+    #     # parse this json file to get the version of the nvidia toolchain
+    #     nvidia_toolchain_version = json.load(nvidia_version_file)
 
-    exe_extension = sysconfig.get_config_var("EXE")
-    download_and_copy(
-        name="nvcc",
-        src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
-        dst_path="bin/ptxas",
-        override_path=helper_args.ptxas_path,
-        version=nvidia_toolchain_version["ptxas"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
+    # exe_extension = sysconfig.get_config_var("EXE")
+    # download_and_copy(
+    #     name="nvcc",
+    #     src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
+    #     dst_path="bin/ptxas",
+    #     override_path=helper_args.ptxas_path,
+    #     version=nvidia_toolchain_version["ptxas"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
 
-    # We download a separate ptxas for blackwell, since there are some bugs when using it for hopper
-    download_and_copy(
-        name="nvcc",
-        src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
-        dst_path="bin/ptxas-blackwell",
-        override_path=helper_args.ptxas_blackwell_path,
-        version=nvidia_toolchain_version["ptxas-blackwell"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cuobjdump",
-        src_func=lambda system, arch, version:
-        f"cuda_cuobjdump-{system}-{arch}-{version}-archive/bin/cuobjdump{exe_extension}",
-        dst_path="bin/cuobjdump",
-        override_path=helper_args.cuobjdump_path,
-        version=nvidia_toolchain_version["cuobjdump"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cuobjdump/{system}-{arch}/cuda_cuobjdump-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="nvdisasm",
-        src_func=lambda system, arch, version:
-        f"cuda_nvdisasm-{system}-{arch}-{version}-archive/bin/nvdisasm{exe_extension}",
-        dst_path="bin/nvdisasm",
-        override_path=helper_args.nvdisasm_path,
-        version=nvidia_toolchain_version["nvdisasm"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvdisasm/{system}-{arch}/cuda_nvdisasm-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    crt = "crt" if int(nvidia_toolchain_version["cudacrt"].split(".")[0]) >= 13 else "nvcc"
-    download_and_copy(
-        name="nvcc",
-        src_func=lambda system, arch, version: f"cuda_{crt}-{system}-{arch}-{version}-archive/include",
-        dst_path="include",
-        override_path=helper_args.cudacrt_path,
-        version=nvidia_toolchain_version["cudacrt"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_{crt}/{system}-{arch}/cuda_{crt}-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cudart",
-        src_func=lambda system, arch, version: f"cuda_cudart-{system}-{arch}-{version}-archive/include",
-        dst_path="include",
-        override_path=helper_args.cudart_path,
-        version=nvidia_toolchain_version["cudart"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/{system}-{arch}/cuda_cudart-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cupti",
-        src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/include",
-        dst_path="include",
-        override_path=helper_args.cupti_include_path,
-        version=nvidia_toolchain_version["cupti"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cupti",
-        src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/lib",
-        dst_path="lib/cupti",
-        override_path=helper_args.cupti_lib_path,
-        version=nvidia_toolchain_version["cupti"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cupti",
-        src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/lib",
-        dst_path="lib/cupti-blackwell",
-        override_path=helper_args.cupti_lib_blackwell_path,
-        version=nvidia_toolchain_version["cupti-blackwell"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
+    # # We download a separate ptxas for blackwell, since there are some bugs when using it for hopper
+    # download_and_copy(
+    #     name="nvcc",
+    #     src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
+    #     dst_path="bin/ptxas-blackwell",
+    #     override_path=helper_args.ptxas_blackwell_path,
+    #     version=nvidia_toolchain_version["ptxas-blackwell"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
+    # download_and_copy(
+    #     name="cuobjdump",
+    #     src_func=lambda system, arch, version:
+    #     f"cuda_cuobjdump-{system}-{arch}-{version}-archive/bin/cuobjdump{exe_extension}",
+    #     dst_path="bin/cuobjdump",
+    #     override_path=helper_args.cuobjdump_path,
+    #     version=nvidia_toolchain_version["cuobjdump"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cuobjdump/{system}-{arch}/cuda_cuobjdump-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
+    # download_and_copy(
+    #     name="nvdisasm",
+    #     src_func=lambda system, arch, version:
+    #     f"cuda_nvdisasm-{system}-{arch}-{version}-archive/bin/nvdisasm{exe_extension}",
+    #     dst_path="bin/nvdisasm",
+    #     override_path=helper_args.nvdisasm_path,
+    #     version=nvidia_toolchain_version["nvdisasm"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvdisasm/{system}-{arch}/cuda_nvdisasm-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
+    # crt = "crt" if int(nvidia_toolchain_version["cudacrt"].split(".")[0]) >= 13 else "nvcc"
+    # download_and_copy(
+    #     name="nvcc",
+    #     src_func=lambda system, arch, version: f"cuda_{crt}-{system}-{arch}-{version}-archive/include",
+    #     dst_path="include",
+    #     override_path=helper_args.cudacrt_path,
+    #     version=nvidia_toolchain_version["cudacrt"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_{crt}/{system}-{arch}/cuda_{crt}-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
+    # download_and_copy(
+    #     name="cudart",
+    #     src_func=lambda system, arch, version: f"cuda_cudart-{system}-{arch}-{version}-archive/include",
+    #     dst_path="include",
+    #     override_path=helper_args.cudart_path,
+    #     version=nvidia_toolchain_version["cudart"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/{system}-{arch}/cuda_cudart-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
+    # download_and_copy(
+    #     name="cupti",
+    #     src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/include",
+    #     dst_path="include",
+    #     override_path=helper_args.cupti_include_path,
+    #     version=nvidia_toolchain_version["cupti"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
+    # download_and_copy(
+    #     name="cupti",
+    #     src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/lib",
+    #     dst_path="lib/cupti",
+    #     override_path=helper_args.cupti_lib_path,
+    #     version=nvidia_toolchain_version["cupti"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
+    # download_and_copy(
+    #     name="cupti",
+    #     src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/lib",
+    #     dst_path="lib/cupti-blackwell",
+    #     override_path=helper_args.cupti_lib_blackwell_path,
+    #     version=nvidia_toolchain_version["cupti-blackwell"],
+    #     url_func=lambda system, arch, version:
+    #     f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
+    #     helper_args=helper_args,
+    # )
 
 
 def add_common_args(parser: argparse.ArgumentParser):

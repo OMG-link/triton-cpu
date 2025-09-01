@@ -411,6 +411,15 @@ std::string translateLLVMIRToASM(
   module.setTargetTriple(Triple(triple));
   auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features,
                                      enable_fast_math);
+                                     
+  // print target machine
+  llvm::dbgs() << *machine;
+  printf("Generating code for %s\n",
+         machine->getTargetTriple().str().c_str());
+  // print feature
+  llvm::dbgs() << "Features: " << features_str << "\n";
+  printf("Features: %s\n", features_str.c_str());
+
   // set data layout
   module.setDataLayout(machine->createDataLayout());
   // emit machine code
@@ -823,8 +832,25 @@ void init_triton_llvm(py::module &&m) {
                 "lineno: " + std::to_string(error.getLineNo()));
           }
           auto triple = getDefaultTargerOrProcessTriple();
+          
+          // --- BEGIN MODIFICATION ---
+          // Get host CPU features
+          llvm::StringMap<bool> features;
+          features = llvm::sys::getHostCPUFeatures();
+          std::string features_str;
+          for (auto const& [feature, enabled] : features) {
+              if (enabled) {
+                  if (!features_str.empty()) {
+                      features_str += ",";
+                  }
+                  features_str += "+";
+                  features_str += feature.str();
+              }
+          }
+          // --- END MODIFICATION ---
+
           res = translateLLVMIRToASM(*module, triple,
-                                     llvm::sys::getHostCPUName().str(), "", {},
+                                     llvm::sys::getHostCPUName().str(), features_str, {},
                                      enable_fp_fusion, false, enable_fast_math);
         }
         return py::str(res);

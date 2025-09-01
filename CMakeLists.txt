@@ -382,6 +382,11 @@ if(TRITON_BUILD_PYTHON_MODULE)
         LLVMPowerPCAsmParser
         LLVMPowerPCCodeGen
       )
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+      list(APPEND TRITON_LIBRARIES
+        LLVMRISCVCodeGen
+        LLVMRISCVAsmParser
+      )
   else()
     message(FATAL_ERROR "LLVM codegen/ASM parser libs: This HW architecture (${CMAKE_SYSTEM_PROCESSOR}) is not configured in cmake lib dependencies.")
   endif()
@@ -397,6 +402,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   set(TRITON_BACKENDS_TUPLE "(${TRITON_BACKENDS_TUPLE})")
   add_compile_definitions(TRITON_BACKENDS_TUPLE=${TRITON_BACKENDS_TUPLE})
+  # TODO 定义 python 模块
   add_library(triton SHARED ${PYTHON_SRC_PATH}/main.cc
                   ${PYTHON_SRC_PATH}/ir.cc
                   ${PYTHON_SRC_PATH}/gluon_ir.cc
@@ -463,8 +469,10 @@ endif()
 find_package(Threads REQUIRED)
 
 add_subdirectory(third_party/f2reduce)
-add_subdirectory(bin)
-add_subdirectory(test)
+# TODO RISCV 下依赖 NVIGPU/AMDGPU 的头文件
+# add_subdirectory(bin)
+# TODO 依赖 bin 工具测试
+# add_subdirectory(test)
 add_subdirectory(examples)
 
 if(TRITON_BUILD_UT)

@@ -56,6 +56,10 @@ if(xsmm_FOUND)
   set(TRITON_CPU_RUNTIME_LIBS ${TRITON_CPU_RUNTIME_LIBS} ${LIBXSMM})
 endif()
 
+message("Triton-CPU runtime sources: ${TRITON_CPU_RUNTIME_SOURCES}")
+message("   Detected C compiler: ${CMAKE_C_COMPILER_ID} @ ${CMAKE_C_COMPILER}")
+message("   Detected C++ compiler: ${CMAKE_CXX_COMPILER_ID} @ ${CMAKE_CXX_COMPILER}")
+
 add_library(TritonCPURuntime SHARED ${TRITON_CPU_RUNTIME_SOURCES})
 target_link_libraries(TritonCPURuntime PRIVATE ${TRITON_CPU_RUNTIME_LIBS})
 
