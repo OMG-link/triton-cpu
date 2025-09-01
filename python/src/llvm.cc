@@ -417,8 +417,8 @@ std::string translateLLVMIRToASM(
   printf("Generating code for %s\n",
          machine->getTargetTriple().str().c_str());
   // print feature
-  llvm::dbgs() << "Features: " << features_str << "\n";
-  printf("Features: %s\n", features_str.c_str());
+  llvm::dbgs() << "Features: " << features << "\n";
+  printf("Features: %s\n", features.c_str());
 
   // set data layout
   module.setDataLayout(machine->createDataLayout());
@@ -848,9 +848,13 @@ void init_triton_llvm(py::module &&m) {
               }
           }
           // --- END MODIFICATION ---
-
+          // FIXME getHostCPUName无法识别 -mcpu=spacemit-x60
+          // res = translateLLVMIRToASM(*module, triple,
+          //                            llvm::sys::getHostCPUName().str(), features_str, {},
+          //                            enable_fp_fusion, false, enable_fast_math);
+          // hardcode -mcpu=spacemit-x60 会指定默认 arch/features/tune flags
           res = translateLLVMIRToASM(*module, triple,
-                                     llvm::sys::getHostCPUName().str(), features_str, {},
+                                     "spacemit-x60", "", {},
                                      enable_fp_fusion, false, enable_fast_math);
         }
         return py::str(res);
