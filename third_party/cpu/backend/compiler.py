@@ -15,8 +15,7 @@ import triton.backends.cpu.driver as cpu_driver
 
 
 def min_dot_size(target: GPUTarget):
-    # Other architectures will only support 16,16,16
-    return lambda lhsType, rhsType: (4, 4, 4)
+    return lambda lhsType, rhsType: (4, 4, 1)
 
 
 VecLib = cpu.passes.ttcpuir.VecLib
@@ -200,9 +199,6 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
         cpu.passes.ttcpuir.add_optimize_masks(pm)
         passes.common.add_canonicalizer(pm)
-
-        # FIXME ADD DOT_SCALED OP LOWERING ？
-
         if (ukernels := opt.get_ukernels()):
             # For further analysis simplification
             cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)
@@ -223,6 +219,10 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_convert_dot_to_amx(pm, amx_int8, amx_fp16, amx_bf16)
         if 'avx512f' in self.cpu_features:
             cpu.passes.ttcpuir.add_convert_dot_to_fma(pm)
+
+        if self.cpu_arch == 'riscv64' and 'v' in self.cpu_features:
+            cpu.passes.ttcpuir.add_convert_dot_to_rvv(pm)
+
         cpu.passes.ttcpuir.add_convert_dot_generic(pm)
         promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features 
         # We don't have any lowering for mixed precision matmuls, so always use casts for now
@@ -296,8 +296,6 @@ class CPUBackend(BaseBackend):
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
-        
-        # TODO FIXME DOT_scaled lowering is not supported yet
         llvm_mod = llvm.to_module(mod, context)
         if llvm_mod is None:
             raise RuntimeError("Failed to convert to LLVM IR")
@@ -326,10 +324,8 @@ class CPUBackend(BaseBackend):
             lib_dirs = cpu_driver.library_dirs
             libs = ["m", "TritonCPURuntime", "sleef"]
             ccflags = []
-            # triton.runtime.build._build 函数
             so = _build("kernel", asm_path, tmpdir, lib_dirs, cpu_driver.include_dirs, libs, ccflags)
             with open(so, "rb") as f:
-                # 打开生成的 .so 文件，以二进制方式读取其内容并返回。
                 return f.read()
 
     def add_stages(self, stages, options, language):

@@ -136,6 +136,17 @@ def ConvertDotToFMA : Pass<"triton-cpu-convert-dot-to-fma", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def ConvertDotToRVV : Pass<"triton-cpu-convert-dot-to-rvv", "mlir::ModuleOp"> {
+    let summary = "Decompose dot product op to a series of RISC-V V Extenstion operations.";
+    let description = [{ }];
+
+    let constructor = "mlir::triton::cpu::createConvertDotToRVV()";
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::vector::VectorDialect",
+                             "mlir::triton::TritonDialect",
+                             "mlir::triton::cpu::TritonCPUDialect"];
+}
+
 def ConvertDotOpToUkernelOps : Pass<"triton-cpu-convert-dot-to-ukernels", "mlir::ModuleOp"> {
     let summary = "Convert dot product op to ukernel ops.";
     let description = [{
