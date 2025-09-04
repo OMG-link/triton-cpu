@@ -39,10 +39,6 @@ struct RvvDotOpCandidate {
   // Memory buffer holding RHS. Can be empty if RHS is not a result of a
   // simple load.
   MemBuffer rhsBuf;
-
-  // If accumulator is updated in a loop, then this flag indicates if we
-  // should keep it in registers the whole loop.
-  bool keepAccOnRegs;
 };
 
 // Check if input types are same, and if output elemets types are same with
@@ -152,7 +148,6 @@ bool isRvvCandidate(cpu::DotOp op, RvvDotOpCandidate &candidate) {
     return false;
 
   candidate.op = op;
-  candidate.keepAccOnRegs = isLoopCarriedAcc(op.getC());
 
   candidate.lhsBuf = findInputBuffer(op.getA(), true);
   candidate.rhsBuf = findInputBuffer(op.getB(), false);
@@ -182,64 +177,56 @@ Value loadScalar(Location loc, const MemBuffer &buf, int64_t m, int64_t n,
   return rewriter.create<memref::LoadOp>(loc, buf.memRef, indices);
 }
 
-Value loadRow(Location loc, VectorType resTy, const MemBuffer &buf, int64_t m,
+Value loadRow(Location loc, VectorType resTy, const MemBuffer &buf,
+              int64_t rowOff, const Value &subVecOff,
               PatternRewriter &rewriter) {
   assert(!buf.empty());
   SmallVector<Value> indices = buf.indices;
   indices[indices.size() - 2] =
-      shiftIndex(loc, indices[indices.size() - 2], m, rewriter);
+      shiftIndex(loc, indices[indices.size() - 2], rowOff, rewriter);
+  indices[indices.size() - 1] = subVecOff;
   return rewriter.create<vector::LoadOp>(loc, resTy, buf.memRef, indices);
 }
 
+SmallVector<Value> loadRows(Location loc, VectorType rowTy, int64_t rowNum,
+                            const MemBuffer &buf, int64_t rowOff,
+                            const Value &subVecOff, PatternRewriter &rewriter) {
+  SmallVector<Value> vecs;
+  vecs.reserve(rowNum);
+  for (int64_t m = 0; m < rowNum; ++m)
+    vecs.push_back(loadRow(loc, rowTy, buf, rowOff, subVecOff, rewriter));
+  return vecs;
+}
+
 void storeRow(Location loc, const MemBuffer &buf, int64_t rowIdx, Value vec,
-              PatternRewriter &rewriter) {
+              const Value &subVecOff, PatternRewriter &rewriter) {
   SmallVector<Value> indices = buf.indices;
   indices[indices.size() - 2] =
       shiftIndex(loc, buf.indices[indices.size() - 2], rowIdx, rewriter);
+  indices[indices.size() - 1] = subVecOff;
   rewriter.create<vector::StoreOp>(loc, vec, buf.memRef, indices);
 }
 
 void storeRows(Location loc, const MemBuffer &buf,
-               const SmallVector<Value> &vecs, PatternRewriter &rewriter) {
-  SmallVector<Value> indices = buf.indices;
+               const SmallVector<Value> &vecs, const Value &subVecOff,
+               PatternRewriter &rewriter) {
   for (int64_t m = 0; m < vecs.size(); ++m)
-    storeRow(loc, buf, m, vecs[m], rewriter);
+    storeRow(loc, buf, m, vecs[m], subVecOff, rewriter);
 }
 
-SmallVector<Value> extractRows(Location loc, Value vec,
-                               PatternRewriter &rewriter) {
-  VectorType vecTy = cast<VectorType>(vec.getType());
-  SmallVector<Value> res;
-  for (int64_t m = 0; m < vecTy.getDimSize(0); ++m) {
-    auto row =
-        rewriter.create<vector::ExtractOp>(loc, vec, SmallVector<int64_t>({m}));
-    res.push_back(row);
-  }
-  return res;
-}
-
-Value mergeRows(Location loc, VectorType resTy, const SmallVector<Value> &tiles,
-                PatternRewriter &rewriter) {
-  Value res =
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(resTy));
-  for (int64_t m = 0; m < tiles.size(); ++m)
-    res = rewriter.create<vector::InsertOp>(loc, tiles[m], res,
-                                            SmallVector<int64_t>({m}));
-  return res;
-}
-
-StringAttr getIntrinsicName(MLIRContext *ctx, bool isInt, bool isWidening) {
+StringAttr getIntrinsicName(PatternRewriter &rewriter, bool isInt,
+                            bool isWidening) {
   if (isInt) {
     if (isWidening) {
-      return StringAttr::get(ctx, "llvm.riscv.vwmacc");
+      return rewriter.getStringAttr("llvm.riscv.vwmacc");
     } else {
-      return StringAttr::get(ctx, "llvm.riscv.vmacc");
+      return rewriter.getStringAttr("llvm.riscv.vmacc");
     }
   } else {
     if (isWidening) {
-      return StringAttr::get(ctx, "llvm.riscv.vfwmacc");
+      return rewriter.getStringAttr("llvm.riscv.vfwmacc");
     } else {
-      return StringAttr::get(ctx, "llvm.riscv.vfmacc");
+      return rewriter.getStringAttr("llvm.riscv.vfmacc");
     }
   }
 }
@@ -247,28 +234,18 @@ StringAttr getIntrinsicName(MLIRContext *ctx, bool isInt, bool isWidening) {
 LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
                                   PatternRewriter &rewriter) {
   cpu::DotOp op = candidate.op;
-  MLIRContext *ctx = rewriter.getContext();
   Location loc = op.getLoc();
-  VectorType outputMatrixTy = cast<VectorType>(op.getC().getType());
+  VectorType outputMatTy = cast<VectorType>(op.getC().getType());
   int64_t inputElemBitWidth = candidate.inputElemTy.getIntOrFloatBitWidth();
-  VectorType inputVecTy =
-      VectorType::get({candidate.n}, candidate.inputElemTy, {false});
-  VectorType outputVecTy =
-      VectorType::get({candidate.n}, candidate.outputElemTy, {false});
 
   const int baseVlen = 64;
   const int64_t baseVl = baseVlen / inputElemBitWidth;
 
-  Value c_tumu =
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(3));
-  Value c_frm_dyn =
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(7));
-  Value cIndex_0 =
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
-  Value cIndex_1 =
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
-  Value c_baseVl =
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(baseVl));
+  Value c_tumu = int_cst(rewriter.getI64Type(), 3);
+  Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
+  Value cIndex_0 = index_cst(0);
+  Value cIndex_1 = index_cst(1);
+  Value c_baseVl = index_cst(baseVl);
 
   Operation *allocaPoint = op;
   while (!isa<triton::FuncOp>(allocaPoint->getParentOp()))
@@ -289,178 +266,87 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
   }
 
   Value acc = op.getC();
-  Value accToStore = acc;
-  scf::ForOp forOp;
-  if (candidate.keepAccOnRegs) {
-    forOp = cast<scf::ForOp>(op->getParentOp());
-    accToStore = getInitAccValue(acc);
-  }
+  MemBuffer accBuf = storeToTmpBuffer(loc, acc, allocaPoint, rewriter);
 
-  SmallVector<Value> accVecs;
-  SmallVector<Value> accInitVecs;
-  if (candidate.keepAccOnRegs) {
-    // Initial tile values are loaded before the loop and then directly
-    // used within the loop. Later, new iter values will be added to
-    // add loop carried-dependencies for accumulator tiles and accInitTiles
-    // will be used as initializers for them.
-    OpBuilder::InsertionGuard g(rewriter);
-    rewriter.setInsertionPoint(forOp);
-    LDBG("Loading accumulator to tiles before the loop.");
-    accInitVecs = extractRows(loc, accToStore, rewriter);
-    accVecs = accInitVecs;
-  } else {
-    accVecs = extractRows(loc, acc, rewriter);
-  }
+  // We will do GEMM by multiplying an <M x 1> vector with an <1 x N> vector.
+  // To do so, we multiply <1 x 1> scalar with <1 x N> vector.
+  // As N is given by the user, it can be too large for single vector register.
+  // We need to divide <1 x N> vector into <1 x VL> one, where VL is the number
+  // of elements single vector register can hold.
 
-  Value nextRhsVec = loadRow(loc, inputVecTy, rhsBuf, 0, rewriter);
-  for (int64_t k = 0; k < candidate.k; ++k) {
-    Value rhsVec = nextRhsVec;
+  // Divide <1 x N> vector into <1 x VL> one.
+  // We do this first to achieve the best performance.
+  Value vscale =
+      rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+  Value vl = op_muli(vscale, c_baseVl);
 
-    // Load next vector in advance to hide load latency.
-    if (k != candidate.k - 1)
-      nextRhsVec = loadRow(loc, inputVecTy, rhsBuf, k + 1, rewriter);
+  Value nVal = index_cst(candidate.n);
+  Value numBlocks = rewriter.create<arith::CeilDivSIOp>(loc, nVal, vl);
+  auto forOp = rewriter.create<scf::ForOp>(loc, cIndex_0, numBlocks, cIndex_1);
+  VectorType inputSubVecTy =
+      VectorType::get({baseVl}, candidate.inputElemTy, {true});
+  VectorType outputSubVecTy =
+      VectorType::get({baseVl}, candidate.outputElemTy, {true});
 
-    Value nextLhsScalar = loadScalar(loc, lhsBuf, 0, k, rewriter);
-    for (int64_t m = 0; m < candidate.m; ++m) {
-      Value lhsScalar = nextLhsScalar;
+  // For-op body: this for-op divide <* x N> vector into <* x VL> one
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(forOp.getBody());
 
-      // Load next value in advance to hide load latency.
-      if (m != candidate.m - 1)
-        nextLhsScalar = loadScalar(loc, lhsBuf, m + 1, k, rewriter);
+    // curVl = min(vl, n - iv * vl)
+    Value iv = forOp.getInductionVar();
+    Value subVecOff = op_muli(iv, vl);
+    Value remaining = op_subi(nVal, subVecOff);
+    Value curVl = op_index_cast(rewriter.getI64Type(), op_minui(vl, remaining));
 
-      // Divide fixed-vector into scalable-vector, then do wmacc
-      Value vscale =
-          rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
-      Value vl = rewriter.create<arith::MulIOp>(loc, vscale, c_baseVl);
+    SmallVector<Value> accVecs = loadRows(loc, outputSubVecTy, candidate.m,
+                                          accBuf, 0, subVecOff, rewriter);
 
-      MemBuffer rhsTmpBuf =
-          storeToTmpBuffer(loc, rhsVec, allocaPoint, rewriter);
-      MemBuffer accTmpBuf =
-          storeToTmpBuffer(loc, accVecs[m], allocaPoint, rewriter);
+    Value nextRhsVec =
+        loadRow(loc, inputSubVecTy, rhsBuf, 0, subVecOff, rewriter);
+    for (int64_t k = 0; k < candidate.k; ++k) {
+      Value rhsVec = nextRhsVec;
 
-      Value nVal = rewriter.create<arith::ConstantIndexOp>(loc, candidate.n);
-      Value numBlocks = rewriter.create<arith::CeilDivSIOp>(loc, nVal, vl);
-      auto forOp =
-          rewriter.create<scf::ForOp>(loc, cIndex_0, numBlocks, cIndex_1);
+      // Load next vector in advance to hide load latency.
+      if (k != candidate.k - 1)
+        nextRhsVec =
+            loadRow(loc, inputSubVecTy, rhsBuf, k + 1, subVecOff, rewriter);
 
-      {
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(forOp.getBody());
+      Value nextLhsScalar = loadScalar(loc, lhsBuf, 0, k, rewriter);
+      for (int64_t m = 0; m < candidate.m; ++m) {
+        Value lhsScalar = nextLhsScalar;
 
-        Value iv = forOp.getInductionVar();
-        // offset = iv * vl
-        Value offset = rewriter.create<arith::MulIOp>(loc, iv, vl);
-        // remaining = n - offset
-        Value remaining = rewriter.create<arith::SubIOp>(loc, nVal, offset);
-        // curVl = min(vl, remaining)
-        Value curVl = rewriter.create<arith::IndexCastOp>(
-            loc, rewriter.getI64Type(),
-            rewriter.create<arith::MinUIOp>(loc, vl, remaining));
+        // Load next value in advance to hide load latency.
+        if (m != candidate.m - 1)
+          nextLhsScalar = loadScalar(loc, lhsBuf, m + 1, k, rewriter);
 
-        // 5. 用 transfer_read 读子向量
-        VectorType subInputTy =
-            VectorType::get({baseVl}, candidate.inputElemTy, {true});
-        VectorType subOutputTy =
-            VectorType::get({baseVl}, candidate.outputElemTy, {true});
-
-        SmallVector<Value> rhsIndices;
-        rhsIndices.push_back(offset);
-        Value rhsSubVec = rewriter.create<vector::TransferReadOp>(
-            loc, subInputTy, rhsTmpBuf.memRef, rhsIndices,
-            rewriter.getMultiDimIdentityMap(rhsIndices.size()));
-
-        SmallVector<Value> accIndices;
-        accIndices.push_back(offset);
-        Value accSubVec = rewriter.create<vector::TransferReadOp>(
-            loc, subOutputTy, accTmpBuf.memRef, accIndices,
-            rewriter.getMultiDimIdentityMap(rhsIndices.size()));
-
-        // 6. 调 intrinsic
+        // Call intrinsic to do macc
         auto intrinsicName = getIntrinsicName(
-            ctx, candidate.inputElemTy.isInteger(), candidate.isWidening);
+            rewriter, candidate.inputElemTy.isInteger(), candidate.isWidening);
         SmallVector<Value> args;
         if (candidate.inputElemTy.isInteger()) {
-          args = {accSubVec, lhsScalar, rhsSubVec, curVl, c_tumu};
+          args = {accVecs[m], lhsScalar, rhsVec, curVl, c_tumu};
         } else {
-          args = {accSubVec, lhsScalar, rhsSubVec, c_frm_dyn, curVl, c_tumu};
+          args = {accVecs[m], lhsScalar, rhsVec, c_frm_dyn, curVl, c_tumu};
         }
         auto callInstrOp = rewriter.create<LLVM::CallIntrinsicOp>(
-            loc, subOutputTy, intrinsicName, args);
-        Value newAccSubVec = callInstrOp.getResult(0);
+            loc, accVecs[m].getType(), intrinsicName, args);
+        Value newAccVec = callInstrOp.getResult(0);
 
-        // 7. 写回 accTmpBuf
-        rewriter.create<vector::TransferWriteOp>(
-            loc, newAccSubVec, accTmpBuf.memRef, accIndices,
-            rewriter.getMultiDimIdentityMap(rhsIndices.size()));
+        // Update accVecs
+        accVecs[m] = newAccVec;
       }
-
-      // 8. 循环结束后，把 accTmpBuf 全量 load 回定长 vector
-      Value newAccVec = rewriter.create<vector::LoadOp>(
-          loc, outputVecTy, accTmpBuf.memRef, accTmpBuf.indices);
-
-      // 用新的 acc 替换旧的
-      accVecs[m] = newAccVec;
-      // === scf.for end ===
     }
-  }
+    storeRows(loc, accBuf, accVecs, subVecOff, rewriter);
 
-  if (candidate.keepAccOnRegs) {
-    // In this case we have the whole accumulator/result on tiles. Loop
-    // carried dependencies are not in place yet and should be added.
-    // After the loop, resulting tiles should either be stored to the
-    // output buffer, or moved to a vector through a temporary buffer.
+  } // end of for-op: rewriter will be set back to where it was automatically
 
-    // We don't need the original accumulator and contraction op anymore.
-    // Directly yield orig accumulator value, so it would be later removed
-    // as unused. The original contraction can be removed right away.
-    int64_t origResIdx = op.getResult().getUses().begin()->getOperandNumber();
-    rewriter.replaceOp(op, op.getC());
-
-    // Now, replace the loop with a new one to add loop carried dependency for
-    // accumulator tiles.
-    LDBG("Rewrite loop to introduce loop carried dependencies for accumulator "
-         "tiles.");
-    SmallVector<Value> newInitOperands;
-    SmallVector<Value> newYieldedValues;
-    for (int64_t m = 0; m < candidate.m; ++m) {
-      LDBG("Initial value\n  " << accInitVecs[m] << "\nis combined with\n  "
-                               << accVecs[m]);
-      newInitOperands.push_back(accInitVecs[m]);
-      newYieldedValues.push_back(accVecs[m]);
-    }
-    auto newForOp = cast<scf::ForOp>(*forOp.replaceWithAdditionalYields(
-        rewriter, newInitOperands, true,
-        [&newYieldedValues](OpBuilder &b, Location loc,
-                            ArrayRef<BlockArgument> newBBArgs) {
-          return newYieldedValues;
-        }));
-
-    // The resulting tiles are now in the new loop results.
-    auto resVecs = newForOp.getResults().take_back(newYieldedValues.size());
-    for (int64_t m = 0; m < candidate.m; ++m)
-      accVecs[m] = resVecs[m];
-
-    OpBuilder::InsertionGuard g(rewriter);
-    rewriter.setInsertionPointAfter(newForOp);
-    // Collect all results into a single vector.
-    LDBG("Merging resulting rows to replace loop result.");
-    VectorType resTy =
-        outputMatrixTy.cloneWith(std::nullopt, candidate.outputElemTy);
-    Value newVal = mergeRows(loc, resTy, accVecs, rewriter);
-    // We might need to cast back to the original type.
-    newVal = maybeCast(loc, newVal, outputMatrixTy.getElementType(), rewriter);
-    rewriter.replaceAllUsesWith(newForOp.getResult(origResIdx), newVal);
-  } else {
-    // The result is in the buffer. We should load it and replace the original
-    // constraction result.
-    LDBG("Merging resulting rows to replace orig op result.");
-    VectorType resTy =
-        outputMatrixTy.cloneWith(std::nullopt, candidate.outputElemTy);
-    Value newVal = mergeRows(loc, resTy, accVecs, rewriter);
-    // We might need to cast back to the original type.
-    newVal = maybeCast(loc, newVal, outputMatrixTy.getElementType(), rewriter);
-    rewriter.replaceOp(op, newVal);
-  }
+  // The result is in accBuf. We should load it and replace the original
+  // constraction result.
+  VectorType resTy =
+      outputMatTy.cloneWith(std::nullopt, candidate.outputElemTy);
+  Value newAccMat = op_read(outputMatTy, accBuf.memRef, accBuf.indices);
+  rewriter.replaceOp(op, newAccMat);
 
   return success();
 }
