@@ -411,14 +411,6 @@ std::string translateLLVMIRToASM(
   module.setTargetTriple(Triple(triple));
   auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features,
                                      enable_fast_math);
-                                     
-  // print target machine
-  llvm::dbgs() << *machine;
-  printf("Generating code for %s\n",
-         machine->getTargetTriple().str().c_str());
-  // print feature
-  llvm::dbgs() << "Features: " << features << "\n";
-  printf("Features: %s\n", features.c_str());
 
   // set data layout
   module.setDataLayout(machine->createDataLayout());
@@ -832,29 +824,29 @@ void init_triton_llvm(py::module &&m) {
                 "lineno: " + std::to_string(error.getLineNo()));
           }
           auto triple = getDefaultTargerOrProcessTriple();
-          
+
           // --- BEGIN MODIFICATION ---
           // Get host CPU features
           llvm::StringMap<bool> features;
           features = llvm::sys::getHostCPUFeatures();
           std::string features_str;
-          for (auto const& [feature, enabled] : features) {
-              if (enabled) {
-                  if (!features_str.empty()) {
-                      features_str += ",";
-                  }
-                  features_str += "+";
-                  features_str += feature.str();
+          for (auto const &[feature, enabled] : features) {
+            if (enabled) {
+              if (!features_str.empty()) {
+                features_str += ",";
               }
+              features_str += "+";
+              features_str += feature.str();
+            }
           }
           // --- END MODIFICATION ---
           // FIXME getHostCPUName无法识别 -mcpu=spacemit-x60
           // res = translateLLVMIRToASM(*module, triple,
-          //                            llvm::sys::getHostCPUName().str(), features_str, {},
-          //                            enable_fp_fusion, false, enable_fast_math);
+          //                            llvm::sys::getHostCPUName().str(),
+          //                            features_str, {}, enable_fp_fusion,
+          //                            false, enable_fast_math);
           // hardcode -mcpu=spacemit-x60 会指定默认 arch/features/tune flags
-          res = translateLLVMIRToASM(*module, triple,
-                                     "spacemit-x60", "", {},
+          res = translateLLVMIRToASM(*module, triple, "spacemit-x60", "", {},
                                      enable_fp_fusion, false, enable_fast_math);
         }
         return py::str(res);

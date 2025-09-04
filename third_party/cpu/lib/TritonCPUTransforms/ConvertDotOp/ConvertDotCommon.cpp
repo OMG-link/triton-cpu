@@ -233,7 +233,7 @@ MemBuffer allocateTmpBufferStack(Location loc, VectorType vecTy,
       rewriter, loc, memRefTy,
       rewriter.getIntegerAttr(rewriter.getI64Type(), 64));
   Value zeroIdx = arith::ConstantIndexOp::create(rewriter, loc, 0);
-  SmallVector<Value> indices(2, zeroIdx);
+  SmallVector<Value> indices(vecTy.getRank(), zeroIdx);
   return {memRef, indices};
 }
 

@@ -31,7 +31,7 @@ struct RvvDotOpCandidate {
   bool isWidening;
 
   // Matrix sizes. LHS = <m x k>; RHS = <k x n>; output = <m x n>
-  uint64_t m, k, n;
+  int64_t m, k, n;
 
   // Memory buffer holding LHS. Can be empty if LHS is not a result of a
   // simple load.
@@ -154,10 +154,6 @@ bool isRvvCandidate(cpu::DotOp op, RvvDotOpCandidate &candidate) {
   candidate.op = op;
   candidate.keepAccOnRegs = isLoopCarriedAcc(op.getC());
 
-  // FIXME: For this demo, we simply assume N=32 and VLEN=256
-  if (candidate.n != 32)
-    return false;
-
   candidate.lhsBuf = findInputBuffer(op.getA(), true);
   candidate.rhsBuf = findInputBuffer(op.getB(), false);
 
@@ -250,25 +246,29 @@ StringAttr getIntrinsicName(MLIRContext *ctx, bool isInt, bool isWidening) {
 
 LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
                                   PatternRewriter &rewriter) {
-  // FIXME: In practice, we should get VLEN dynamically
-  const int64_t VLEN = 256;
-
   cpu::DotOp op = candidate.op;
   MLIRContext *ctx = rewriter.getContext();
   Location loc = op.getLoc();
   VectorType outputMatrixTy = cast<VectorType>(op.getC().getType());
   int64_t inputElemBitWidth = candidate.inputElemTy.getIntOrFloatBitWidth();
   VectorType inputVecTy =
-      VectorType::get({VLEN / 8}, candidate.inputElemTy, {false});
+      VectorType::get({candidate.n}, candidate.inputElemTy, {false});
   VectorType outputVecTy =
-      VectorType::get({VLEN / 8}, candidate.outputElemTy, {false});
+      VectorType::get({candidate.n}, candidate.outputElemTy, {false});
 
-  Value vl =
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(32));
-  Value tumu =
+  const int baseVlen = 64;
+  const int64_t baseVl = baseVlen / inputElemBitWidth;
+
+  Value c_tumu =
       rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(3));
-  Value frm_dyn =
+  Value c_frm_dyn =
       rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(7));
+  Value cIndex_0 =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+  Value cIndex_1 =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+  Value c_baseVl =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(baseVl));
 
   Operation *allocaPoint = op;
   while (!isa<triton::FuncOp>(allocaPoint->getParentOp()))
@@ -328,30 +328,79 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
       if (m != candidate.m - 1)
         nextLhsScalar = loadScalar(loc, lhsBuf, m + 1, k, rewriter);
 
-      auto intrinsicName = getIntrinsicName(
-          ctx, candidate.inputElemTy.isInteger(), candidate.isWidening);
-      SmallVector<Value> args;
-      if (candidate.inputElemTy.isInteger()) {
-        args = {
-            accVecs[m], // Accumulator
-            lhsScalar,  // Scalar
-            rhsVec,     // Vector
-            vl,         // vl
-            tumu        // tu, mu
-        };
-      } else {
-        args = {
-            accVecs[m], // Accumulator
-            lhsScalar,  // Scalar
-            rhsVec,     // Vector
-            frm_dyn,    // float round mode
-            vl,         // vector length
-            tumu        // tu, mu
-        };
+      // Divide fixed-vector into scalable-vector, then do wmacc
+      Value vscale =
+          rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+      Value vl = rewriter.create<arith::MulIOp>(loc, vscale, c_baseVl);
+
+      MemBuffer rhsTmpBuf =
+          storeToTmpBuffer(loc, rhsVec, allocaPoint, rewriter);
+      MemBuffer accTmpBuf =
+          storeToTmpBuffer(loc, accVecs[m], allocaPoint, rewriter);
+
+      Value nVal = rewriter.create<arith::ConstantIndexOp>(loc, candidate.n);
+      Value numBlocks = rewriter.create<arith::CeilDivSIOp>(loc, nVal, vl);
+      auto forOp =
+          rewriter.create<scf::ForOp>(loc, cIndex_0, numBlocks, cIndex_1);
+
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(forOp.getBody());
+
+        Value iv = forOp.getInductionVar();
+        // offset = iv * vl
+        Value offset = rewriter.create<arith::MulIOp>(loc, iv, vl);
+        // remaining = n - offset
+        Value remaining = rewriter.create<arith::SubIOp>(loc, nVal, offset);
+        // curVl = min(vl, remaining)
+        Value curVl = rewriter.create<arith::IndexCastOp>(
+            loc, rewriter.getI64Type(),
+            rewriter.create<arith::MinUIOp>(loc, vl, remaining));
+
+        // 5. 用 transfer_read 读子向量
+        VectorType subInputTy =
+            VectorType::get({baseVl}, candidate.inputElemTy, {true});
+        VectorType subOutputTy =
+            VectorType::get({baseVl}, candidate.outputElemTy, {true});
+
+        SmallVector<Value> rhsIndices;
+        rhsIndices.push_back(offset);
+        Value rhsSubVec = rewriter.create<vector::TransferReadOp>(
+            loc, subInputTy, rhsTmpBuf.memRef, rhsIndices,
+            rewriter.getMultiDimIdentityMap(rhsIndices.size()));
+
+        SmallVector<Value> accIndices;
+        accIndices.push_back(offset);
+        Value accSubVec = rewriter.create<vector::TransferReadOp>(
+            loc, subOutputTy, accTmpBuf.memRef, accIndices,
+            rewriter.getMultiDimIdentityMap(rhsIndices.size()));
+
+        // 6. 调 intrinsic
+        auto intrinsicName = getIntrinsicName(
+            ctx, candidate.inputElemTy.isInteger(), candidate.isWidening);
+        SmallVector<Value> args;
+        if (candidate.inputElemTy.isInteger()) {
+          args = {accSubVec, lhsScalar, rhsSubVec, curVl, c_tumu};
+        } else {
+          args = {accSubVec, lhsScalar, rhsSubVec, c_frm_dyn, curVl, c_tumu};
+        }
+        auto callInstrOp = rewriter.create<LLVM::CallIntrinsicOp>(
+            loc, subOutputTy, intrinsicName, args);
+        Value newAccSubVec = callInstrOp.getResult(0);
+
+        // 7. 写回 accTmpBuf
+        rewriter.create<vector::TransferWriteOp>(
+            loc, newAccSubVec, accTmpBuf.memRef, accIndices,
+            rewriter.getMultiDimIdentityMap(rhsIndices.size()));
       }
-      auto callInstrOp = rewriter.create<LLVM::CallIntrinsicOp>(
-          loc, outputVecTy, intrinsicName, args);
-      accVecs[m] = callInstrOp.getResult(0);
+
+      // 8. 循环结束后，把 accTmpBuf 全量 load 回定长 vector
+      Value newAccVec = rewriter.create<vector::LoadOp>(
+          loc, outputVecTy, accTmpBuf.memRef, accTmpBuf.indices);
+
+      // 用新的 acc 替换旧的
+      accVecs[m] = newAccVec;
+      // === scf.for end ===
     }
   }
 
