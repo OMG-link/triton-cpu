@@ -1,6 +1,7 @@
 #include "ConvertDotCommon.h"
 
 #include "cpu/include/TritonCPUTransforms/Passes.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -155,6 +156,72 @@ bool isRvvCandidate(cpu::DotOp op, RvvDotOpCandidate &candidate) {
   return true;
 }
 
+// Get RVV VSCALE.
+//
+// VSCALE is a implement-defined value. Program can only know that value at
+// runtime. In triton, we use JIT, so we may be possible to get VSCALE when
+// compiling. We support three ways to specific VSCALE using environment
+// variable RVV_VLEN:
+//
+// 1) When RVV_VLEN is an integer, compiler uses RVV_VLEN/64 as VSCALE. (If it
+// is a valid VLEN: RVV_VLEN is power of 2 && RVV_VLEN >= 64)
+// 2) When RVV_VLEN is "dynamic", compiler uses a runtime call @vector.vscale to
+// get VSCALE.
+// 3) When RVV_VLEN is "local", compiler executes assembly `csrr %0, vlenb` to
+// get VSCALE.
+//
+// If RVV_VLEN is undefined or invalid(including RVV_VLEN is "local" but the
+// compiler is running on a machine that doesn't support RISCV-V-Extension),
+// compiler will fallback and tries the following ways one by one:
+// - Executes assembly `csrr %0, vlenb` to get VSCALE if possible.
+// - Return a runtime call @vector.vscale.
+
+static inline int64_t tryReadVlenb() {
+#ifdef __riscv_vector
+  int64_t vlenb;
+  asm volatile("csrr %0, vlenb" : "=r"(vlenb));
+  return vlenb * 8;
+#else
+  return -1;
+#endif
+}
+
+// Returns: VSCALE of type 'index'
+Value getVscale(Location loc, PatternRewriter &rewriter) {
+  std::string RVV_VLEN = mlir::triton::tools::getStrEnv("RVV_VLEN");
+  // if RVV_VLEN is defined
+  if (!RVV_VLEN.empty()) {
+    if (RVV_VLEN == "dynamic") {
+      return rewriter.create<vector::VectorScaleOp>(loc,
+                                                    rewriter.getIndexType());
+    } else if (RVV_VLEN == "local") {
+      int vlenb = tryReadVlenb();
+      if (vlenb > 0) {
+        return index_cst(vlenb / 8);
+      } else {
+        emitWarning(loc, "Environment variable RVV_VLEN is set to 'local', but "
+                         "triton compiler is not running on platform that "
+                         "supports RISCV-V-Extension.");
+      }
+    } else {
+      char *end;
+      long vlen = strtol(RVV_VLEN.c_str(), &end, 10);
+      if (*end == '\0') {
+        if (vlen >= 64 && (vlen & (vlen - 1)) == 0) {
+          return index_cst(vlen / 64);
+        }
+      }
+      emitWarning(loc) << "Invalid RVV_VLEN option: " << RVV_VLEN;
+    }
+  }
+  // fallback
+  int vlenb = tryReadVlenb();
+  if (vlenb > 0) {
+    return index_cst(vlenb / 8);
+  }
+  return rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+}
+
 SmallVector<Value> shiftIndices(Location loc, ArrayRef<Value> indices,
                                 bool transposed, int64_t m, int64_t n,
                                 PatternRewriter &rewriter) {
@@ -276,8 +343,7 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
 
   // Divide <1 x N> vector into <1 x VL> one.
   // We do this first to achieve the best performance.
-  Value vscale =
-      rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+  Value vscale = getVscale(loc, rewriter);
   Value vl = op_muli(vscale, c_baseVl);
 
   Value nVal = index_cst(candidate.n);
