@@ -1,6 +1,7 @@
 #include "ConvertDotCommon.h"
 
 #include "cpu/include/TritonCPUTransforms/Passes.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -281,21 +282,13 @@ void storeRows(Location loc, const MemBuffer &buf,
     storeRow(loc, buf, m, vecs[m], subVecOff, rewriter);
 }
 
-StringAttr getIntrinsicName(PatternRewriter &rewriter, bool isInt,
-                            bool isWidening) {
-  if (isInt) {
-    if (isWidening) {
-      return rewriter.getStringAttr("llvm.riscv.vwmacc");
-    } else {
-      return rewriter.getStringAttr("llvm.riscv.vmacc");
-    }
-  } else {
-    if (isWidening) {
-      return rewriter.getStringAttr("llvm.riscv.vfwmacc");
-    } else {
-      return rewriter.getStringAttr("llvm.riscv.vfmacc");
-    }
-  }
+StringAttr getIntrinsicName(PatternRewriter &rewriter, std::string opName,
+                            bool isFloat, bool isWidening) {
+  auto name = Twine("llvm.riscv.v")
+                  .concat(isFloat ? "f" : "")
+                  .concat(isWidening ? "w" : "")
+                  .concat(opName);
+  return rewriter.getStringAttr(name.str());
 }
 
 LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
@@ -333,7 +326,14 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
   }
 
   Value acc = op.getC();
-  MemBuffer accBuf = storeToTmpBuffer(loc, acc, allocaPoint, rewriter);
+  bool isOpCZero = isZeroConst(acc);
+  MemBuffer accBuf;
+  if (isOpCZero) {
+    accBuf = allocateTmpBufferStack(loc, cast<VectorType>(acc.getType()),
+                                    allocaPoint, rewriter);
+  } else {
+    accBuf = storeToTmpBuffer(loc, acc, allocaPoint, rewriter);
+  }
 
   // We will do GEMM by multiplying an <M x 1> vector with an <1 x N> vector.
   // To do so, we multiply <1 x 1> scalar with <1 x N> vector.
@@ -365,8 +365,13 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
     Value remaining = op_subi(nVal, subVecOff);
     Value curVl = op_index_cast(rewriter.getI64Type(), op_minui(vl, remaining));
 
-    SmallVector<Value> accVecs = loadRows(loc, outputSubVecTy, candidate.m,
-                                          accBuf, 0, subVecOff, rewriter);
+    SmallVector<Value> accVecs;
+    if (isOpCZero) {
+      accVecs.reserve(candidate.m);
+    } else {
+      accVecs = loadRows(loc, outputSubVecTy, candidate.m, accBuf, 0, subVecOff,
+                         rewriter);
+    }
 
     Value nextRhsVec =
         loadRow(loc, inputSubVecTy, rhsBuf, 0, subVecOff, rewriter);
@@ -387,20 +392,35 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
           nextLhsScalar = loadScalar(loc, lhsBuf, m + 1, k, rewriter);
 
         // Call intrinsic to do macc
-        auto intrinsicName = getIntrinsicName(
-            rewriter, candidate.inputElemTy.isInteger(), candidate.isWidening);
-        SmallVector<Value> args;
-        if (candidate.inputElemTy.isInteger()) {
-          args = {accVecs[m], lhsScalar, rhsVec, curVl, c_tumu};
+        Value newAccVec;
+        if (k == 0 && isOpCZero) {
+          auto intrinsicName =
+              getIntrinsicName(rewriter, "mul", candidate.inputElemTy.isFloat(),
+                               candidate.isWidening);
+          SmallVector<Value> args;
+          auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
+          if (candidate.inputElemTy.isInteger()) {
+            args = {poison, rhsVec, lhsScalar, curVl};
+          } else {
+            args = {poison, rhsVec, lhsScalar, c_frm_dyn, curVl};
+          }
+          auto callInstrOp = rewriter.create<LLVM::CallIntrinsicOp>(
+              loc, outputSubVecTy, intrinsicName, args);
+          accVecs.push_back(callInstrOp.getResult(0));
         } else {
-          args = {accVecs[m], lhsScalar, rhsVec, c_frm_dyn, curVl, c_tumu};
+          auto intrinsicName = getIntrinsicName(rewriter, "macc",
+                                                candidate.inputElemTy.isFloat(),
+                                                candidate.isWidening);
+          SmallVector<Value> args;
+          if (candidate.inputElemTy.isInteger()) {
+            args = {accVecs[m], lhsScalar, rhsVec, curVl, c_tumu};
+          } else {
+            args = {accVecs[m], lhsScalar, rhsVec, c_frm_dyn, curVl, c_tumu};
+          }
+          auto callInstrOp = rewriter.create<LLVM::CallIntrinsicOp>(
+              loc, outputSubVecTy, intrinsicName, args);
+          accVecs[m] = callInstrOp.getResult(0);
         }
-        auto callInstrOp = rewriter.create<LLVM::CallIntrinsicOp>(
-            loc, accVecs[m].getType(), intrinsicName, args);
-        Value newAccVec = callInstrOp.getResult(0);
-
-        // Update accVecs
-        accVecs[m] = newAccVec;
       }
     }
     storeRows(loc, accBuf, accVecs, subVecOff, rewriter);
