@@ -436,6 +436,7 @@ def add_link_to_backends(external_only):
             # `triton.language.extra`.
             extra_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "python", "triton", "language",
                                                      "extra"))
+            os.makedirs(extra_dir, exist_ok=True)
             for x in os.listdir(backend.language_dir):
                 src_dir = os.path.join(backend.language_dir, x)
                 install_dir = os.path.join(extra_dir, x)
@@ -445,6 +446,7 @@ def add_link_to_backends(external_only):
             # Link the contents of each backend's `tools` directory into
             # `triton.tools.extra`.
             extra_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "python", "triton", "tools", "extra"))
+            os.makedirs(extra_dir, exist_ok=True)
             for x in os.listdir(backend.tools_dir):
                 src_dir = os.path.join(backend.tools_dir, x)
                 install_dir = os.path.join(extra_dir, x)
