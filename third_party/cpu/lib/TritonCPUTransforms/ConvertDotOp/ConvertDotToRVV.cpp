@@ -200,9 +200,9 @@ Value getVscale(Location loc, PatternRewriter &rewriter) {
       if (vlenb > 0) {
         return index_cst(vlenb / 8);
       } else {
-        emitWarning(loc, "Environment variable RVV_VLEN is set to 'local', but "
-                         "triton compiler is not running on platform that "
-                         "supports RISCV-V-Extension.");
+        emitWarning(loc,
+                    "Environment variable RVV_VLEN is set to 'local', but "
+                    "triton compiler is not compiled with RISCV-V-Extension.");
       }
     } else {
       char *end;
