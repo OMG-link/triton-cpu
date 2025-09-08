@@ -257,12 +257,12 @@ Value loadRow(Location loc, VectorType resTy, const MemBuffer &buf,
 }
 
 SmallVector<Value> loadRows(Location loc, VectorType rowTy, int64_t rowNum,
-                            const MemBuffer &buf, int64_t rowOff,
-                            const Value &subVecOff, PatternRewriter &rewriter) {
+                            const MemBuffer &buf, const Value &subVecOff,
+                            PatternRewriter &rewriter) {
   SmallVector<Value> vecs;
   vecs.reserve(rowNum);
   for (int64_t m = 0; m < rowNum; ++m)
-    vecs.push_back(loadRow(loc, rowTy, buf, rowOff, subVecOff, rewriter));
+    vecs.push_back(loadRow(loc, rowTy, buf, m, subVecOff, rewriter));
   return vecs;
 }
 
@@ -369,7 +369,7 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
     if (isOpCZero) {
       accVecs.reserve(candidate.m);
     } else {
-      accVecs = loadRows(loc, outputSubVecTy, candidate.m, accBuf, 0, subVecOff,
+      accVecs = loadRows(loc, outputSubVecTy, candidate.m, accBuf, subVecOff,
                          rewriter);
     }
 
