@@ -181,7 +181,7 @@ static inline int64_t tryReadVlenb() {
 #ifdef __riscv_vector
   int64_t vlenb;
   asm volatile("csrr %0, vlenb" : "=r"(vlenb));
-  return vlenb * 8;
+  return vlenb;
 #else
   return -1;
 #endif
