@@ -528,7 +528,7 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
         // Get operands
         Value lhsVec = loadRow(loc, rewriter, inputSubVecTy, lhsBuf,
                                index_cst(m), cIndex_0);
-        Value rhsVec = loadCol(loc, rewriter, inputSubVecTy, lhsBuf, cIndex_0,
+        Value rhsVec = loadCol(loc, rewriter, inputSubVecTy, rhsBuf, cIndex_0,
                                index_cst(n));
         // Prepare and call intrinsic
         auto intrinsicName = getIntrinsicName(
@@ -562,7 +562,7 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
         // Get operands
         Value lhsVec = loadRow(loc, rewriter, inputSubVecTy, lhsBuf,
                                index_cst(m), subVecOff);
-        Value rhsVec = loadCol(loc, rewriter, inputSubVecTy, lhsBuf, subVecOff,
+        Value rhsVec = loadCol(loc, rewriter, inputSubVecTy, rhsBuf, subVecOff,
                                index_cst(n));
         Value sumVec = forOp.getRegionIterArg(0);
         // Prepare and call intrinsic
