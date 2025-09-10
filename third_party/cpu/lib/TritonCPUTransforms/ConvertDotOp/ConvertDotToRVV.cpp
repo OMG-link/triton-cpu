@@ -664,6 +664,8 @@ struct ConvertDotToRVV
         LLVM_DEBUG({
           LDBG("Found RVV candidate");
           LDBG("  Op: " << candidate.op);
+          LDBG("  DotStyle: " << (candidate.dotStyle == INNER ? "INNER"
+                                                              : "OUTER"));
           LDBG("  InputElemTy: " << candidate.inputElemTy);
           LDBG("  OutputElemTy: " << candidate.outputElemTy);
           LDBG("  IsWidening: " << candidate.isWidening);
