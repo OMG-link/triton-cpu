@@ -374,17 +374,19 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
 
   int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
   const int64_t baseVlen = 64;
-  const int64_t baseVl = baseVlen / inputElemBitWidth;
+  const int64_t baseInputVl = baseVlen / inputElemBitWidth;
 
   VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
-  VectorType inputSubVecTy = VectorType::get({baseVl}, inputElemTy, {true});
-  VectorType outputSubVecTy = VectorType::get({baseVl}, outputElemTy, {true});
+  VectorType inputSubVecTy =
+      VectorType::get({baseInputVl}, inputElemTy, {true});
+  VectorType outputSubVecTy =
+      VectorType::get({baseInputVl}, outputElemTy, {true});
 
   Value c_tumu = int_cst(rewriter.getI64Type(), 3);
   Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
   Value cIndex_0 = index_cst(0);
   Value cIndex_1 = index_cst(1);
-  Value cIndex_baseVl = index_cst(baseVl);
+  Value cIndex_baseVl = index_cst(baseInputVl);
   Value cIndex_n = index_cst(mat_n);
 
   // We will do GEMM by multiplying an <M x 1> vector with an <1 x N> vector.
@@ -497,11 +499,13 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
 
   int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
   const int64_t baseVlen = 64;
-  const int64_t baseVl = baseVlen / inputElemBitWidth;
+  const int64_t baseInputVl = baseVlen / inputElemBitWidth;
 
   VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
-  VectorType inputSubVecTy = VectorType::get({baseVl}, inputElemTy, {true});
-  VectorType outputSubVecTy = VectorType::get({baseVl}, outputElemTy, {true});
+  VectorType inputSubVecTy =
+      VectorType::get({baseInputVl}, inputElemTy, {true});
+  VectorType outputSubVecTy =
+      VectorType::get({baseInputVl}, outputElemTy, {true});
 
   Value resMat = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getZeroAttr(outputMatTy));
@@ -510,11 +514,11 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
   Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
   Value cIndex_0 = index_cst(0);
   Value cIndex_1 = index_cst(1);
-  Value cIndex_baseVl = index_cst(baseVl);
+  Value cIndex_baseInputVl = index_cst(baseInputVl);
   Value cIndex_k = index_cst(mat_k);
 
   Value vscale = getVscale(loc, rewriter);
-  Value vl = op_muli(vscale, cIndex_baseVl);
+  Value vl = op_muli(vscale, cIndex_baseInputVl);
   Value numSubVec = rewriter.create<arith::CeilDivSIOp>(loc, cIndex_k, vl);
 
   for (int64_t m = 0; m < mat_m; m++) {
@@ -585,13 +589,28 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
 
       // Reduction: Sum the accumulated results horizontally.
       Value newAccScalar;
-      if (isAccZeroInit) {
-        newAccScalar = rewriter.create<vector::ReductionOp>(
-            loc, vector::CombiningKind::ADD, sumVec);
-      } else {
-        Value accScalar = loadScalar(loc, rewriter, accBuf, m, n);
-        newAccScalar = rewriter.create<vector::ReductionOp>(
-            loc, vector::CombiningKind::ADD, sumVec, accScalar);
+      {
+        int64_t baseOutputVl = baseVlen / outputElemTy.getIntOrFloatBitWidth();
+        VectorType redVecTy =
+            VectorType::get({baseOutputVl}, outputElemTy, {true});
+        Value poison = rewriter.create<LLVM::PoisonOp>(loc, redVecTy);
+        Value redSumScalar;
+        if (isAccZeroInit) {
+          auto zeroAttr = rewriter.getZeroAttr(outputElemTy);
+          redSumScalar =
+              rewriter.create<arith::ConstantOp>(loc, outputElemTy, zeroAttr);
+        } else {
+          redSumScalar = loadScalar(loc, rewriter, accBuf, m, n);
+        }
+        Value redSum = rewriter.create<vector::InsertOp>(
+            loc, redSumScalar, poison, SmallVector<int64_t>({0}));
+        Value curVl =
+            op_index_cast(rewriter.getI64Type(), op_minui(vl, cIndex_k));
+        SmallVector<Value> args = {poison, sumVec, redSum, curVl};
+        auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+            loc, redVecTy, rewriter.getStringAttr("llvm.riscv.vredsum"), args);
+        auto newRedSum = callIntrinsicOp.getResult(0);
+        newAccScalar = rewriter.create<vector::ExtractOp>(loc, newRedSum, 0);
       }
       resMat = rewriter.create<vector::InsertOp>(loc, newAccScalar, resMat,
                                                  SmallVector<int64_t>({m, n}));
