@@ -6,6 +6,7 @@
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/Support/FormatVariadic.h"
 
 namespace mlir {
 namespace triton {
@@ -348,13 +349,22 @@ void storeRows(Location loc, const MemBuffer &buf,
     storeRow(loc, buf, m, vecs[m], subVecOff, rewriter);
 }
 
-StringAttr getIntrinsicName(PatternRewriter &rewriter, std::string opName,
-                            bool isFloat, bool isWidening) {
-  auto name = Twine("llvm.riscv.v")
-                  .concat(isFloat ? "f" : "")
-                  .concat(isWidening ? "w" : "")
-                  .concat(opName);
-  return rewriter.getStringAttr(name.str());
+StringAttr getMulIntrinsicName(PatternRewriter &rewriter, StringRef opName,
+                               bool isFloat, bool isWidening) {
+  std::string name = llvm::formatv("llvm.riscv.v{0}{1}{2}",
+                                   isFloat ? "f" : "",    // 0
+                                   isWidening ? "w" : "", // 1
+                                   opName);               // 2
+  return rewriter.getStringAttr(name);
+}
+
+StringAttr getReduceIntrinsicName(PatternRewriter &rewriter, StringRef opName,
+                                  bool isFloat, StringRef fOrder = "") {
+  std::string name = llvm::formatv("llvm.riscv.v{0}red{1}{2}",
+                                   isFloat ? "f" : "",    // 0
+                                   isFloat ? fOrder : "", // 1
+                                   opName);               // 2
+  return rewriter.getStringAttr(name);
 }
 
 LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
@@ -442,7 +452,7 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
         // Call intrinsic to do macc
         Value newAccVec;
         if (k == 0 && isAccZeroInit) {
-          auto intrinsicName = getIntrinsicName(
+          auto intrinsicName = getMulIntrinsicName(
               rewriter, "mul", inputElemTy.isFloat(), isWidening);
           SmallVector<Value> args;
           auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
@@ -455,7 +465,7 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
               loc, outputSubVecTy, intrinsicName, args);
           accVecs.push_back(callIntrinsicOp.getResult(0));
         } else {
-          auto intrinsicName = getIntrinsicName(
+          auto intrinsicName = getMulIntrinsicName(
               rewriter, "macc", inputElemTy.isFloat(), isWidening);
           SmallVector<Value> args;
           if (inputElemTy.isInteger()) {
@@ -535,7 +545,7 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
         Value rhsVec = loadCol(loc, rewriter, inputSubVecTy, rhsBuf, cIndex_0,
                                index_cst(n));
         // Prepare and call intrinsic
-        auto intrinsicName = getIntrinsicName(
+        auto intrinsicName = getMulIntrinsicName(
             rewriter, "mul", inputElemTy.isFloat(), isWidening);
         SmallVector<Value> args;
         auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
@@ -570,7 +580,7 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
                                index_cst(n));
         Value sumVec = forOp.getRegionIterArg(0);
         // Prepare and call intrinsic
-        auto intrinsicName = getIntrinsicName(
+        auto intrinsicName = getMulIntrinsicName(
             rewriter, "macc", inputElemTy.isFloat(), isWidening);
         SmallVector<Value> args;
         if (inputElemTy.isInteger()) {
@@ -606,9 +616,16 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
             loc, redSumScalar, poison, SmallVector<int64_t>({0}));
         Value curVl =
             op_index_cast(rewriter.getI64Type(), op_minui(vl, cIndex_k));
-        SmallVector<Value> args = {poison, sumVec, redSum, curVl};
+        SmallVector<Value> args;
+        if (outputElemTy.isInteger()) {
+          args = {poison, sumVec, redSum, curVl};
+        } else {
+          args = {poison, sumVec, redSum, c_frm_dyn, curVl};
+        }
+        auto intrinsicName = getReduceIntrinsicName(
+            rewriter, "sum", outputElemTy.isFloat(), "u");
         auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-            loc, redVecTy, rewriter.getStringAttr("llvm.riscv.vredsum"), args);
+            loc, redVecTy, intrinsicName, args);
         auto newRedSum = callIntrinsicOp.getResult(0);
         newAccScalar = rewriter.create<vector::ExtractOp>(loc, newRedSum, 0);
       }
