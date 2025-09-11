@@ -131,29 +131,69 @@ bool checkInputShapes(VectorType lhsTy, VectorType resTy,
   return true;
 }
 
+int64_t findLowestDim(const MemBuffer &buf) {
+  if (buf.empty()) {
+    // storeToTempBuffer will make the last dimension continuous.
+    return -1;
+  }
+
+  auto memrefType = dyn_cast<MemRefType>(buf.memRef.getType());
+  if (!memrefType) {
+    // Don't know how to find lowest dimension if memref is not memref.
+    return 0;
+  }
+
+  llvm::SmallVector<int64_t, 8> strides;
+  int64_t offset = 0;
+  if (succeeded(memrefType.getStridesAndOffset(strides, offset))) {
+    // Find the dimension with stride 1
+    int64_t lowestDim = 0;
+    for (size_t i = 0; i < strides.size(); ++i) {
+      int64_t s = strides[i];
+      if (s == 1) {
+        lowestDim =
+            static_cast<int64_t>(i) - static_cast<int64_t>(buf.indices.size());
+        break;
+      }
+    }
+    // Process buf.transposed
+    if (lowestDim == -1 && buf.transposed) {
+      lowestDim = -2;
+    } else if (lowestDim == -2 && buf.transposed) {
+      lowestDim = -1;
+    }
+    return lowestDim;
+  } else {
+    // Failed to get strides? Don't know what happened.
+    return 0;
+  }
+}
+
 // Determine dot style by input data layout.
 void determineDotStyle(Value a, Value b, RvvDotOpCandidate &candidate) {
   candidate.lhsBuf = findInputBuffer(a, true);
   candidate.rhsBuf = findInputBuffer(b, true);
-  // FIXME:
-  // MemBuffer.transposed方法只能说明findInputBuffer在寻找内存地址的过程中是否
-  // 经历了转置，不代表矩阵在内存中被转置存储。
-  if (candidate.lhsBuf.transposed) {
-    if (candidate.rhsBuf.transposed) {
-      LDBG("Both lhs and rhs are transposed. Nothing to recommend.");
-      candidate.dotStyle = INNER;
-    } else {
-      LDBG("Only lhs is transposed. Recommend outer-product GEMM.");
-      candidate.dotStyle = OUTER;
-    }
+  int64_t lhsLowestDim = findLowestDim(candidate.lhsBuf);
+  int64_t rhsLowestDim = findLowestDim(candidate.rhsBuf);
+  if (rhsLowestDim == -1) {
+    // When the last dimension of right operand(N) is continuous, we use
+    // outer-product GEMM.
+    LDBG("Last dimension of right operand is continuous. "
+         "Recommend outer-product GEMM.");
+    candidate.dotStyle = OUTER;
+  } else if (rhsLowestDim == -2 && lhsLowestDim == -1) {
+    // When the penultimate dimension of right operand(K) and the last dimension
+    // of left operand(K) is continuous, we use inner-product GEMM.
+    LDBG("Penultimate dimension of right operand is continuous and "
+         "last dimension of left operand is continuous. "
+         "Recommend inner-product GEMM.");
+    candidate.dotStyle = INNER;
   } else {
-    if (candidate.rhsBuf.transposed) {
-      LDBG("Only rhs is transposed. Recommend inner-product GEMM.");
-      candidate.dotStyle = INNER;
-    } else {
-      LDBG("No operand transposed. Nothing to recommend.");
-      candidate.dotStyle = INNER;
-    }
+    LDBG("No recommend rule matches. Recommend outer-product GEMM as default "
+         "dot "
+         "style. (lhsLowestDim="
+         << lhsLowestDim << ", rhsLowestDim=" << rhsLowestDim << ")");
+    candidate.dotStyle = OUTER;
   }
 }
 
