@@ -380,6 +380,32 @@ std::string translateLLVMIRToASM(
       }
     }
   }
+  if (auto RVV_VLEN = triton::tools::getStrEnv("RVV_VLEN");
+      RVV_VLEN.length() > 0) {
+    int64_t vlen = -1;
+    {
+      char *end;
+      auto vlen_str = strtol(RVV_VLEN.c_str(), &end, 10);
+      if (*end == '\0') {
+        vlen = vlen_str;
+      } else {
+        if (RVV_VLEN != "dynamic") {
+#ifdef __riscv_vector
+          asm volatile("csrr %0, vlenb" : "=r"(vlen));
+          vlen *= 8;
+#endif
+        }
+      }
+    }
+    if (vlen > 0) {
+      auto optMin = options.at("riscv-v-vector-bits-min");
+      auto optMax = options.at("riscv-v-vector-bits-max");
+      // llvm/lib/Target/RISCV/RISCVTargetMachine.cpp:66
+      static_cast<llvm::cl::opt<int> *>(optMin)->setValue(vlen);
+      // llvm/lib/Target/RISCV/RISCVTargetMachine.cpp:60
+      static_cast<llvm::cl::opt<unsigned> *>(optMax)->setValue(vlen);
+    }
+  }
 
   // inline everything
   for (llvm::Function &f : module.functions())
