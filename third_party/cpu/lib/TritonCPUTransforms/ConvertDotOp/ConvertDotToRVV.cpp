@@ -117,12 +117,6 @@ bool checkInputShapes(VectorType lhsTy, VectorType resTy,
     return false;
   }
 
-  if (resTy.getDimSize(1) < 8) {
-    LDBG("checkInputShapes failed: resTy of length "
-         << resTy.getDimSize(1) << " is too short for vectorize");
-    return false;
-  }
-
   // Fillin matrix size
   candidate.m = resTy.getDimSize(0);
   candidate.n = resTy.getDimSize(1);
