@@ -4,6 +4,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 
+#include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -125,36 +126,20 @@ bool checkInputShapes(VectorType lhsTy, VectorType resTy,
   return true;
 }
 
-int64_t findLowestDim(const MemBuffer &buf) {
-  if (buf.empty()) {
-    // storeToTempBuffer will make the last dimension continuous.
-    return -1;
-  }
-
-  auto memrefType = dyn_cast<MemRefType>(buf.memRef.getType());
-  if (!memrefType) {
-    // Don't know how to find lowest dimension if memref is not memref.
-    return 0;
-  }
-
+// Returns the first dimension with stride 1, which is usually considered as
+// 'lowest' dimention.
+int64_t findLowestDim(MemRefType memRefType) {
   llvm::SmallVector<int64_t, 8> strides;
   int64_t offset = 0;
-  if (succeeded(memrefType.getStridesAndOffset(strides, offset))) {
+  if (succeeded(memRefType.getStridesAndOffset(strides, offset))) {
     // Find the dimension with stride 1
     int64_t lowestDim = 0;
     for (size_t i = 0; i < strides.size(); ++i) {
       int64_t s = strides[i];
       if (s == 1) {
-        lowestDim =
-            static_cast<int64_t>(i) - static_cast<int64_t>(buf.indices.size());
+        lowestDim = static_cast<int64_t>(i);
         break;
       }
-    }
-    // Process buf.transposed
-    if (lowestDim == -1 && buf.transposed) {
-      lowestDim = -2;
-    } else if (lowestDim == -2 && buf.transposed) {
-      lowestDim = -1;
     }
     return lowestDim;
   } else {
@@ -163,12 +148,39 @@ int64_t findLowestDim(const MemBuffer &buf) {
   }
 }
 
+int64_t findLowestDim(const MemBuffer &buf) {
+  if (buf.empty()) {
+    // storeToTempBuffer will make the last dimension continuous.
+    return -1;
+  }
+
+  auto memRefType = dyn_cast<MemRefType>(buf.memRef.getType());
+  if (!memRefType) {
+    // Don't know how to find lowest dimension if memref is not memref.
+    return 0;
+  }
+
+  int64_t lowestDim = findLowestDim(memRefType);
+  int64_t totalDim = memRefType.getRank();
+
+  // Process buf.transposed
+  if (lowestDim == totalDim - 1 && buf.transposed) {
+    lowestDim = totalDim - 2;
+  } else if (lowestDim == totalDim - 2 && buf.transposed) {
+    lowestDim = totalDim - 1;
+  }
+
+  return lowestDim;
+}
+
 // Determine dot style by input data layout.
 void determineDotStyle(Value a, Value b, RvvDotOpCandidate &candidate) {
   candidate.lhsBuf = findInputBuffer(a, true);
   candidate.rhsBuf = findInputBuffer(b, true);
-  int64_t lhsLowestDim = findLowestDim(candidate.lhsBuf);
-  int64_t rhsLowestDim = findLowestDim(candidate.rhsBuf);
+  int64_t lhsLowestDim =
+      findLowestDim(candidate.lhsBuf) - candidate.lhsBuf.indices.size();
+  int64_t rhsLowestDim =
+      findLowestDim(candidate.rhsBuf) - candidate.lhsBuf.indices.size();
   if (rhsLowestDim == -1) {
     // When the last dimension of right operand(N) is continuous, we use
     // outer-product GEMM.
@@ -313,56 +325,64 @@ Value loadScalar(Location loc, PatternRewriter &rewriter, const MemBuffer &buf,
 // Load vector at memRef[indices].
 // Result vector has type resTy, and will be read along the resDim-th dimesion.
 Value loadVec(Location loc, PatternRewriter &rewriter, VectorType resTy,
-              int64_t resDim, const Value &memRef, ValueRange indices) {
+              int64_t resDim, Value resLen, const Value &memRef,
+              ValueRange indices) {
   assert(resTy.getRank() == 1);
   AffineExpr resDimAffineExpr = rewriter.getAffineDimExpr(resDim);
   AffineMap affineMap = AffineMap::get(indices.size(), 0, resDimAffineExpr);
-  return rewriter.create<vector::TransferReadOp>(loc, resTy, memRef, indices,
-                                                 affineMap);
+  Value padding = rewriter.create<LLVM::UndefOp>(loc, resTy.getElementType());
+  VectorType maskType = resTy.cloneWith(std::nullopt, rewriter.getI1Type());
+  Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, resLen);
+  ArrayAttr inBounds = rewriter.getBoolArrayAttr({true});
+  return rewriter.create<vector::TransferReadOp>(
+      loc, resTy, memRef, indices, affineMap, padding, mask, inBounds);
 }
 
 Value loadRow(Location loc, PatternRewriter &rewriter, VectorType resTy,
-              const MemBuffer &buf, const Value &off2, const Value &off1) {
+              Value resLen, const MemBuffer &buf, const Value &off2,
+              const Value &off1) {
   assert(buf.indices.size() >= 2);
-  int64_t vecDim;
+  int64_t resDim;
   SmallVector<Value> indices = buf.indices;
   if (buf.transposed) {
     indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off2);
     indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off1);
-    vecDim = static_cast<int64_t>(buf.indices.size()) - 2;
+    resDim = static_cast<int64_t>(buf.indices.size()) - 2;
   } else {
     indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off1);
     indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off2);
-    vecDim = static_cast<int64_t>(buf.indices.size()) - 1;
+    resDim = static_cast<int64_t>(buf.indices.size()) - 1;
   }
-  return loadVec(loc, rewriter, resTy, vecDim, buf.memRef, indices);
+  return loadVec(loc, rewriter, resTy, resDim, resLen, buf.memRef, indices);
 }
 
 Value loadCol(Location loc, PatternRewriter &rewriter, VectorType resTy,
-              const MemBuffer &buf, const Value &off2, const Value &off1) {
+              Value resLen, const MemBuffer &buf, const Value &off2,
+              const Value &off1) {
   assert(buf.indices.size() >= 2);
-  int64_t vecDim;
+  int64_t resDim;
   SmallVector<Value> indices = buf.indices;
   if (buf.transposed) {
     indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off2);
     indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off1);
-    vecDim = static_cast<int64_t>(buf.indices.size()) - 1;
+    resDim = static_cast<int64_t>(buf.indices.size()) - 1;
   } else {
     indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off1);
     indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off2);
-    vecDim = static_cast<int64_t>(buf.indices.size()) - 2;
+    resDim = static_cast<int64_t>(buf.indices.size()) - 2;
   }
-  return loadVec(loc, rewriter, resTy, vecDim, buf.memRef, indices);
+  return loadVec(loc, rewriter, resTy, resDim, resLen, buf.memRef, indices);
 }
 
 SmallVector<Value> loadRows(Location loc, VectorType rowTy, int64_t rowNum,
-                            const MemBuffer &buf, const Value &subVecOff,
-                            PatternRewriter &rewriter) {
+                            Value colNum, const MemBuffer &buf,
+                            const Value &subVecOff, PatternRewriter &rewriter) {
   SmallVector<Value> vecs;
   vecs.reserve(rowNum);
   for (int64_t m = 0; m < rowNum; ++m) {
     Value cIndex_m = index_cst(m);
-    vecs.push_back(loadRow(loc, rewriter, rowTy, buf, cIndex_m, subVecOff));
+    vecs.push_back(
+        loadRow(loc, rewriter, rowTy, colNum, buf, cIndex_m, subVecOff));
   }
   return vecs;
 }
@@ -455,25 +475,26 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
     Value iv = forOp.getInductionVar();
     Value subVecOff = op_muli(iv, vl);
     Value remaining = op_subi(cIndex_n, subVecOff);
-    Value curVl = op_index_cast(rewriter.getI64Type(), op_minui(vl, remaining));
+    Value curVl_indexTy = op_minui(vl, remaining);
+    Value curVl = op_index_cast(rewriter.getI64Type(), curVl_indexTy);
 
     SmallVector<Value> accVecs;
     if (isAccZeroInit) {
       accVecs.reserve(mat_m);
     } else {
-      accVecs =
-          loadRows(loc, outputSubVecTy, mat_m, accBuf, subVecOff, rewriter);
+      accVecs = loadRows(loc, outputSubVecTy, mat_m, curVl_indexTy, accBuf,
+                         subVecOff, rewriter);
     }
 
-    Value nextRhsVec =
-        loadRow(loc, rewriter, inputSubVecTy, rhsBuf, index_cst(0), subVecOff);
+    Value nextRhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
+                               rhsBuf, index_cst(0), subVecOff);
     for (int64_t k = 0; k < mat_k; ++k) {
       Value rhsVec = nextRhsVec;
 
       // Load next vector in advance to hide load latency.
       if (k != mat_k - 1)
-        nextRhsVec = loadRow(loc, rewriter, inputSubVecTy, rhsBuf,
-                             index_cst(k + 1), subVecOff);
+        nextRhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
+                             rhsBuf, index_cst(k + 1), subVecOff);
 
       Value nextLhsScalar = loadScalar(loc, rewriter, lhsBuf, 0, k);
       for (int64_t m = 0; m < mat_m; ++m) {
@@ -542,129 +563,172 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
   Location loc = dotOp.getLoc();
 
   int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
-  const int64_t baseVlen = 64;
-  const int64_t baseInputVl = baseVlen / inputElemBitWidth;
+  const int64_t baseVlen_i64 = 64;
+  const int64_t baseArithVl_i64 =
+      baseVlen_i64 / inputElemBitWidth / (isWidening ? 2 : 1);
+  assert(baseArithVl_i64 > 0 &&
+         "Did you tried to widen an element from 64-bit to 128-bit?");
 
   VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
   VectorType inputSubVecTy =
-      VectorType::get({baseInputVl}, inputElemTy, {true});
+      VectorType::get({baseArithVl_i64}, inputElemTy, {true});
   VectorType outputSubVecTy =
-      VectorType::get({baseInputVl}, outputElemTy, {true});
+      VectorType::get({baseArithVl_i64}, outputElemTy, {true});
 
   Value resMat = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getZeroAttr(outputMatTy));
 
-  Value c_tumu = int_cst(rewriter.getI64Type(), 3);
-  Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
-  Value cIndex_0 = index_cst(0);
-  Value cIndex_1 = index_cst(1);
-  Value cIndex_baseInputVl = index_cst(baseInputVl);
-  Value cIndex_k = index_cst(mat_k);
+  Value tumu_cI64 = int_cst(rewriter.getI64Type(), 3);
+  Value frm_dyn_cI64 = int_cst(rewriter.getI64Type(), 7);
+  Value c0_cIndex = index_cst(0);
+  Value c1_cIndex = index_cst(1);
+  Value baseArithVl_cIndex = index_cst(baseArithVl_i64);
+  Value k_cIndex = index_cst(mat_k);
 
   Value vscale = getVscale(loc, rewriter);
-  Value vl = op_muli(vscale, cIndex_baseInputVl);
-  Value numSubVec = rewriter.create<arith::CeilDivSIOp>(loc, cIndex_k, vl);
+  Value arithVl_index = op_muli(vscale, baseArithVl_cIndex);
+  Value numSubVec =
+      rewriter.create<arith::CeilDivSIOp>(loc, k_cIndex, arithVl_index);
 
-  for (int64_t m = 0; m < mat_m; m++) {
-    for (int64_t n = 0; n < mat_n; n++) {
+  const int64_t MR = 4;
+  const int64_t NR = 4;
+
+  for (int64_t m = 0; m < mat_m; m += MR) {
+    for (int64_t n = 0; n < mat_n; n += NR) {
+      const int mr = std::min(MR, mat_m - m);
+      const int nr = std::min(NR, mat_n - n);
       // First round: use vmul.vv to avoid 0 initialize
-      Value accInit;
+      SmallVector<Value, MR * NR> sumInitVecs(mr * nr);
       {
         // Get VL
-        Value curVl =
-            op_index_cast(rewriter.getI64Type(), op_minui(vl, cIndex_k));
+        Value curVl_index = op_minui(arithVl_index, k_cIndex);
+        Value curVl_i64 = op_index_cast(rewriter.getI64Type(), curVl_index);
         // Get operands
-        Value lhsVec = loadRow(loc, rewriter, inputSubVecTy, lhsBuf,
-                               index_cst(m), cIndex_0);
-        Value rhsVec = loadCol(loc, rewriter, inputSubVecTy, rhsBuf, cIndex_0,
-                               index_cst(n));
-        // Prepare and call intrinsic
-        auto intrinsicName = getMulIntrinsicName(
-            rewriter, "mul", inputElemTy.isFloat(), isWidening);
-        SmallVector<Value> args;
-        auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
-        if (inputElemTy.isInteger()) {
-          args = {poison, lhsVec, rhsVec, curVl};
-        } else {
-          args = {poison, lhsVec, rhsVec, c_frm_dyn, curVl};
+        SmallVector<Value, MR> lhsVec(mr);
+        SmallVector<Value, NR> rhsVec(nr);
+        for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
+          lhsVec[i_mr] = loadRow(loc, rewriter, inputSubVecTy, curVl_index,
+                                 lhsBuf, index_cst(m + i_mr), c0_cIndex);
         }
-        auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-            loc, outputSubVecTy, intrinsicName, args);
-        // Set intrinsic result as initial accumulator
-        accInit = callIntrinsicOp.getResult(0);
+        for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
+          rhsVec[i_nr] = loadCol(loc, rewriter, inputSubVecTy, curVl_index,
+                                 rhsBuf, c0_cIndex, index_cst(n + i_nr));
+        }
+        // Fillin sumInitVecs
+        for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
+          for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
+            const int64_t id_region_iter = i_mr * nr + i_nr;
+            // Prepare and call intrinsic
+            auto intrinsicName = getMulIntrinsicName(
+                rewriter, "mul", inputElemTy.isFloat(), isWidening);
+            SmallVector<Value> args;
+            auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
+            if (inputElemTy.isInteger()) {
+              args = {poison, lhsVec[i_mr], rhsVec[i_nr], curVl_i64};
+            } else {
+              args = {poison, lhsVec[i_mr], rhsVec[i_nr], frm_dyn_cI64,
+                      curVl_i64};
+            }
+            auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+                loc, outputSubVecTy, intrinsicName, args);
+            // Set intrinsic result as initial accumulator
+            sumInitVecs[id_region_iter] = callIntrinsicOp.getResult(0);
+          }
+        }
       }
 
       // Following rounds: use vmacc.vv
-      auto forOp = rewriter.create<scf::ForOp>(
-          loc, cIndex_1, numSubVec, cIndex_1, ArrayRef<Value>{accInit});
+      auto forOp = rewriter.create<scf::ForOp>(loc, c1_cIndex, numSubVec,
+                                               c1_cIndex, sumInitVecs);
       {
         // Get VL
         OpBuilder::InsertionGuard guard(rewriter);
         auto forBody = forOp.getBody();
         rewriter.setInsertionPointToStart(forBody);
         Value iv = forOp.getInductionVar();
-        Value subVecOff = op_muli(iv, vl);
-        Value remaining = op_subi(cIndex_k, subVecOff);
-        Value curVl =
-            op_index_cast(rewriter.getI64Type(), op_minui(vl, remaining));
+        Value subVecOff = op_muli(iv, arithVl_index);
+        Value remaining = op_subi(k_cIndex, subVecOff);
+        Value curVl_index = op_minui(arithVl_index, k_cIndex);
+        Value curVl_i64 = op_index_cast(rewriter.getI64Type(), curVl_index);
         // Get operands
-        Value lhsVec = loadRow(loc, rewriter, inputSubVecTy, lhsBuf,
-                               index_cst(m), subVecOff);
-        Value rhsVec = loadCol(loc, rewriter, inputSubVecTy, rhsBuf, subVecOff,
-                               index_cst(n));
-        Value sumVec = forOp.getRegionIterArg(0);
-        // Prepare and call intrinsic
-        auto intrinsicName = getMulIntrinsicName(
-            rewriter, "macc", inputElemTy.isFloat(), isWidening);
-        SmallVector<Value> args;
-        if (inputElemTy.isInteger()) {
-          args = {sumVec, lhsVec, rhsVec, curVl, c_tumu};
-        } else {
-          args = {sumVec, lhsVec, rhsVec, c_frm_dyn, curVl, c_tumu};
+        SmallVector<Value, MR> lhsVec(mr);
+        SmallVector<Value, NR> rhsVec(nr);
+        for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
+          lhsVec[i_mr] = loadRow(loc, rewriter, inputSubVecTy, curVl_index,
+                                 lhsBuf, index_cst(m + i_mr), subVecOff);
         }
-        auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-            loc, outputSubVecTy, intrinsicName, args);
+        for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
+          rhsVec[i_nr] = loadCol(loc, rewriter, inputSubVecTy, curVl_index,
+                                 rhsBuf, subVecOff, index_cst(n + i_nr));
+        }
+        // Update sumVec
+        SmallVector<Value, MR * NR> newSumVecs(mr * nr);
+        for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
+          for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
+            const int64_t id_region_iter = i_mr * nr + i_nr;
+            // Prepare and call intrinsic
+            Value sumVec = forOp.getRegionIterArg(id_region_iter);
+            auto intrinsicName = getMulIntrinsicName(
+                rewriter, "macc", inputElemTy.isFloat(), isWidening);
+            SmallVector<Value> args;
+            if (inputElemTy.isInteger()) {
+              args = {sumVec, lhsVec[i_mr], rhsVec[i_nr], curVl_i64, tumu_cI64};
+            } else {
+              args = {sumVec,       lhsVec[i_mr], rhsVec[i_nr],
+                      frm_dyn_cI64, curVl_i64,    tumu_cI64};
+            }
+            auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+                loc, outputSubVecTy, intrinsicName, args);
+            newSumVecs[id_region_iter] = callIntrinsicOp.getResult(0);
+          }
+        }
         // Yield intrinsic result
         rewriter.setInsertionPointToEnd(forBody);
-        rewriter.create<mlir::scf::YieldOp>(
-            loc, ValueRange{callIntrinsicOp.getResult(0)});
+        rewriter.create<mlir::scf::YieldOp>(loc, newSumVecs);
       }
-      Value sumVec = forOp.getResult(0);
+      SmallVector<Value, MR * NR> sumVecs(forOp.getResults());
 
       // Reduction: Sum the accumulated results horizontally.
-      Value newAccScalar;
-      {
-        int64_t baseOutputVl = baseVlen / outputElemTy.getIntOrFloatBitWidth();
-        VectorType redVecTy =
-            VectorType::get({baseOutputVl}, outputElemTy, {true});
-        Value poison = rewriter.create<LLVM::PoisonOp>(loc, redVecTy);
-        Value redSumScalar;
-        if (isAccZeroInit) {
-          auto zeroAttr = rewriter.getZeroAttr(outputElemTy);
-          redSumScalar =
-              rewriter.create<arith::ConstantOp>(loc, outputElemTy, zeroAttr);
-        } else {
-          redSumScalar = loadScalar(loc, rewriter, accBuf, m, n);
+      for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
+        for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
+          const int64_t id_region_iter = i_mr * nr + i_nr;
+          Value newAccScalar;
+          int64_t baseReduceVl =
+              baseVlen_i64 / outputElemTy.getIntOrFloatBitWidth();
+          VectorType redVecTy =
+              VectorType::get({baseReduceVl}, outputElemTy, {true});
+          Value poison = rewriter.create<LLVM::PoisonOp>(loc, redVecTy);
+          Value redSumScalar;
+          if (isAccZeroInit) {
+            auto zeroAttr = rewriter.getZeroAttr(outputElemTy);
+            redSumScalar =
+                rewriter.create<arith::ConstantOp>(loc, outputElemTy, zeroAttr);
+          } else {
+            redSumScalar =
+                loadScalar(loc, rewriter, accBuf, m + i_mr, n + i_nr);
+          }
+          Value redSum = rewriter.create<vector::InsertOp>(
+              loc, redSumScalar, poison, SmallVector<int64_t>({0}));
+          Value curVl = op_index_cast(rewriter.getI64Type(),
+                                      op_minui(arithVl_index, k_cIndex));
+          SmallVector<Value> args;
+          if (outputElemTy.isInteger()) {
+            args = {poison, sumVecs[id_region_iter], redSum, curVl};
+          } else {
+            args = {poison, sumVecs[id_region_iter], redSum, frm_dyn_cI64,
+                    curVl};
+          }
+          auto intrinsicName = getReduceIntrinsicName(
+              rewriter, "sum", outputElemTy.isFloat(), "u");
+          auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+              loc, redVecTy, intrinsicName, args);
+          auto newRedSum = callIntrinsicOp.getResult(0);
+          newAccScalar = rewriter.create<vector::ExtractOp>(loc, newRedSum, 0);
+          resMat = rewriter.create<vector::InsertOp>(
+              loc, newAccScalar, resMat,
+              SmallVector<int64_t>({m + i_mr, n + i_nr}));
         }
-        Value redSum = rewriter.create<vector::InsertOp>(
-            loc, redSumScalar, poison, SmallVector<int64_t>({0}));
-        Value curVl =
-            op_index_cast(rewriter.getI64Type(), op_minui(vl, cIndex_k));
-        SmallVector<Value> args;
-        if (outputElemTy.isInteger()) {
-          args = {poison, sumVec, redSum, curVl};
-        } else {
-          args = {poison, sumVec, redSum, c_frm_dyn, curVl};
-        }
-        auto intrinsicName = getReduceIntrinsicName(
-            rewriter, "sum", outputElemTy.isFloat(), "u");
-        auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-            loc, redVecTy, intrinsicName, args);
-        auto newRedSum = callIntrinsicOp.getResult(0);
-        newAccScalar = rewriter.create<vector::ExtractOp>(loc, newRedSum, 0);
       }
-      resMat = rewriter.create<vector::InsertOp>(loc, newAccScalar, resMat,
-                                                 SmallVector<int64_t>({m, n}));
     }
   }
 
@@ -710,8 +774,13 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
                                      isAccZeroInit);
   }
   case INNER: {
-    return convertToInnerProductGemm(candidate, rewriter, accBuf,
-                                     isAccZeroInit);
+    if (candidate.isWidening) {
+      return convertToInnerProductGemm(candidate, rewriter, accBuf,
+                                       isAccZeroInit);
+    } else {
+      return convertToInnerProductGemm(candidate, rewriter, accBuf,
+                                       isAccZeroInit);
+    }
   }
   default: {
     llvm_unreachable("Unknown dot style.");
