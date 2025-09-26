@@ -18,7 +18,7 @@ from triton._C.libtriton import llvm
 _dirname = os.getenv("TRITON_SYS_PATH", default="/usr/local")
 # for locating libTritonCPURuntime
 try:
-    _triton_C_dir = importlib.resources.files(triton).joinpath("_C")
+    _triton_C_dir = str(importlib.resources.files(triton).joinpath("_C"))
 except AttributeError:
     # resources.files() doesn't exist for Python < 3.9
     _triton_C_dir = importlib.resources.path(triton, "_C").__enter__()
