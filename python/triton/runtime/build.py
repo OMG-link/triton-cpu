@@ -120,7 +120,6 @@ def _build(name: str, src: str, srcdir: str, library_dirs: list[str], include_di
             if cpu_abi is None:
                 # Default to lp64d if TRITON_CPU_ABI is not set
                 cc_cmd += ["-mabi=lp64d"]
-                cc_cmd += ["-mcpu=spacemit-x60"]
     cc_cmd.extend(ccflags)
 
     proc = subprocess.run(cc_cmd, capture_output=True, text=True, check=False)

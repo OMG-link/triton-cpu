@@ -866,14 +866,9 @@ void init_triton_llvm(py::module &&m) {
             }
           }
           // --- END MODIFICATION ---
-          // FIXME getHostCPUName无法识别 -mcpu=spacemit-x60
-          // res = translateLLVMIRToASM(*module, triple,
-          //                            llvm::sys::getHostCPUName().str(),
-          //                            features_str, {}, enable_fp_fusion,
-          //                            false, enable_fast_math);
-          // hardcode -mcpu=spacemit-x60 会指定默认 arch/features/tune flags
-          res = translateLLVMIRToASM(*module, triple, "spacemit-x60", "", {},
-                                     enable_fp_fusion, false, enable_fast_math);
+          res = translateLLVMIRToASM(
+              *module, triple, llvm::sys::getHostCPUName().str(), features_str,
+              {}, enable_fp_fusion, false, enable_fast_math);
         }
         return py::str(res);
       },
