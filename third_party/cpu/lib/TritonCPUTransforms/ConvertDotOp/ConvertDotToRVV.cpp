@@ -486,23 +486,12 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
                          subVecOff, rewriter);
     }
 
-    Value nextRhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
-                               rhsBuf, index_cst(0), subVecOff);
     for (int64_t k = 0; k < mat_k; ++k) {
-      Value rhsVec = nextRhsVec;
+      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
+                             rhsBuf, index_cst(k), subVecOff);
 
-      // Load next vector in advance to hide load latency.
-      if (k != mat_k - 1)
-        nextRhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
-                             rhsBuf, index_cst(k + 1), subVecOff);
-
-      Value nextLhsScalar = loadScalar(loc, rewriter, lhsBuf, 0, k);
       for (int64_t m = 0; m < mat_m; ++m) {
-        Value lhsScalar = nextLhsScalar;
-
-        // Load next value in advance to hide load latency.
-        if (m != mat_m - 1)
-          nextLhsScalar = loadScalar(loc, rewriter, lhsBuf, m + 1, k);
+        Value lhsScalar = loadScalar(loc, rewriter, lhsBuf, m, k);
 
         // Call intrinsic to do macc
         Value newAccVec;
