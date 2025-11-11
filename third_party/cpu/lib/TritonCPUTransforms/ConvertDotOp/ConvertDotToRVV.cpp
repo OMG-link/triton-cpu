@@ -392,20 +392,45 @@ SmallVector<Value> loadRows(Location loc, VectorType rowTy, int64_t rowNum,
   return vecs;
 }
 
-void storeRow(Location loc, const MemBuffer &buf, int64_t rowIdx, Value vec,
-              const Value &subVecOff, PatternRewriter &rewriter) {
-  SmallVector<Value> indices = buf.indices;
-  indices[indices.size() - 2] =
-      shiftIndex(loc, buf.indices[indices.size() - 2], rowIdx, rewriter);
-  indices[indices.size() - 1] = subVecOff;
-  rewriter.create<vector::StoreOp>(loc, vec, buf.memRef, indices);
+void storeVec(Location loc, PatternRewriter &rewriter, Value vec,
+              int64_t resDim, Value resLen, const Value &memRef,
+              ValueRange indices) {
+  VectorType vecTy = cast<VectorType>(vec.getType());
+  assert(vecTy.getRank() == 1);
+  AffineExpr resDimAffineExpr = rewriter.getAffineDimExpr(resDim);
+  AffineMap affineMap = AffineMap::get(indices.size(), 0, resDimAffineExpr);
+  AffineMapAttr affineMapAttr = AffineMapAttr::get(affineMap);
+  ArrayAttr inBounds = rewriter.getBoolArrayAttr({true});
+  VectorType maskType = vecTy.cloneWith(std::nullopt, rewriter.getI1Type());
+  Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, resLen);
+  rewriter.create<vector::TransferWriteOp>(loc, vec, memRef, indices,
+                                           affineMapAttr, mask, inBounds);
 }
 
-void storeRows(Location loc, const MemBuffer &buf,
-               const SmallVector<Value> &vecs, const Value &subVecOff,
+void storeRow(Location loc, PatternRewriter &rewriter, Value vec, Value resLen,
+              const MemBuffer &buf, const Value &off2, const Value &off1) {
+  assert(buf.indices.size() >= 2);
+  int64_t resDim;
+  SmallVector<Value> indices = buf.indices;
+  if (buf.transposed) {
+    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off2);
+    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off1);
+    resDim = static_cast<int64_t>(buf.indices.size()) - 2;
+  } else {
+    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off1);
+    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off2);
+    resDim = static_cast<int64_t>(buf.indices.size()) - 1;
+  }
+  storeVec(loc, rewriter, vec, resDim, resLen, buf.memRef, indices);
+}
+
+void storeRows(Location loc, const MemBuffer &buf, ArrayRef<Value> vecs,
+               Value colNum, const Value &subVecOff,
                PatternRewriter &rewriter) {
-  for (int64_t m = 0; m < vecs.size(); ++m)
-    storeRow(loc, buf, m, vecs[m], subVecOff, rewriter);
+  for (size_t m = 0; m < vecs.size(); ++m) {
+    Value cIndex_m = index_cst(static_cast<int64_t>(m));
+    storeRow(loc, rewriter, vecs[m], colNum, buf, cIndex_m, subVecOff);
+  }
 }
 
 StringAttr getMulIntrinsicName(PatternRewriter &rewriter, StringRef opName,
@@ -572,7 +597,7 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
       rewriter.create<scf::YieldOp>(loc, accVecs);
     } // end of for-op-k
     accVecs = forOpK.getResults();
-    storeRows(loc, accBuf, accVecs, subVecOff, rewriter);
+    storeRows(loc, accBuf, accVecs, curVl_index, subVecOff, rewriter);
 
   } // end of for-op-n: rewriter will be set back to where it was automatically
 
