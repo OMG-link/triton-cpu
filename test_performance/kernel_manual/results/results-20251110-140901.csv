@@ -1,0 +1,7 @@
+timestamp,test_name,returncode,cmd,cycles,l1d_access,l1d_miss,miss_rate,n_fma,theoretical_cycle,actual_cycle,actual_theoretical_ratio,actual_theoretical_ratio_pct,fma_per_cycle_eff,efficiency_percent,meta.k,meta.m,meta.n
+20251110-140901,example_echo,0,"/bin/sh -c echo ""cycle = 1000	 l1d_access = 800	 l1d_miss = 80	 miss_rate = 10.00%
+乘加数: 282624
+理论需要周期数: 17664
+实际执行周期数: 20000
+实际-理论比值: 1.13 (88.32%)
+""",1000.0,800.0,80.0,10.0,282624.0,17664.0,20000.0,1.13,88.32,14.1312,88.32,1536,144,128
