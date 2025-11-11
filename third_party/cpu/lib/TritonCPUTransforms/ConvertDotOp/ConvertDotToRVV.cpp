@@ -421,6 +421,21 @@ StringAttr getReduceIntrinsicName(PatternRewriter &rewriter, StringRef opName,
   return rewriter.getStringAttr(name);
 }
 
+/**
+ * Get VMUL according to the number of accumulating vectors.
+ */
+int64_t getVmul(int64_t n, bool isWidening) {
+  // Assume VMUL=1, we need n VREGs for accumulate (2n if widening) and 2 VREGs
+  // for input (with prefetch buffer).
+  int64_t vmul = 32 / (n * (isWidening ? 2 : 1) + 2);
+  // VMUL must be a power of 2.
+  vmul = 1ll << (63 - __builtin_clzll(vmul));
+  // VMUL must be at least 1, and at most 8 (4 if widening). (For RVV 1.0)
+  vmul = std::max<int64_t>(vmul, 1);
+  vmul = std::min<int64_t>(vmul, isWidening ? 4 : 8);
+  return vmul;
+}
+
 LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
                                         PatternRewriter &rewriter,
                                         MemBuffer accBuf, bool isAccZeroInit) {
@@ -437,8 +452,9 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   Location loc = dotOp.getLoc();
 
   int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
+  int64_t vmul = getVmul(mat_m, isWidening);
   const int64_t baseVlen = 64;
-  const int64_t baseInputVl = baseVlen / inputElemBitWidth;
+  const int64_t baseInputVl = vmul * baseVlen / inputElemBitWidth;
 
   VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
   VectorType inputSubVecTy =
