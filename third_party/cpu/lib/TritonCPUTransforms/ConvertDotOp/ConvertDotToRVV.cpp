@@ -603,7 +603,6 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
 
   // The result is in accBuf. We should load it and replace the original
   // constraction result.
-  VectorType resTy = outputMatTy.cloneWith(std::nullopt, outputElemTy);
   Value newAccMat = op_read(outputMatTy, accBuf.memRef, accBuf.indices);
   rewriter.replaceOp(dotOp, newAccMat);
 
