@@ -737,8 +737,8 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
             redSumScalar =
                 rewriter.create<arith::ConstantOp>(loc, outputElemTy, zeroAttr);
           } else {
-            redSumScalar =
-                loadScalar(loc, rewriter, accBuf, m + i_mr, n + i_nr);
+            redSumScalar = loadScalar(loc, rewriter, accBuf,
+                                      index_cst(m + i_mr), index_cst(n + i_nr));
           }
           Value redSum = rewriter.create<vector::InsertOp>(
               loc, redSumScalar, poison, SmallVector<int64_t>({0}));
