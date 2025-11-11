@@ -301,23 +301,23 @@ Value getVscale(Location loc, PatternRewriter &rewriter) {
 }
 
 SmallVector<Value> shiftIndices(Location loc, ArrayRef<Value> indices,
-                                bool transposed, int64_t m, int64_t n,
+                                bool transposed, Value m, Value n,
                                 PatternRewriter &rewriter) {
   SmallVector<Value> res(indices.begin(), indices.end() - 2);
   if (transposed)
     std::swap(m, n);
-  res.push_back(shiftIndex(loc, *(indices.end() - 2), m, rewriter));
-  res.push_back(shiftIndex(loc, *(indices.end() - 1), n, rewriter));
+  res.push_back(op_addi(*(indices.end() - 2), m));
+  res.push_back(op_addi(*(indices.end() - 1), n));
   return res;
 }
 
-SmallVector<Value> shiftIndices(Location loc, const MemBuffer &buf, int64_t m,
-                                int64_t n, PatternRewriter &rewriter) {
+SmallVector<Value> shiftIndices(Location loc, const MemBuffer &buf, Value m,
+                                Value n, PatternRewriter &rewriter) {
   return shiftIndices(loc, buf.indices, buf.transposed, m, n, rewriter);
 }
 
 Value loadScalar(Location loc, PatternRewriter &rewriter, const MemBuffer &buf,
-                 int64_t m, int64_t n) {
+                 Value m, Value n) {
   SmallVector<Value> indices = shiftIndices(loc, buf, m, n, rewriter);
   return rewriter.create<memref::LoadOp>(loc, buf.memRef, indices);
 }
@@ -464,15 +464,15 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   Value vscale = getVscale(loc, rewriter);
   Value vl = op_muli(vscale, cIndex_baseVl);
   Value numSubVec = rewriter.create<arith::CeilDivSIOp>(loc, cIndex_n, vl);
-  auto forOp = rewriter.create<scf::ForOp>(loc, cIndex_0, numSubVec, cIndex_1);
+  auto forOpN = rewriter.create<scf::ForOp>(loc, cIndex_0, numSubVec, cIndex_1);
 
   // For-op body: this for-op divide <* x N> vector into <* x VL> one
   {
     OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(forOp.getBody());
+    rewriter.setInsertionPointToStart(forOpN.getBody());
 
     // curVl = min(vl, n - iv * vl)
-    Value iv = forOp.getInductionVar();
+    Value iv = forOpN.getInductionVar();
     Value subVecOff = op_muli(iv, vl);
     Value remaining = op_subi(cIndex_n, subVecOff);
     Value curVl_indexTy = op_minui(vl, remaining);
@@ -480,52 +480,80 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
 
     SmallVector<Value> accVecs;
     if (isAccZeroInit) {
-      accVecs.reserve(mat_m);
+      accVecs.resize(mat_m);
     } else {
       accVecs = loadRows(loc, outputSubVecTy, mat_m, curVl_indexTy, accBuf,
                          subVecOff, rewriter);
     }
 
-    for (int64_t k = 0; k < mat_k; ++k) {
+    auto doMul = [&](Value lhsScalar, Value rhsVec) {
+      auto intrinsicName = getMulIntrinsicName(
+          rewriter, "mul", inputElemTy.isFloat(), isWidening);
+      SmallVector<Value> args;
+      auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
+      if (inputElemTy.isInteger()) {
+        args = {poison, rhsVec, lhsScalar, curVl};
+      } else {
+        args = {poison, rhsVec, lhsScalar, c_frm_dyn, curVl};
+      }
+      auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+          loc, outputSubVecTy, intrinsicName, args);
+      return callIntrinsicOp.getResult(0);
+    };
+
+    auto doMacc = [&](Value accVec, Value lhsScalar, Value rhsVec) {
+      auto intrinsicName = getMulIntrinsicName(
+          rewriter, "macc", inputElemTy.isFloat(), isWidening);
+      SmallVector<Value> args;
+      if (inputElemTy.isInteger()) {
+        args = {accVec, lhsScalar, rhsVec, curVl, c_tumu};
+      } else {
+        args = {accVec, lhsScalar, rhsVec, c_frm_dyn, curVl, c_tumu};
+      }
+      auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+          loc, outputSubVecTy, intrinsicName, args);
+      return callIntrinsicOp.getResult(0);
+    };
+
+    // k = 0
+    {
+      Value cIndex_k = index_cst(0);
       Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
-                             rhsBuf, index_cst(k), subVecOff);
-
+                             rhsBuf, cIndex_k, subVecOff);
       for (int64_t m = 0; m < mat_m; ++m) {
-        Value lhsScalar = loadScalar(loc, rewriter, lhsBuf, m, k);
-
-        // Call intrinsic to do macc
-        Value newAccVec;
-        if (k == 0 && isAccZeroInit) {
-          auto intrinsicName = getMulIntrinsicName(
-              rewriter, "mul", inputElemTy.isFloat(), isWidening);
-          SmallVector<Value> args;
-          auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
-          if (inputElemTy.isInteger()) {
-            args = {poison, rhsVec, lhsScalar, curVl};
-          } else {
-            args = {poison, rhsVec, lhsScalar, c_frm_dyn, curVl};
-          }
-          auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-              loc, outputSubVecTy, intrinsicName, args);
-          accVecs.push_back(callIntrinsicOp.getResult(0));
+        Value lhsScalar =
+            loadScalar(loc, rewriter, lhsBuf, index_cst(m), cIndex_k);
+        if (isAccZeroInit) {
+          accVecs[m] = doMul(lhsScalar, rhsVec);
         } else {
-          auto intrinsicName = getMulIntrinsicName(
-              rewriter, "macc", inputElemTy.isFloat(), isWidening);
-          SmallVector<Value> args;
-          if (inputElemTy.isInteger()) {
-            args = {accVecs[m], lhsScalar, rhsVec, curVl, c_tumu};
-          } else {
-            args = {accVecs[m], lhsScalar, rhsVec, c_frm_dyn, curVl, c_tumu};
-          }
-          auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-              loc, outputSubVecTy, intrinsicName, args);
-          accVecs[m] = callIntrinsicOp.getResult(0);
+          accVecs[m] = doMacc(accVecs[m], lhsScalar, rhsVec);
         }
       }
     }
+
+    // for k in [1, mat_k)
+    auto forOpK = rewriter.create<scf::ForOp>(
+        loc, index_cst(1), index_cst(mat_k), index_cst(1), accVecs);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(forOpK.getBody());
+
+      Value cIndex_k = forOpK.getInductionVar();
+      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
+                             rhsBuf, cIndex_k, subVecOff);
+
+      SmallVector<Value> accVecs(mat_m);
+      for (int64_t m = 0; m < mat_m; ++m) {
+        Value lhsScalar =
+            loadScalar(loc, rewriter, lhsBuf, index_cst(m), cIndex_k);
+        accVecs[m] = doMacc(forOpK.getRegionIterArg(m), lhsScalar, rhsVec);
+      }
+      rewriter.create<scf::YieldOp>(loc, accVecs);
+    } // end of for-op-k
+    accVecs = forOpK.getResults();
     storeRows(loc, accBuf, accVecs, subVecOff, rewriter);
 
-  } // end of for-op: rewriter will be set back to where it was automatically
+  } // end of for-op-n: rewriter will be set back to where it was automatically
 
   // The result is in accBuf. We should load it and replace the original
   // constraction result.
