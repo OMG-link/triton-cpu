@@ -264,40 +264,45 @@ static inline int64_t tryReadVlenb() {
 #endif
 }
 
-// Returns: VSCALE of type 'index'
-Value getVscale(Location loc, PatternRewriter &rewriter) {
+int64_t getVlen() {
   std::string RVV_VLEN = mlir::triton::tools::getStrEnv("RVV_VLEN");
   // if RVV_VLEN is defined
   if (!RVV_VLEN.empty()) {
     if (RVV_VLEN == "dynamic") {
-      return rewriter.create<vector::VectorScaleOp>(loc,
-                                                    rewriter.getIndexType());
+      return -1;
     } else if (RVV_VLEN == "local") {
       int vlenb = tryReadVlenb();
       if (vlenb > 0) {
-        return index_cst(vlenb / 8);
+        return vlenb * 8;
       } else {
-        emitWarning(loc,
-                    "Environment variable RVV_VLEN is set to 'local', but "
-                    "triton compiler is not compiled with RISCV-V-Extension.");
+        return -1;
       }
     } else {
       char *end;
       long vlen = strtol(RVV_VLEN.c_str(), &end, 10);
       if (*end == '\0') {
         if (vlen >= 64 && (vlen & (vlen - 1)) == 0) {
-          return index_cst(vlen / 64);
+          return vlen;
         }
       }
-      emitWarning(loc) << "Invalid RVV_VLEN option: " << RVV_VLEN;
     }
   }
   // fallback
   int vlenb = tryReadVlenb();
   if (vlenb > 0) {
-    return index_cst(vlenb / 8);
+    return vlenb * 8;
   }
-  return rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+  return -1;
+}
+
+// Returns: VSCALE of type 'index'
+Value getVscale(Location loc, PatternRewriter &rewriter) {
+  int vlen = getVlen();
+  if (vlen > 0) {
+    return rewriter.create<arith::ConstantIndexOp>(loc, vlen / 64);
+  } else {
+    return rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+  }
 }
 
 SmallVector<Value> shiftIndices(Location loc, ArrayRef<Value> indices,
