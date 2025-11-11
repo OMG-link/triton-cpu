@@ -506,36 +506,26 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   Value cIndex_baseVl = index_cst(baseInputVl);
   Value cIndex_n = index_cst(mat_n);
 
+  Value vscale = getVscale(loc, rewriter);
+  Value vl = op_muli(vscale, cIndex_baseVl);
+
   // We will do GEMM by multiplying an <M x 1> vector with an <1 x N> vector.
   // To do so, we multiply <1 x 1> scalar with <1 x N> vector.
   // As N is given by the user, it can be too large for single vector register.
   // We need to divide <1 x N> vector into <1 x VL> one, where VL is the number
   // of elements single vector register can hold.
 
-  // Divide <1 x N> vector into <1 x VL> one.
-  // We do this first to achieve the best performance.
-  Value vscale = getVscale(loc, rewriter);
-  Value vl = op_muli(vscale, cIndex_baseVl);
-  Value numSubVec = rewriter.create<arith::CeilDivSIOp>(loc, cIndex_n, vl);
-  auto forOpN = rewriter.create<scf::ForOp>(loc, cIndex_0, numSubVec, cIndex_1);
-
-  // For-op body: this for-op divide <* x N> vector into <* x VL> one
-  {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(forOpN.getBody());
-
-    // curVl = min(vl, n - iv * vl)
-    Value iv = forOpN.getInductionVar();
+  // Code generator that computes <M x K> x <K x VL>.
+  // When 'curVl' is null, it computes as many elements as possible.
+  auto genForOpK = [&](Value iv, Value curVl_index) {
     Value subVecOff = op_muli(iv, vl);
-    Value remaining = op_subi(cIndex_n, subVecOff);
-    Value curVl_indexTy = op_minui(vl, remaining);
-    Value curVl = op_index_cast(rewriter.getI64Type(), curVl_indexTy);
+    Value curVl_i64 = op_index_cast(rewriter.getI64Type(), curVl_index);
 
     SmallVector<Value> accVecs;
     if (isAccZeroInit) {
       accVecs.resize(mat_m);
     } else {
-      accVecs = loadRows(loc, outputSubVecTy, mat_m, curVl_indexTy, accBuf,
+      accVecs = loadRows(loc, outputSubVecTy, mat_m, curVl_index, accBuf,
                          subVecOff, rewriter);
     }
 
@@ -545,9 +535,9 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
       SmallVector<Value> args;
       auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
       if (inputElemTy.isInteger()) {
-        args = {poison, rhsVec, lhsScalar, curVl};
+        args = {poison, rhsVec, lhsScalar, curVl_i64};
       } else {
-        args = {poison, rhsVec, lhsScalar, c_frm_dyn, curVl};
+        args = {poison, rhsVec, lhsScalar, c_frm_dyn, curVl_i64};
       }
       auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
           loc, outputSubVecTy, intrinsicName, args);
@@ -559,9 +549,9 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
           rewriter, "macc", inputElemTy.isFloat(), isWidening);
       SmallVector<Value> args;
       if (inputElemTy.isInteger()) {
-        args = {accVec, lhsScalar, rhsVec, curVl, c_tumu};
+        args = {accVec, lhsScalar, rhsVec, curVl_i64, c_tumu};
       } else {
-        args = {accVec, lhsScalar, rhsVec, c_frm_dyn, curVl, c_tumu};
+        args = {accVec, lhsScalar, rhsVec, c_frm_dyn, curVl_i64, c_tumu};
       }
       auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
           loc, outputSubVecTy, intrinsicName, args);
@@ -571,8 +561,8 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
     // k = 0
     {
       Value cIndex_k = index_cst(0);
-      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
-                             rhsBuf, cIndex_k, subVecOff);
+      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_index, rhsBuf,
+                             cIndex_k, subVecOff);
       for (int64_t m = 0; m < mat_m; ++m) {
         Value lhsScalar =
             loadScalar(loc, rewriter, lhsBuf, index_cst(m), cIndex_k);
@@ -592,8 +582,8 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
       rewriter.setInsertionPointToStart(forOpK.getBody());
 
       Value cIndex_k = forOpK.getInductionVar();
-      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_indexTy,
-                             rhsBuf, cIndex_k, subVecOff);
+      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_index, rhsBuf,
+                             cIndex_k, subVecOff);
 
       SmallVector<Value> accVecs(mat_m);
       for (int64_t m = 0; m < mat_m; ++m) {
@@ -605,8 +595,35 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
     } // end of for-op-k
     accVecs = forOpK.getResults();
     storeRows(loc, accBuf, accVecs, curVl_index, subVecOff, rewriter);
+  };
 
-  } // end of for-op-n: rewriter will be set back to where it was automatically
+  // Divide <K x N> vector into <K x VL> ones.
+  // We do this first to achieve the best performance.
+  Value numSubVec = rewriter.create<arith::DivSIOp>(loc, cIndex_n, vl);
+  auto forOpN = rewriter.create<scf::ForOp>(loc, cIndex_0, numSubVec, cIndex_1);
+  // Process each <M x K> x <K x VL> sub-matrix-product.
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(forOpN.getBody());
+    // vector::TransferReadOp can identify algebraic VL limits and
+    // automatically remove unnecessary limits when lowering. To use this
+    // feature, we construct another algebraic VL here.
+    Value algebraicVl =
+        op_muli(rewriter.create<vector::VectorScaleOp>(loc), cIndex_baseVl);
+    genForOpK(forOpN.getInductionVar(), algebraicVl);
+  }
+  // Process the remaining <K x (N % VL)> vector if N is not multiple of VL.
+  Value nModVl = rewriter.create<arith::RemSIOp>(loc, cIndex_n, vl);
+  auto ifOpRem = rewriter.create<scf::IfOp>(
+      loc,
+      rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, nModVl,
+                                     cIndex_0),
+      /*withElseRegion=*/false);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(ifOpRem.getBody());
+    genForOpK(numSubVec, nModVl);
+  }
 
   // The result is in accBuf. We should load it and replace the original
   // constraction result.
