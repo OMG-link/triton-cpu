@@ -455,15 +455,15 @@ StringAttr getReduceIntrinsicName(PatternRewriter &rewriter, StringRef opName,
 /**
  * Get VMUL according to the number of accumulating vectors.
  */
-int64_t getVmul(int64_t numVec, int64_t bitsToHold, bool isWidening) {
+int64_t getVmul(int64_t numAcc, int64_t bitsToHold, bool isWidening) {
   // Assume VMUL=1, we need n VREGs for accumulate (2n if widening) and 2 VREGs
   // for input (with prefetch buffer).
-  int64_t vmul = 32 / (numVec * (isWidening ? 2 : 1) + 2);
+  int64_t vmul = 32 / (numAcc * (isWidening ? 2 : 1) + 2);
   // Avoid allocate too many VREGs.
   if (auto vlen = getVlen(); vlen > 0) {
     int64_t vregNeeded = (bitsToHold + vlen - 1) / vlen;
     // Ceil to a power of 2
-    int64_t maxVmul = 1ll << (64 - __builtin_clzll(vregNeeded - 1) - 1);
+    int64_t maxVmul = 1ll << (64 - __builtin_clzll(vregNeeded - 1));
     vmul = std::min<int64_t>(vmul, maxVmul);
   }
   // VMUL must be a power of 2.
@@ -490,7 +490,10 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   Location loc = dotOp.getLoc();
 
   int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
-  int64_t vmul = getVmul(mat_m, mat_n * inputElemBitWidth, isWidening);
+  // If mat_k==1, the result is available immediately. No accumulation is
+  // needed.
+  int64_t vmul = getVmul(/*numAcc=*/mat_k > 1 ? mat_m : 1,
+                         /*bitsToHold=*/mat_n * inputElemBitWidth, isWidening);
   const int64_t baseVlen = 64;
   const int64_t baseInputVl = vmul * baseVlen / inputElemBitWidth;
 
