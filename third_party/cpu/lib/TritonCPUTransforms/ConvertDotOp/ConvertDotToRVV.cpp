@@ -144,20 +144,21 @@ int64_t findLowestDim(MemRefType memRefType) {
     return lowestDim;
   } else {
     // Failed to get strides? Don't know what happened.
-    return 0;
+    // Return the last dimension as default.
+    return memRefType.getRank() - 1;
   }
 }
 
 int64_t findLowestDim(const MemBuffer &buf) {
   if (buf.empty()) {
     // storeToTempBuffer will make the last dimension continuous.
-    return -1;
+    return static_cast<int64_t>(buf.indices.size()) - 1;
   }
 
   auto memRefType = dyn_cast<MemRefType>(buf.memRef.getType());
   if (!memRefType) {
     // Don't know how to find lowest dimension if memref is not memref.
-    return 0;
+    return static_cast<int64_t>(buf.indices.size()) - 1;
   }
 
   int64_t lowestDim = findLowestDim(memRefType);
