@@ -181,7 +181,7 @@ void determineDotStyle(Value a, Value b, RvvDotOpCandidate &candidate) {
   int64_t lhsLowestDim =
       findLowestDim(candidate.lhsBuf) - candidate.lhsBuf.indices.size();
   int64_t rhsLowestDim =
-      findLowestDim(candidate.rhsBuf) - candidate.lhsBuf.indices.size();
+      findLowestDim(candidate.rhsBuf) - candidate.rhsBuf.indices.size();
   if (rhsLowestDim == -1) {
     // When the last dimension of right operand(N) is continuous, we use
     // outer-product GEMM.
