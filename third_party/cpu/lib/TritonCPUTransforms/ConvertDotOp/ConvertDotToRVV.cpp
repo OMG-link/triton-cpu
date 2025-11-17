@@ -474,6 +474,43 @@ int64_t getVmul(int64_t numAcc, int64_t bitsToHold, bool isWidening) {
   return vmul;
 }
 
+/*
+ * Cast 'val' to have element type 'dstElemTy' if needed.
+ * If 'val' is a vector, each element is casted.
+ */
+Value maybeCast(Location loc, Value val, Type dstElemTy,
+                PatternRewriter &rewriter) {
+  Type srcTy = val.getType();
+  Type srcElemTy;
+  if (auto srcVecTy = dyn_cast<VectorType>(srcTy); srcVecTy) {
+    srcElemTy = srcVecTy.getElementType();
+  } else {
+    srcElemTy = srcTy;
+  }
+  if (srcElemTy == dstElemTy)
+    return val;
+  Type dstTy;
+  if (auto srcVecTy = dyn_cast<VectorType>(srcTy); srcVecTy) {
+    dstTy = srcVecTy.cloneWith(std::nullopt, dstElemTy);
+  } else {
+    dstTy = dstElemTy;
+  }
+
+  if (!srcElemTy.isIntOrFloat() || !dstElemTy.isIntOrFloat()) {
+    llvm_unreachable("maybeCast supports only int or float types.");
+  }
+
+  if (srcElemTy.isInteger()) {
+    if (srcElemTy.getIntOrFloatBitWidth() < dstElemTy.getIntOrFloatBitWidth())
+      return rewriter.create<arith::ExtSIOp>(loc, dstTy, val);
+    return rewriter.create<arith::TruncIOp>(loc, dstTy, val);
+  } else {
+    if (srcElemTy.getIntOrFloatBitWidth() < dstElemTy.getIntOrFloatBitWidth())
+      return rewriter.create<arith::ExtFOp>(loc, dstTy, val);
+    return rewriter.create<arith::TruncFOp>(loc, dstTy, val);
+  }
+}
+
 LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
                                         PatternRewriter &rewriter,
                                         MemBuffer accBuf, bool isAccZeroInit) {
@@ -497,21 +534,24 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   const int64_t baseVlen = 64;
   const int64_t baseInputVl = vmul * baseVlen / inputElemBitWidth;
 
-  VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
-  VectorType inputSubVecTy =
-      VectorType::get({baseInputVl}, inputElemTy, {true});
-  VectorType outputSubVecTy =
-      VectorType::get({baseInputVl}, outputElemTy, {true});
-
   Value c_tumu = int_cst(rewriter.getI64Type(), 3);
   Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
-  Value cIndex_0 = index_cst(0);
-  Value cIndex_1 = index_cst(1);
   Value cIndex_baseVl = index_cst(baseInputVl);
-  Value cIndex_n = index_cst(mat_n);
 
   Value vscale = getVscale(loc, rewriter);
   Value vl = op_muli(vscale, cIndex_baseVl);
+
+  VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
+  VectorType inputSubVecTy, outputSubVecTy;
+  if (auto vscaleDefOp = vscale.getDefiningOp<arith::ConstantIndexOp>()) {
+    inputSubVecTy = VectorType::get({baseInputVl * vscaleDefOp.value()},
+                                    inputElemTy, {false});
+    outputSubVecTy = VectorType::get({baseInputVl * vscaleDefOp.value()},
+                                     outputElemTy, {false});
+  } else {
+    inputSubVecTy = VectorType::get({baseInputVl}, inputElemTy, {true});
+    outputSubVecTy = VectorType::get({baseInputVl}, outputElemTy, {true});
+  }
 
   // We will do GEMM by multiplying an <M x 1> vector with an <1 x N> vector.
   // To do so, we multiply <1 x 1> scalar with <1 x N> vector.
@@ -533,33 +573,41 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
                          subVecOff, rewriter);
     }
 
-    auto doMul = [&](Value lhsScalar, Value rhsVec) {
-      auto intrinsicName = getMulIntrinsicName(
-          rewriter, "mul", inputElemTy.isFloat(), isWidening);
-      SmallVector<Value> args;
-      auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
-      if (inputElemTy.isInteger()) {
-        args = {poison, rhsVec, lhsScalar, curVl_i64};
+    auto doMul = [&](Value lhsScalar, Value rhsVec) -> Value {
+      if (lhsScalar.getType().isIntOrFloat()) {
+        lhsScalar = maybeCast(loc, lhsScalar, outputElemTy, rewriter);
+        rhsVec = maybeCast(loc, rhsVec, outputElemTy, rewriter);
+        auto splat =
+            rewriter.create<vector::SplatOp>(loc, rhsVec.getType(), lhsScalar);
+        if (lhsScalar.getType().isInteger()) {
+          return rewriter.create<arith::MulIOp>(loc, splat, rhsVec);
+        } else {
+          return rewriter.create<arith::MulFOp>(loc, splat, rhsVec,
+                                                arith::FastMathFlags::none);
+        }
       } else {
-        args = {poison, rhsVec, lhsScalar, c_frm_dyn, curVl_i64};
+        // report type of lhsScalar is unexpected
+        llvm_unreachable("Unexpected type of lhsScalar in doMul.");
       }
-      auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-          loc, outputSubVecTy, intrinsicName, args);
-      return callIntrinsicOp.getResult(0);
     };
 
-    auto doMacc = [&](Value accVec, Value lhsScalar, Value rhsVec) {
-      auto intrinsicName = getMulIntrinsicName(
-          rewriter, "macc", inputElemTy.isFloat(), isWidening);
-      SmallVector<Value> args;
-      if (inputElemTy.isInteger()) {
-        args = {accVec, lhsScalar, rhsVec, curVl_i64, c_tumu};
+    auto doMacc = [&](Value accVec, Value lhsScalar, Value rhsVec) -> Value {
+      if (lhsScalar.getType().isIntOrFloat()) {
+        lhsScalar = maybeCast(loc, lhsScalar, outputElemTy, rewriter);
+        rhsVec = maybeCast(loc, rhsVec, outputElemTy, rewriter);
+        assert(accVec.getType() == rhsVec.getType());
+        auto splat =
+            rewriter.create<vector::SplatOp>(loc, rhsVec.getType(), lhsScalar);
+        if (lhsScalar.getType().isInteger()) {
+          auto mul = rewriter.create<arith::MulIOp>(loc, splat, rhsVec);
+          return rewriter.create<arith::AddIOp>(loc, accVec, mul);
+        } else {
+          return rewriter.create<vector::FMAOp>(loc, splat, rhsVec, accVec);
+        }
       } else {
-        args = {accVec, lhsScalar, rhsVec, c_frm_dyn, curVl_i64, c_tumu};
+        // report type of lhsScalar is unexpected
+        llvm_unreachable("Unexpected type of lhsScalar in doMacc.");
       }
-      auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-          loc, outputSubVecTy, intrinsicName, args);
-      return callIntrinsicOp.getResult(0);
     };
 
     // k = 0
@@ -603,25 +651,21 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
 
   // Divide <K x N> vector into <K x VL> ones.
   // We do this first to achieve the best performance.
-  Value numSubVec = rewriter.create<arith::DivSIOp>(loc, cIndex_n, vl);
-  auto forOpN = rewriter.create<scf::ForOp>(loc, cIndex_0, numSubVec, cIndex_1);
+  Value numSubVec = rewriter.create<arith::DivSIOp>(loc, index_cst(mat_n), vl);
+  auto forOpN =
+      rewriter.create<scf::ForOp>(loc, index_cst(0), numSubVec, index_cst(1));
   // Process each <M x K> x <K x VL> sub-matrix-product.
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(forOpN.getBody());
-    // vector::TransferReadOp can identify algebraic VL limits and
-    // automatically remove unnecessary limits when lowering. To use this
-    // feature, we construct another algebraic VL here.
-    Value algebraicVl =
-        op_muli(rewriter.create<vector::VectorScaleOp>(loc), cIndex_baseVl);
-    genForOpK(forOpN.getInductionVar(), algebraicVl);
+    genForOpK(forOpN.getInductionVar(), vl);
   }
   // Process the remaining <K x (N % VL)> vector if N is not multiple of VL.
-  Value nModVl = rewriter.create<arith::RemSIOp>(loc, cIndex_n, vl);
+  Value nModVl = rewriter.create<arith::RemSIOp>(loc, index_cst(mat_n), vl);
   auto ifOpRem = rewriter.create<scf::IfOp>(
       loc,
       rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, nModVl,
-                                     cIndex_0),
+                                     index_cst(0)),
       /*withElseRegion=*/false);
   {
     OpBuilder::InsertionGuard guard(rewriter);
