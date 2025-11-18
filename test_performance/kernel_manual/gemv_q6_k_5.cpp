@@ -1,8 +1,11 @@
+
+// vx : q6_k
+// vy :
 static void ggml_gemv_q6_K_8x32_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     //矩阵乘实际上是1*n*nc
 
-    const int qk = QK_K;    //256
-    const int nb = n / qk;  //1536/256=6
+    const int qk = QK_K;    // 256
+    const int nb = n / qk;  // k 维度大小 n 
 
     assert (n % qk == 0);
     // assert (nc % ncols_interleaved == 0);
@@ -15,9 +18,9 @@ static void ggml_gemv_q6_K_8x32_q8_K(int n, float * GGML_RESTRICT s, size_t bs, 
     size_t vl = 32;   //vl = 32
 
     const block_q6_Kx32 * b_ptr_start = (const block_q6_Kx32 *)vx; // 右操作数 权重
-    const block_q8_K * a_ptr_start = (const block_q8_K *)vy; // 左操作数 激活值
+    const block_q8_K * a_ptr_start = (const block_q8_K *)vy; // 左操作数 激活值 
     
-    for (int64_t y = 0; y < nr; y++) {  //nr=1 
+    for (int64_t y = 0; y < nr; y++) {  // 
 
         // Pointers to LHS blocks of block_q8_K format 
         const block_q8_K * a_ptr = a_ptr_start + (y * nb); 

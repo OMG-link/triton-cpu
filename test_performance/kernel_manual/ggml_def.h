@@ -28,7 +28,6 @@
 
 #define UNUSED(x) (void)(x)
 
-
 // 自定义带消息的断言宏
 #ifndef NDEBUG
     #define ASSERT_MSG(cond, fmt, ...) \
@@ -63,6 +62,25 @@ template <int VL> struct block_q8_Kx {
 };
 
 
+
+#define QK8_0 32
+typedef struct {
+    ggml_half d;       // delta
+    int8_t  qs[QK8_0]; // quants
+} block_q8_0;
+
+
+// K 量化后 quant 位数 
+// N 寄存器分块 nr 大小 
+template <int K, int N> struct block {
+    ggml_half d[N];                         // deltas for N qK_0 blocks
+    int8_t    qs[(QK8_0 * N * K) / 8];         // quants for N qK_0 blocks : sizeof(qs) = 512 bytes
+};
+
+using block_q4_0x32 = block<4, 32>;
+
 #define GGML_UNUSED(x) (void)(x)
 
 void ggml_gemm_q4_K_8x32_q8_K(int n, float *GGML_RESTRICT s, size_t bs, const void *GGML_RESTRICT vx, const void *GGML_RESTRICT vy, int nr, int nc);
+
+void ggml_gemv_q4_0_8x32_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);

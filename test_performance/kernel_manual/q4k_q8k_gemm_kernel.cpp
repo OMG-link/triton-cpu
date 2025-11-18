@@ -55,17 +55,20 @@ void ggml_gemm_q4_K_8x32_q8_K(int k, float *GGML_RESTRICT s, size_t bs, const vo
                     float sum_row[mr * nr] = {0.0};
                     for (int b = 0; b < k / QK_K; b++) { // K: superblock 
                         int sum_block[mr * nr];
-                        for (int sb = 0; sb < QK_K / QK_SB_K; sb++) { // K: subblock 寄存器内核 循环展开 
+                        for (int sb = 0; sb < QK_K / QK_SB_K; sb++) { // K: 处理整个 superblock，每个 subblock 寄存器内核 循环展开 
                             vuint8m1_t src0_0, src0_0_prefetch;
                             vint16m2_t suml_32_0, suml_32_1, suml_32_2, suml_32_3, suml_32_4, suml_32_5;
                             vint16m2_t suml_32_6, suml_32_7, suml_32_8, suml_32_9, suml_32_10, suml_32_11;
+                            // ✅ 外积布局核心 12（n 维度） * 32（k 维度）的权重 12 个子块连续 
+                            // ✅ 每个子块 32 个 4-bit 量化值，打包存储在 16 字节中 
+                            // ✅ 超块按照 QK_K/QK_SB_K = 8 * 32 在 k 维度横向堆叠 
                             const uint64_t *a_ptr_temp = static_cast<const uint64_t *>((void *)&a_ptr[b].qs[sb * 384]); // mr * QK_SB_K = 12 * 32 = 384  
                             
-                            // 内核贡献 1.5 
+                            // 内核贡献 1.5  
                             {    const int z = 0;
-                                // b 权重，qs 存储的是 4-bit 量化值，两个值打包在一个字节中
-                                // 这里需要将 4-bit 量化值拆分出来
-                                // nr 个 subblock 大小，32 * 16B (32 * 4 bit)= 512 字节
+                                // b 权重，qs 存储的是 4-bit 量化值，两个值打包在一个字节中 
+                                // 这里需要将 4-bit 量化值拆分出来 
+                                // nr 个 subblock 大小，32 * 16B (32 * 4 bit)= 512 字节 
                                 src0_0 = __riscv_vle8_v_u8m1(b_ptr[b].qs + sb * 512 + z * nr, vl);
                                 src0_0_prefetch = __riscv_vle8_v_u8m1(b_ptr[b].qs + sb * 512 + (z + 1) * nr, vl);
                                 vint8m1_t low4bits_0 = __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vand_vx_u8m1(src0_0, 0x0F, vl));
@@ -132,7 +135,7 @@ void ggml_gemm_q4_K_8x32_q8_K(int k, float *GGML_RESTRICT s, size_t bs, const vo
                                 suml_32_10 = __riscv_vwmacc_vx_i16m2(suml_32_10, (a_16_23 >> (6 * 8)) & 0xff, low4bits_0, vl);
                                 suml_32_11 = __riscv_vwmacc_vx_i16m2(suml_32_11, (a_16_23 >> (7 * 8)) & 0xff, low4bits_0, vl);
                             }
-                            { // z = 15
+                            { // z = 15 
                                 src0_0 = src0_0_prefetch;
                                 vint8m1_t low4bits_0 = __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vand_vx_u8m1(src0_0, 0x0F, vl));
                                 uint64_t a_0_7 = *a_ptr_temp++;
@@ -165,7 +168,7 @@ void ggml_gemm_q4_K_8x32_q8_K(int k, float *GGML_RESTRICT s, size_t bs, const vo
                                 suml_32_11 = __riscv_vwmacc_vx_i16m2(suml_32_11, (a_16_23 >> (7 * 8)) & 0xff, low4bits_0, vl);
                             }
 
-                            // 累加到 sum_block 贡献 0.36
+                            // 累加到 sum_block 贡献 0.36  
                             vint16m2_t vec_scales_32 = __riscv_vreinterpret_v_u16m2_i16m2(__riscv_vzext_vf2_u16m2(__riscv_vle8_v_u8m1(b_ptr[b].scales + sb * nr, vl), vl));
 
                             if (sb == 0) {

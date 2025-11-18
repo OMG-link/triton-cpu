@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
     int64_t cycle_total = cycles;
     int64_t cycle_per_test = cycle_total / T;
 
-    int64_t n_fma = static_cast<int64_t>(k) * mTile * nTile * 12 * VL;
+    int64_t n_fma = static_cast<int64_t>(k) * mTile * nTile * 12 * VL; // 考虑实际形状，为了避免 padding，这里用的整数倍的寄存器分块大小 
     int64_t fma_per_cycle;
 
 #ifdef SPACEMIT_X60

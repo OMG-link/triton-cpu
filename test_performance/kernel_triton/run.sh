@@ -1,0 +1,15 @@
+# 默认测试（N=512, K=1024, 5轮测试）
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1 TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=./ir-dump python3 q40_q80_gemv.py
+
+# 自定义参数
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1 TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=./ir-dump python3 q40_q80_gemv.py --n 2048 --k 2048 --rounds 10
+
+# 简单功能测试
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1 TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=./ir-dump python3 q40_q80_gemv.py --simple-test
+
+# 完整参数示例 909 组数据
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1 TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=./ir-dump python3 q40_q80_gemv.py --n 2048 --k 2048 --rounds 5 --warmup 3 --target-gb 2.0
+
+
+# 9 组 数据
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1 TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=./ir-dump python3 q40_q80_gemv.py --n 20480 --k 20480 --rounds 5 --warmup 3 --target-gb 2.0
