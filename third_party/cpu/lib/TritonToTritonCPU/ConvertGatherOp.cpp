@@ -50,7 +50,6 @@ struct GatherOpConversion : public OpConversionPattern<triton::GatherOp> {
   LogicalResult
   matchAndRewrite(triton::GatherOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    llvm::errs() << "Converting " << op << '\n';
     Location loc = op.getLoc();
 
     // Remapped operands (after other rewrites / mapping)
@@ -145,7 +144,6 @@ struct GatherOpConversion : public OpConversionPattern<triton::GatherOp> {
     // -------------------------
     auto retOp = rewriter.replaceOpWithNewOp<vector::GatherOp>(
         op, vecResultType, baseMemRef, indices, indexVec, mask, passThru);
-    llvm::errs() << "-> " << retOp << '\n';
     return success();
   }
 };
