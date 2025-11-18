@@ -79,6 +79,9 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_convert_dot_op", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createConvertDotOp());
   });
+  m.def("add_convert_gather_op", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cpu::createConvertGatherOp());
+  });
   m.def("add_convert_histogram_op", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createConvertHistogramOp());
   });

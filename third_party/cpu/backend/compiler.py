@@ -179,6 +179,7 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_convert_elementwise_ops(pm)
         cpu.passes.ttcpuir.add_convert_elem_manip_ops(pm)
         cpu.passes.ttcpuir.add_convert_dot_op(pm)
+        cpu.passes.ttcpuir.add_convert_gather_op(pm)
         cpu.passes.ttcpuir.add_convert_histogram_op(pm)
         cpu.passes.ttcpuir.add_convert_reduction_op(pm, True, False)
         cpu.passes.ttcpuir.add_convert_scan_op(pm)

@@ -29,6 +29,7 @@ createConvertMemoryOps(bool useGatherScatter);
 std::unique_ptr<OperationPass<ModuleOp>> createConvertPtrOps();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotOp();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertControlFlowOps();
+std::unique_ptr<OperationPass<ModuleOp>> createConvertGatherOp();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertHistogramOp();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertReductionOp();
 std::unique_ptr<OperationPass<ModuleOp>>

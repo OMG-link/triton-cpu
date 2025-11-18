@@ -80,6 +80,21 @@ def ConvertDotOp : Pass<"triton-cpu-convert-dot-op", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def ConvertGatherOp : Pass<"triton-cpu-convert-gather-op", "mlir::ModuleOp"> {
+    let summary = "Convert Triton GatherOp.";
+    let description = [{
+
+    }];
+    let constructor = "mlir::triton::cpu::createConvertGatherOp()";
+
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::memref::MemRefDialect",
+                             "mlir::vector::VectorDialect",
+                             "mlir::triton::TritonDialect",
+                             "mlir::LLVM::LLVMDialect",
+                             "mlir::triton::cpu::TritonCPUDialect"];
+}
+
 def ConvertControlFlowOps : Pass<"triton-cpu-convert-control-flow-op", "mlir::ModuleOp"> {
     let summary = "Convert Triton DotOp.";
     let description = [{

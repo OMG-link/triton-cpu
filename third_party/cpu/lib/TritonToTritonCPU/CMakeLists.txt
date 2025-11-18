@@ -5,6 +5,7 @@ add_triton_library(TritonToTritonCPU
     ConvertDotOp.cpp
     ConvertElementwiseOps.cpp
     ConvertElemManipOps.cpp
+    ConvertGatherOp.cpp
     ConvertHistogramOp.cpp
     ScalarizeInterface.cpp
     ScalarizeUsingForOps.cpp
