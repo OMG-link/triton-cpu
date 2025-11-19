@@ -33,7 +33,7 @@ BITWIDTH = {
 MR_IN_VAL = 4
 NR_IN_VAL = 4
 KC_IN_VAL = 256
-MR_OUT_VAL = 12
+MR_OUT_VAL = 4
 NR_OUT_VAL = 32
 KC_OUT_VAL = 256
 
@@ -198,8 +198,6 @@ def test_correctness(M, K, N):
     a_in, b_in = prepare_inner(a, b)
     a_out, b_out = prepare_outer(a, b)
 
-    print(a_out.shape)
-
     # do matmul
     grid_outer = (cdiv(M, MR_OUT_VAL), cdiv(N, NR_OUT_VAL))
     matmul_outer_kernel[grid_outer](
@@ -340,7 +338,7 @@ if __name__ == '__main__':
     TORCH_OUT_DTYPE, TL_OUT_DTYPE = DTYPE_CONFIG[args.out_dtype]
 
     correctness_tests = (
-        (48, 256, 32),
+        (12, 256, 32),
     )
 
     is_inner_good = True
