@@ -33,7 +33,7 @@ BITWIDTH = {
 MR_IN_VAL = 4
 NR_IN_VAL = 4
 KC_IN_VAL = 256
-MR_OUT_VAL = 4
+MR_OUT_VAL = 12
 NR_OUT_VAL = 32
 KC_OUT_VAL = 256
 
@@ -227,8 +227,6 @@ def test_correctness(M, K, N):
               f'{torch.max(torch.abs(diff/output_torch)) * 100}' "%")
         ok_outer = False
 
-    return (ok_inner, ok_outer)
-
     # diff output
     if torch.allclose(output_inner, output_torch, rtol=1e-5, atol=1e-5):
         ok_inner = True
@@ -237,6 +235,8 @@ def test_correctness(M, K, N):
         print("❌ INNER: TritonCPU and TorchCPU differ, the maximum difference is "
               f'{torch.max(torch.abs(diff/output_torch)) * 100}' "%")
         ok_inner = False
+    
+    return (ok_inner, ok_outer)
 
 # -----------------------
 # Benchmark helpers (refactored)
@@ -340,7 +340,7 @@ if __name__ == '__main__':
     TORCH_OUT_DTYPE, TL_OUT_DTYPE = DTYPE_CONFIG[args.out_dtype]
 
     correctness_tests = (
-        (12, 256, 32),
+        (48, 256, 32),
     )
 
     is_inner_good = True
