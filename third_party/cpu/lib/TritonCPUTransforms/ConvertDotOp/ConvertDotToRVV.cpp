@@ -434,24 +434,6 @@ void storeRows(Location loc, const MemBuffer &buf, ArrayRef<Value> vecs,
   }
 }
 
-StringAttr getMulIntrinsicName(PatternRewriter &rewriter, StringRef opName,
-                               bool isFloat, bool isWidening) {
-  std::string name = llvm::formatv("llvm.riscv.v{0}{1}{2}",
-                                   isFloat ? "f" : "",    // 0
-                                   isWidening ? "w" : "", // 1
-                                   opName);               // 2
-  return rewriter.getStringAttr(name);
-}
-
-StringAttr getReduceIntrinsicName(PatternRewriter &rewriter, StringRef opName,
-                                  bool isFloat, StringRef fOrder = "") {
-  std::string name = llvm::formatv("llvm.riscv.v{0}red{1}{2}",
-                                   isFloat ? "f" : "",    // 0
-                                   isFloat ? fOrder : "", // 1
-                                   opName);               // 2
-  return rewriter.getStringAttr(name);
-}
-
 /**
  * Get VMUL according to the number of accumulating vectors.
  */
@@ -698,31 +680,32 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
 
   int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
   const int64_t baseVlen_i64 = 64;
-  const int64_t baseArithVl_i64 =
+  const int64_t baseVlmax_i64 =
       baseVlen_i64 / inputElemBitWidth / (isWidening ? 2 : 1);
-  assert(baseArithVl_i64 > 0 &&
+  assert(baseVlmax_i64 > 0 &&
          "Did you tried to widen an element from 64-bit to 128-bit?");
 
+  Value c_tumu = int_cst(rewriter.getI64Type(), 3);
+  Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
+  Value baseVlmax_cIndex = index_cst(baseVlmax_i64);
+
+  Value vscale = getVscale(loc, rewriter);
+  Value vlmax = op_muli(vscale, baseVlmax_cIndex);
+
   VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
-  VectorType inputSubVecTy =
-      VectorType::get({baseArithVl_i64}, inputElemTy, {true});
-  VectorType outputSubVecTy =
-      VectorType::get({baseArithVl_i64}, outputElemTy, {true});
+  VectorType inputSubVecTy, outputSubVecTy;
+  if (auto vscaleDefOp = vscale.getDefiningOp<arith::ConstantIndexOp>()) {
+    inputSubVecTy = VectorType::get({baseVlmax_i64 * vscaleDefOp.value()},
+                                    inputElemTy, {false});
+    outputSubVecTy = VectorType::get({baseVlmax_i64 * vscaleDefOp.value()},
+                                     outputElemTy, {false});
+  } else {
+    inputSubVecTy = VectorType::get({baseVlmax_i64}, inputElemTy, {true});
+    outputSubVecTy = VectorType::get({baseVlmax_i64}, outputElemTy, {true});
+  }
 
   Value resMat = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getZeroAttr(outputMatTy));
-
-  Value tumu_cI64 = int_cst(rewriter.getI64Type(), 3);
-  Value frm_dyn_cI64 = int_cst(rewriter.getI64Type(), 7);
-  Value c0_cIndex = index_cst(0);
-  Value c1_cIndex = index_cst(1);
-  Value baseArithVl_cIndex = index_cst(baseArithVl_i64);
-  Value k_cIndex = index_cst(mat_k);
-
-  Value vscale = getVscale(loc, rewriter);
-  Value arithVl_index = op_muli(vscale, baseArithVl_cIndex);
-  Value numSubVec =
-      rewriter.create<arith::CeilDivSIOp>(loc, k_cIndex, arithVl_index);
 
   const int64_t MR = 4;
   const int64_t NR = 4;
@@ -731,69 +714,24 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
     for (int64_t n = 0; n < mat_n; n += NR) {
       const int mr = std::min(MR, mat_m - m);
       const int nr = std::min(NR, mat_n - n);
-      // First round: use vmul.vv to avoid 0 initialize
-      SmallVector<Value, MR * NR> sumInitVecs(mr * nr);
-      {
-        // Get VL
-        Value curVl_index = op_minui(arithVl_index, k_cIndex);
-        Value curVl_i64 = op_index_cast(rewriter.getI64Type(), curVl_index);
-        // Get operands
-        SmallVector<Value, MR> lhsVec(mr);
-        SmallVector<Value, NR> rhsVec(nr);
-        for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
-          lhsVec[i_mr] = loadRow(loc, rewriter, inputSubVecTy, curVl_index,
-                                 lhsBuf, index_cst(m + i_mr), c0_cIndex);
-        }
-        for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
-          rhsVec[i_nr] = loadCol(loc, rewriter, inputSubVecTy, curVl_index,
-                                 rhsBuf, c0_cIndex, index_cst(n + i_nr));
-        }
-        // Fillin sumInitVecs
-        for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
-          for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
-            const int64_t id_region_iter = i_mr * nr + i_nr;
-            // Prepare and call intrinsic
-            auto intrinsicName = getMulIntrinsicName(
-                rewriter, "mul", inputElemTy.isFloat(), isWidening);
-            SmallVector<Value> args;
-            auto poison = rewriter.create<LLVM::PoisonOp>(loc, outputSubVecTy);
-            if (inputElemTy.isInteger()) {
-              args = {poison, lhsVec[i_mr], rhsVec[i_nr], curVl_i64};
-            } else {
-              args = {poison, lhsVec[i_mr], rhsVec[i_nr], frm_dyn_cI64,
-                      curVl_i64};
-            }
-            auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-                loc, outputSubVecTy, intrinsicName, args);
-            // Set intrinsic result as initial accumulator
-            sumInitVecs[id_region_iter] = callIntrinsicOp.getResult(0);
-          }
-        }
-      }
 
-      // Following rounds: use vmacc.vv
-      auto forOp = rewriter.create<scf::ForOp>(loc, c1_cIndex, numSubVec,
-                                               c1_cIndex, sumInitVecs);
-      {
-        // Get VL
-        OpBuilder::InsertionGuard guard(rewriter);
-        auto forBody = forOp.getBody();
-        rewriter.setInsertionPointToStart(forBody);
-        Value iv = forOp.getInductionVar();
-        Value subVecOff = op_muli(iv, arithVl_index);
-        Value remaining = op_subi(k_cIndex, subVecOff);
-        Value curVl_index = op_minui(arithVl_index, k_cIndex);
+      SmallVector<Value, MR * NR> sumVecs(
+          mr * nr, rewriter.create<arith::ConstantOp>(
+                       loc, rewriter.getZeroAttr(outputSubVecTy)));
+
+      auto genForBodyK = [&](Value iv, Value curVl_index) {
+        Value subVecOff = op_muli(iv, vlmax);
         Value curVl_i64 = op_index_cast(rewriter.getI64Type(), curVl_index);
         // Get operands
-        SmallVector<Value, MR> lhsVec(mr);
-        SmallVector<Value, NR> rhsVec(nr);
+        SmallVector<Value, MR> lhsVecs(mr);
+        SmallVector<Value, NR> rhsVecs(nr);
         for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
-          lhsVec[i_mr] = loadRow(loc, rewriter, inputSubVecTy, curVl_index,
-                                 lhsBuf, index_cst(m + i_mr), subVecOff);
+          lhsVecs[i_mr] = loadRow(loc, rewriter, inputSubVecTy, curVl_index,
+                                  lhsBuf, index_cst(m + i_mr), subVecOff);
         }
         for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
-          rhsVec[i_nr] = loadCol(loc, rewriter, inputSubVecTy, curVl_index,
-                                 rhsBuf, subVecOff, index_cst(n + i_nr));
+          rhsVecs[i_nr] = loadCol(loc, rewriter, inputSubVecTy, curVl_index,
+                                  rhsBuf, subVecOff, index_cst(n + i_nr));
         }
         // Update sumVec
         SmallVector<Value, MR * NR> newSumVecs(mr * nr);
@@ -801,65 +739,79 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
           for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
             const int64_t id_region_iter = i_mr * nr + i_nr;
             // Prepare and call intrinsic
-            Value sumVec = forOp.getRegionIterArg(id_region_iter);
-            auto intrinsicName = getMulIntrinsicName(
-                rewriter, "macc", inputElemTy.isFloat(), isWidening);
-            SmallVector<Value> args;
-            if (inputElemTy.isInteger()) {
-              args = {sumVec, lhsVec[i_mr], rhsVec[i_nr], curVl_i64, tumu_cI64};
+            Value sumVec = sumVecs[id_region_iter];
+            Value lhsVec =
+                maybeCast(loc, lhsVecs[i_mr], outputElemTy, rewriter);
+            Value rhsVec =
+                maybeCast(loc, rhsVecs[i_nr], outputElemTy, rewriter);
+            Value newSumVec;
+            if (outputElemTy.isInteger()) {
+              auto mul = rewriter.create<arith::MulIOp>(loc, lhsVec, rhsVec);
+              newSumVec = rewriter.create<arith::AddIOp>(loc, sumVec, mul);
             } else {
-              args = {sumVec,       lhsVec[i_mr], rhsVec[i_nr],
-                      frm_dyn_cI64, curVl_i64,    tumu_cI64};
+              newSumVec =
+                  rewriter.create<vector::FMAOp>(loc, lhsVec, rhsVec, sumVec);
             }
-            auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-                loc, outputSubVecTy, intrinsicName, args);
-            newSumVecs[id_region_iter] = callIntrinsicOp.getResult(0);
+            newSumVecs[id_region_iter] = newSumVec;
           }
         }
         // Yield intrinsic result
-        rewriter.setInsertionPointToEnd(forBody);
         rewriter.create<mlir::scf::YieldOp>(loc, newSumVecs);
+      };
+
+      // for k in [0, mat_k / vlmax * vlmax)
+      Value numSubVec =
+          rewriter.create<arith::DivSIOp>(loc, index_cst(mat_k), vlmax);
+      auto forOp = rewriter.create<scf::ForOp>(loc, index_cst(0), numSubVec,
+                                               index_cst(1), sumVecs);
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(forOp.getBody());
+        sumVecs.assign(forOp.getRegionIterArgs().begin(),
+                       forOp.getRegionIterArgs().end());
+        genForBodyK(forOp.getInductionVar(), vlmax);
       }
-      SmallVector<Value, MR * NR> sumVecs(forOp.getResults());
+      sumVecs = forOp.getResults();
+      // for k in [mat_k / vlmax * vlmax, mat_k)
+      Value kModVl =
+          rewriter.create<arith::RemSIOp>(loc, index_cst(mat_k), vlmax);
+      auto ifOp = rewriter.create<scf::IfOp>(
+          loc,
+          /*resultTypes=*/
+          llvm::map_to_vector(sumVecs, [&](Value v) { return v.getType(); }),
+          /*condition=*/
+          rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, kModVl,
+                                         index_cst(0)),
+          /*withElseRegion=*/true);
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(ifOp.thenBlock());
+        genForBodyK(numSubVec, kModVl);
+      }
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(ifOp.elseBlock());
+        rewriter.create<scf::YieldOp>(loc, sumVecs);
+      }
+      sumVecs = ifOp.getResults();
 
       // Reduction: Sum the accumulated results horizontally.
       for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
         for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
           const int64_t id_region_iter = i_mr * nr + i_nr;
-          Value newAccScalar;
-          int64_t baseReduceVl =
-              baseVlen_i64 / outputElemTy.getIntOrFloatBitWidth();
-          VectorType redVecTy =
-              VectorType::get({baseReduceVl}, outputElemTy, {true});
-          Value poison = rewriter.create<LLVM::PoisonOp>(loc, redVecTy);
-          Value redSumScalar;
+          Value newRedSum;
           if (isAccZeroInit) {
-            auto zeroAttr = rewriter.getZeroAttr(outputElemTy);
-            redSumScalar =
-                rewriter.create<arith::ConstantOp>(loc, outputElemTy, zeroAttr);
+            newRedSum = rewriter.create<vector::ReductionOp>(
+                loc, vector::CombiningKind::ADD, sumVecs[id_region_iter]);
           } else {
-            redSumScalar = loadScalar(loc, rewriter, accBuf,
+            Value redsum = loadScalar(loc, rewriter, accBuf,
                                       index_cst(m + i_mr), index_cst(n + i_nr));
+            newRedSum = rewriter.create<vector::ReductionOp>(
+                loc, vector::CombiningKind::ADD, sumVecs[id_region_iter],
+                redsum);
           }
-          Value redSum = rewriter.create<vector::InsertOp>(
-              loc, redSumScalar, poison, SmallVector<int64_t>({0}));
-          Value curVl = op_index_cast(rewriter.getI64Type(),
-                                      op_minui(arithVl_index, k_cIndex));
-          SmallVector<Value> args;
-          if (outputElemTy.isInteger()) {
-            args = {poison, sumVecs[id_region_iter], redSum, curVl};
-          } else {
-            args = {poison, sumVecs[id_region_iter], redSum, frm_dyn_cI64,
-                    curVl};
-          }
-          auto intrinsicName = getReduceIntrinsicName(
-              rewriter, "sum", outputElemTy.isFloat(), "u");
-          auto callIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
-              loc, redVecTy, intrinsicName, args);
-          auto newRedSum = callIntrinsicOp.getResult(0);
-          newAccScalar = rewriter.create<vector::ExtractOp>(loc, newRedSum, 0);
           resMat = rewriter.create<vector::InsertOp>(
-              loc, newAccScalar, resMat,
+              loc, newRedSum, resMat,
               SmallVector<int64_t>({m + i_mr, n + i_nr}));
         }
       }
