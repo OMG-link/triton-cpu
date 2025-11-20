@@ -110,7 +110,7 @@ struct GatherOpConversion : public OpConversionPattern<triton::GatherOp> {
     }
     MemRefType baseMemRefType =
         MemRefType::get(baseVecType.getShape(), baseVecType.getElementType());
-    Value baseMemRef = rewriter.create<memref::AllocOp>(loc, baseMemRefType);
+    Value baseMemRef = rewriter.create<memref::AllocaOp>(loc, baseMemRefType);
     auto transferWriteIndices = SmallVector<Value>(
         baseRank, rewriter.create<arith::ConstantIndexOp>(loc, 0));
     rewriter.create<vector::TransferWriteOp>(loc, baseVec, baseMemRef,
