@@ -514,25 +514,25 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   int64_t vmul = getVmul(/*numAcc=*/mat_k > 1 ? mat_m : 1,
                          /*bitsToHold=*/mat_n * inputElemBitWidth, isWidening);
   const int64_t baseVlen = 64;
-  const int64_t baseInputVl = vmul * baseVlen / inputElemBitWidth;
+  const int64_t baseVlmax = vmul * baseVlen / inputElemBitWidth;
 
   Value c_tumu = int_cst(rewriter.getI64Type(), 3);
   Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
-  Value cIndex_baseVl = index_cst(baseInputVl);
+  Value baseVlmax_cIndex = index_cst(baseVlmax);
 
   Value vscale = getVscale(loc, rewriter);
-  Value vl = op_muli(vscale, cIndex_baseVl);
+  Value vlmax = op_muli(vscale, baseVlmax_cIndex);
 
   VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
   VectorType inputSubVecTy, outputSubVecTy;
   if (auto vscaleDefOp = vscale.getDefiningOp<arith::ConstantIndexOp>()) {
-    inputSubVecTy = VectorType::get({baseInputVl * vscaleDefOp.value()},
+    inputSubVecTy = VectorType::get({baseVlmax * vscaleDefOp.value()},
                                     inputElemTy, {false});
-    outputSubVecTy = VectorType::get({baseInputVl * vscaleDefOp.value()},
+    outputSubVecTy = VectorType::get({baseVlmax * vscaleDefOp.value()},
                                      outputElemTy, {false});
   } else {
-    inputSubVecTy = VectorType::get({baseInputVl}, inputElemTy, {true});
-    outputSubVecTy = VectorType::get({baseInputVl}, outputElemTy, {true});
+    inputSubVecTy = VectorType::get({baseVlmax}, inputElemTy, {true});
+    outputSubVecTy = VectorType::get({baseVlmax}, outputElemTy, {true});
   }
 
   // We will do GEMM by multiplying an <M x 1> vector with an <1 x N> vector.
@@ -542,17 +542,15 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   // of elements single vector register can hold.
 
   // Code generator that computes <M x K> x <K x VL>.
-  // When 'curVl' is null, it computes as many elements as possible.
-  auto genForOpK = [&](Value iv, Value curVl_index) {
-    Value subVecOff = op_muli(iv, vl);
-    Value curVl_i64 = op_index_cast(rewriter.getI64Type(), curVl_index);
+  auto genForBodyN = [&](Value iv, Value vl) {
+    Value subVecOff = op_muli(iv, vlmax);
 
     SmallVector<Value> accVecs;
     if (isAccZeroInit) {
       accVecs.resize(mat_m);
     } else {
-      accVecs = loadRows(loc, outputSubVecTy, mat_m, curVl_index, accBuf,
-                         subVecOff, rewriter);
+      accVecs =
+          loadRows(loc, outputSubVecTy, mat_m, vl, accBuf, subVecOff, rewriter);
     }
 
     auto doMul = [&](Value lhsScalar, Value rhsVec) -> Value {
@@ -595,8 +593,8 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
     // k = 0
     {
       Value cIndex_k = index_cst(0);
-      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_index, rhsBuf,
-                             cIndex_k, subVecOff);
+      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, vl, rhsBuf, cIndex_k,
+                             subVecOff);
       for (int64_t m = 0; m < mat_m; ++m) {
         Value lhsScalar =
             loadScalar(loc, rewriter, lhsBuf, index_cst(m), cIndex_k);
@@ -616,8 +614,8 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
       rewriter.setInsertionPointToStart(forOpK.getBody());
 
       Value cIndex_k = forOpK.getInductionVar();
-      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, curVl_index, rhsBuf,
-                             cIndex_k, subVecOff);
+      Value rhsVec = loadRow(loc, rewriter, inputSubVecTy, vl, rhsBuf, cIndex_k,
+                             subVecOff);
 
       SmallVector<Value> accVecs(mat_m);
       for (int64_t m = 0; m < mat_m; ++m) {
@@ -628,31 +626,32 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
       rewriter.create<scf::YieldOp>(loc, accVecs);
     } // end of for-op-k
     accVecs = forOpK.getResults();
-    storeRows(loc, accBuf, accVecs, curVl_index, subVecOff, rewriter);
+    storeRows(loc, accBuf, accVecs, vl, subVecOff, rewriter);
   };
 
   // Divide <K x N> vector into <K x VL> ones.
   // We do this first to achieve the best performance.
-  Value numSubVec = rewriter.create<arith::DivSIOp>(loc, index_cst(mat_n), vl);
+  Value numSubVec =
+      rewriter.create<arith::DivSIOp>(loc, index_cst(mat_n), vlmax);
   auto forOpN =
       rewriter.create<scf::ForOp>(loc, index_cst(0), numSubVec, index_cst(1));
   // Process each <M x K> x <K x VL> sub-matrix-product.
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(forOpN.getBody());
-    genForOpK(forOpN.getInductionVar(), vl);
+    genForBodyN(forOpN.getInductionVar(), vlmax);
   }
   // Process the remaining <K x (N % VL)> vector if N is not multiple of VL.
-  Value nModVl = rewriter.create<arith::RemSIOp>(loc, index_cst(mat_n), vl);
-  auto ifOpRem = rewriter.create<scf::IfOp>(
+  Value nModVl = rewriter.create<arith::RemSIOp>(loc, index_cst(mat_n), vlmax);
+  auto ifOp = rewriter.create<scf::IfOp>(
       loc,
       rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, nModVl,
                                      index_cst(0)),
       /*withElseRegion=*/false);
   {
     OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(ifOpRem.getBody());
-    genForOpK(numSubVec, nModVl);
+    rewriter.setInsertionPointToStart(ifOp.getBody());
+    genForBodyN(numSubVec, nModVl);
   }
 
   // The result is in accBuf. We should load it and replace the original
@@ -682,8 +681,9 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
   const int64_t baseVlen_i64 = 64;
   const int64_t baseVlmax_i64 =
       baseVlen_i64 / inputElemBitWidth / (isWidening ? 2 : 1);
-  assert(baseVlmax_i64 > 0 &&
-         "Did you tried to widen an element from 64-bit to 128-bit?");
+  assert(!(inputElemBitWidth == 64 && isWidening) &&
+         "Cannot widen 64-bit element.");
+  assert(baseVlmax_i64 > 0);
 
   Value c_tumu = int_cst(rewriter.getI64Type(), 3);
   Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
@@ -719,19 +719,18 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
           mr * nr, rewriter.create<arith::ConstantOp>(
                        loc, rewriter.getZeroAttr(outputSubVecTy)));
 
-      auto genForBodyK = [&](Value iv, Value curVl_index) {
+      auto genForBodyK = [&](Value iv, Value vl) {
         Value subVecOff = op_muli(iv, vlmax);
-        Value curVl_i64 = op_index_cast(rewriter.getI64Type(), curVl_index);
         // Get operands
         SmallVector<Value, MR> lhsVecs(mr);
         SmallVector<Value, NR> rhsVecs(nr);
         for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
-          lhsVecs[i_mr] = loadRow(loc, rewriter, inputSubVecTy, curVl_index,
-                                  lhsBuf, index_cst(m + i_mr), subVecOff);
+          lhsVecs[i_mr] = loadRow(loc, rewriter, inputSubVecTy, vl, lhsBuf,
+                                  index_cst(m + i_mr), subVecOff);
         }
         for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
-          rhsVecs[i_nr] = loadCol(loc, rewriter, inputSubVecTy, curVl_index,
-                                  rhsBuf, subVecOff, index_cst(n + i_nr));
+          rhsVecs[i_nr] = loadCol(loc, rewriter, inputSubVecTy, vl, rhsBuf,
+                                  subVecOff, index_cst(n + i_nr));
         }
         // Update sumVec
         SmallVector<Value, MR * NR> newSumVecs(mr * nr);
@@ -831,8 +830,6 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
   while (!isa<triton::FuncOp>(allocaPoint->getParentOp()))
     allocaPoint = allocaPoint->getParentOp();
 
-  // Cast input data if required and prepare input buffer. It might be
-  // temporary buffers with stored vectors or the original input memory.
   if (candidate.lhsBuf.empty()) {
     Value lhs = op.getA();
     candidate.lhsBuf = storeToTmpBuffer(loc, lhs, allocaPoint, rewriter);
@@ -860,13 +857,8 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
                                      isAccZeroInit);
   }
   case INNER: {
-    if (candidate.isWidening) {
-      return convertToInnerProductGemm(candidate, rewriter, accBuf,
-                                       isAccZeroInit);
-    } else {
-      return convertToInnerProductGemm(candidate, rewriter, accBuf,
-                                       isAccZeroInit);
-    }
+    return convertToInnerProductGemm(candidate, rewriter, accBuf,
+                                     isAccZeroInit);
   }
   default: {
     llvm_unreachable("Unknown dot style.");
