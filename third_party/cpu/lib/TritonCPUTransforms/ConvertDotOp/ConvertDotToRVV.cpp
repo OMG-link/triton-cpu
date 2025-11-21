@@ -437,22 +437,25 @@ void storeRows(Location loc, const MemBuffer &buf, ArrayRef<Value> vecs,
 /**
  * Get VMUL according to the number of accumulating vectors.
  */
-int64_t getVmul(int64_t numAcc, int64_t bitsToHold, bool isWidening) {
-  // Assume VMUL=1, we need n VREGs for accumulate (2n if widening) and 2 VREGs
-  // for input (with prefetch buffer).
-  int64_t vmul = 32 / (numAcc * (isWidening ? 2 : 1) + 2);
-  // Avoid allocate too many VREGs.
+int64_t getVmul(int64_t numAcc, int64_t accBits) {
+  // Assume VMUL=1, we need n VREGs for accumulate and 2 VREGs for input (with
+  // prefetch buffer).
+  int64_t vmul = 32 / (numAcc + 2);
+  // Floor to a power of 2 since:
+  // - VMUL must be a power of 2.
+  // - We will use more than 32 VREGs if we ceil it.
+  vmul = 1ll << (63 - __builtin_clzll(vmul));
+  // Prevent a situation where more than half of the registers are left unused.
   if (auto vlen = getVlen(); vlen > 0) {
-    int64_t vregNeeded = (bitsToHold + vlen - 1) / vlen;
+    int64_t vregNeeded = (accBits + vlen - 1) / vlen;
     // Ceil to a power of 2
     int64_t maxVmul = 1ll << (64 - __builtin_clzll(vregNeeded - 1));
     vmul = std::min<int64_t>(vmul, maxVmul);
   }
-  // VMUL must be a power of 2.
-  vmul = 1ll << (63 - __builtin_clzll(vmul));
-  // VMUL must be at least 1, and at most 8 (4 if widening). (For RVV 1.0)
+  // VMUL must be at most 8. (For RVV 1.0)
+  // The lower bound is set to 1 to maximize register utilization.
   vmul = std::max<int64_t>(vmul, 1);
-  vmul = std::min<int64_t>(vmul, isWidening ? 4 : 8);
+  vmul = std::min<int64_t>(vmul, 8);
   return vmul;
 }
 
@@ -508,13 +511,13 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
 
   Location loc = dotOp.getLoc();
 
-  int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
+  int64_t outputElemBitWidth = outputElemTy.getIntOrFloatBitWidth();
   // If mat_k==1, the result is available immediately. No accumulation is
   // needed.
   int64_t vmul = getVmul(/*numAcc=*/mat_k > 1 ? mat_m : 1,
-                         /*bitsToHold=*/mat_n * inputElemBitWidth, isWidening);
+                         /*accBits=*/mat_n * outputElemBitWidth);
   const int64_t baseVlen = 64;
-  const int64_t baseVlmax = vmul * baseVlen / inputElemBitWidth;
+  const int64_t baseVlmax = vmul * baseVlen / outputElemBitWidth;
 
   Value baseVlmax_cIndex = index_cst(baseVlmax);
 
