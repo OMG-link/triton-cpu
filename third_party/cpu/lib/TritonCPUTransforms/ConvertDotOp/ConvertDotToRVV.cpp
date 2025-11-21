@@ -516,8 +516,6 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   const int64_t baseVlen = 64;
   const int64_t baseVlmax = vmul * baseVlen / inputElemBitWidth;
 
-  Value c_tumu = int_cst(rewriter.getI64Type(), 3);
-  Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
   Value baseVlmax_cIndex = index_cst(baseVlmax);
 
   Value vscale = getVscale(loc, rewriter);
@@ -685,8 +683,6 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
          "Cannot widen 64-bit element.");
   assert(baseVlmax_i64 > 0);
 
-  Value c_tumu = int_cst(rewriter.getI64Type(), 3);
-  Value c_frm_dyn = int_cst(rewriter.getI64Type(), 7);
   Value baseVlmax_cIndex = index_cst(baseVlmax_i64);
 
   Value vscale = getVscale(loc, rewriter);
