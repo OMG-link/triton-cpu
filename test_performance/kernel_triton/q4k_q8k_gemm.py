@@ -26,9 +26,6 @@ NR = tl.constexpr(32) # 如何获取CPU的VLEN作为NR?
 QK_K = tl.constexpr(256)
 QK_SB_K = tl.constexpr(32)
 
-Freq = 1.6
-VLEN = 256
-
 
 def cdiv(a, b):
     return (a + b - 1) // b
@@ -194,9 +191,11 @@ def quantize_q4_K(b: torch.Tensor):
 # -----------------------
 @triton.jit
 def q4k_q8k_matmul_kernel(
+    # q8k 输入
     a_q_ptr_raw,              # int8     A        (M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR)
     a_bsums_ptr_raw,          # int16    a_bsums  (M//MR, K//QK_K, QK_K//QK_SB_K, MR)
     a_d_ptr_raw,              # float32  a_d      (M//MR, K//QK_K, MR)
+    
     b_q_ptr_raw,              # int8     Bpacked  (N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR)
     b_scales_ptr_raw,         # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
     b_mins_ptr_raw,           # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
@@ -273,6 +272,7 @@ def q4k_q8k_matmul_kernel(
         block_shape=(1, 1, NR),
         order=(2, 1, 0),
     )
+
     b_dmin_ptr_start = tl.make_block_ptr(
         base=b_dmin_ptr_raw,
         shape=(N//NR, K//QK_K, NR),
@@ -281,6 +281,7 @@ def q4k_q8k_matmul_kernel(
         block_shape=(1, 1, NR),
         order=(2, 1, 0),
     )
+
     c_ptr_start = tl.make_block_ptr(
         base=c_ptr_raw,
         shape=(M, N),
@@ -340,11 +341,10 @@ def gflo_ps_from_ms(ms, M, N, K):
     # total flops assumed 2*M*N*K
     return 2.0 * M * N * K * 1e-9 / (ms * 1e-3)
 
-def bench_kernel_only_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
+def bench_q4k_q8k_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
     """
-    Pre-quantize inputs once, then benchmark only the Triton kernel invocation:
-      matmul_kernel[(cdiv(M,MR), cdiv(N,NR))](a_q, a_bsums, a_d, b_q, b_scales, b_mins, b_d, b_dmin, c, M, N, K)
-    Excludes quantize time.
+    Pre-quantize inputs once, then benchmark only the Triton kernel invocation.
+    Returns timing only - performance calculation moved to driver.
     """
     device = 'cpu'
 
@@ -371,21 +371,9 @@ def bench_kernel_only_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
             c, M, N, K, num_threads=num_threads
         )
 
-    # run benchmark (request mean mode with quantiles returned)
-    # do_bench signature: (fn, warmup=25, rep=100, quantiles=None, return_mode='mean')
+    # run benchmark
     ms, min_ms, max_ms = tt.do_bench(fn, warmup=warmup_ms, rep=rep_ms, quantiles=[0.5, 0.2, 0.8])
-
-    # gflops = gflo_ps_from_ms(ms, M, N, K)
-    # gflops_max = gflo_ps_from_ms(min_ms, M, N, K)
-    # gflops_min = gflo_ps_from_ms(max_ms, M, N, K)
-
-    # 峰值性能
-    peak_flops = 2.0 * VLEN/8 * Freq
-
-    # print(f"[KERNEL BENCH] M={M} K={K} N={N} | median_ms={ms:.3f} min_ms={min_ms:.3f} max_ms={max_ms:.3f} | "
-    #       f"GFLOPS(med)={gflops:.2f} GFLOPS(min)={gflops_min:.2f} GFLOPS(max)={gflops_max:.2f}")
-    # 计算量
-    return ms, min_ms, max_ms, peak_flops
+    return ms, min_ms, max_ms
 
 
 # Integrate with argparse: add a --bench-kernel flag
@@ -394,15 +382,26 @@ if __name__ == '__main__':
     parser.add_argument('--rep-ms', type=int, default=200, help='do_bench rep time in ms')
     parser.add_argument('--warmup-ms', type=int, default=50, help='do_bench warmup time in ms')
     parser.add_argument('--num-threads', type=int, default=8, help='torch.set_num_threads() (None = unchanged)')
+    parser.add_argument('--shapes', type=str, default='', help='额外形状, 逗号分隔, 例如 48x512x32,96x256x32')
     args, unknown = parser.parse_known_args()
 
     # run the original correctness tests (keeps previous behavior)
-    tests = (
+    tests = [
         (48, 512, 32),
-    )
+    ]
+    if args.shapes:
+        for item in args.shapes.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                m,k,n = item.lower().split('x')
+                tests.append((int(m), int(k), int(n)))
+            except Exception as e:
+                print(f"忽略无效形状 '{item}': {e}")
 
     for M, K, N in tests:
-        mean_ms, max_ms, min_ms, peak_flops = bench_kernel_only_case(
+        mean_ms, max_ms, min_ms = bench_kernel_only_case(
             M=M,
             N=N,
             K=K,
@@ -410,6 +409,9 @@ if __name__ == '__main__':
             warmup_ms=args.warmup_ms,
             num_threads=args.num_threads,
         )
+        # 使用默认芯片参数计算性能（独立运行时）
+        freq, vlen = 1.6, 256
+        peak_flops = 2.0 * vlen / 8 * freq
         gflops = gflo_ps_from_ms(mean_ms, M, N, K)
         gflops_max = gflo_ps_from_ms(min_ms, M, N, K)
         gflops_min = gflo_ps_from_ms(max_ms, M, N, K)
@@ -419,6 +421,20 @@ if __name__ == '__main__':
         print(f"[KERNEL BENCH] M={M} K={K} N={N} | median_ms={mean_ms:.3f} min_ms={min_ms:.3f} max_ms={max_ms:.3f} | "
             f"GFLOPS(med)={gflops:.2f} GFLOPS(min)={gflops_min:.2f} GFLOPS(max)={gflops_max:.2f} | "
             f"Utilization(med)={utilization:.2f}% Utilization(min)={utilization_min:.2f}% Utilization(max)={utilization_max:.2f}%") 
+
+# -----------------------
+# 统一驱动注册接口 - 简化版本，逻辑移到 driver
+# -----------------------
+
+def get_kernel_info():
+    """返回 kernel 的基本信息，供 driver 调用"""
+    return {
+        'name': 'q4k_q8k',
+        'bench_fn': bench_q4k_q8k_case,
+        'constraints': {'M': 12, 'N': 32, 'K': 256},  # 块大小约束
+        'compute_dtype': 'int8',  # 实际计算使用的数据类型
+        'dtype_width': 8,  # bits
+    }
         
 
 

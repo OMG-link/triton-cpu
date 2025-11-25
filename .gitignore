@@ -104,3 +104,5 @@ srh_demo/**
 python/tutorials/ir_dump/**
 
 test_performance/kernel_triton/ir-dump/**
+
+test_performance/kernel_triton/perf_result/**
