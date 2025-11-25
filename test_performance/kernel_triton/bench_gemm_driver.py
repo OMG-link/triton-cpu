@@ -16,7 +16,7 @@ TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --metri
 TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k --metric gflops
 
 # 测试特定形状和 kernel（使用 tt.do_bench 进行精确计时）
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80 --shapes 48x512x32,96x512x32 --warmup 3 --rounds 10 --metric gflops
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k,iq4k_q8k --warmup 3 --rounds 5 --metric gflops --num-threads=8 --grid-repeat 10
 
 注意:
   - 可用的 kernel: q40_q80, q4k_q8k, iq4k_q8k

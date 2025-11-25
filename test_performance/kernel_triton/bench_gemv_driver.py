@@ -21,8 +21,8 @@ TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_tr
 TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --plot bandwidth_comparison.png
 
 # 同时指定 CSV 和图片，以及峰值带宽 (推荐)
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --num_threads=8 \
-    --csv bandwidth_comparison.csv --plot bandwidth_comparison.png --rounds 5 --target-gb 1.5 --peak-bw 8.5
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  ./gemv_driver.py --sweep --kernel all --num_threads=8 \
+    --csv bandwidth_comparison.csv --plot bandwidth_comparison.png --rounds 5 --target-gb 1.5 --peak-bw 5.83
 '''
 
 
@@ -675,8 +675,8 @@ def save_results_csv(results, csv_path):
 
 
 def plot_bandwidth_comparison(results, output_path=None, title='GEMV Bandwidth Comparison'):
-    """绘制不同 kernel 在不同 shape 下的带宽对比图
-    
+    """绘制不同 kernel 在不同 shape 下的带宽对比图，并按 N×K 从小到大排序横坐标。
+
     Args:
         results: {kernel_name: [result_dict1, result_dict2, ...]}
         output_path: 图片保存路径，默认自动生成
@@ -685,45 +685,71 @@ def plot_bandwidth_comparison(results, output_path=None, title='GEMV Bandwidth C
     if output_path is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_path = f'gemv_bandwidth_plot_{timestamp}.png'
-    
+
     plt.figure(figsize=(12, 7))
-    
+
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
     markers = ['o', 's', '^', 'D', 'v', 'p']
-    
+
+    # 1) 收集所有 kernel 的有效 shape，并按 N*K 全局排序
+    all_valid_items = []  # (kernel_name, res)
+    for kernel_name, result_list in results.items():
+        for r in result_list:
+            if 'error' in r:
+                continue
+            all_valid_items.append((kernel_name, r))
+
+    if not all_valid_items:
+        print('[WARN] 没有可绘制的有效结果，跳过绘图。')
+        return
+
+    # 全局唯一 shape 列表
+    unique_shapes = set((r['N'], r['K']) for _, r in all_valid_items)
+    shapes_sorted = sorted(unique_shapes, key=lambda nk: (nk[0] * nk[1], nk[0], nk[1]))
+    x_pos = np.arange(len(shapes_sorted))
+    shape_labels = [f"{N}x{K}" for (N, K) in shapes_sorted]
+
+    # 2) 逐 kernel 构造与全局 shape 对齐的 y/yerr，缺失用 NaN
     for idx, (kernel_name, result_list) in enumerate(results.items()):
-        # 过滤掉失败的结果
         valid_results = [r for r in result_list if 'error' not in r]
         if not valid_results:
             continue
-        
-        # 提取数据
-        shape_labels = [f"{r['N']}x{r['K']}" for r in valid_results]
-        bandwidths = [r['avg_bandwidth'] for r in valid_results]
-        std_bws = [r['std_bandwidth'] for r in valid_results]
-        
-        x_pos = np.arange(len(shape_labels))
-        
+
+        # 快速索引：shape -> res
+        res_map = {(r['N'], r['K']): r for r in valid_results}
+
+        y = np.array([res_map.get((N, K), {}).get('avg_bandwidth', np.nan) for (N, K) in shapes_sorted], dtype=float)
+        yerr_raw = [res_map.get((N, K), {}).get('std_bandwidth', np.nan) for (N, K) in shapes_sorted]
+        # 将与 y 对应为 NaN 的 yerr 置 0，避免 Matplotlib 对 NaN 报错
+        yerr = np.array([0.0 if np.isnan(v) else v for v in yerr_raw], dtype=float)
+
         color = colors[idx % len(colors)]
         marker = markers[idx % len(markers)]
-        
-        plt.errorbar(x_pos, bandwidths, yerr=std_bws,
-                    label=kernel_name, marker=marker, markersize=8,
-                    linestyle='-', linewidth=2, capsize=5,
-                    color=color, alpha=0.8)
-    
-    # 设置图表
-    if valid_results:  # 使用最后一个 kernel 的 shape 标签
-        shape_labels = [f"{r['N']}x{r['K']}" for r in valid_results]
-        plt.xticks(np.arange(len(shape_labels)), shape_labels, rotation=45, ha='right')
-    
+
+        plt.errorbar(
+            x_pos,
+            y,
+            yerr=yerr,
+            label=kernel_name,
+            marker=marker,
+            markersize=8,
+            linestyle='-',
+            linewidth=2,
+            capsize=5,
+            color=color,
+            alpha=0.8,
+        )
+
+    # 3) 统一的 X 轴刻度与标签（全局升序）
+    plt.xticks(x_pos, shape_labels, rotation=45, ha='right')
+
     plt.xlabel('Matrix Shape (NxK)', fontsize=12, fontweight='bold')
     plt.ylabel('Bandwidth (GB/s)', fontsize=12, fontweight='bold')
     plt.title(title, fontsize=14, fontweight='bold')
     plt.legend(loc='best', fontsize=10)
     plt.grid(True, alpha=0.3, linestyle='--')
     plt.tight_layout()
-    
+
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"[INFO] 图表已保存到: {output_path}")
     plt.close()
