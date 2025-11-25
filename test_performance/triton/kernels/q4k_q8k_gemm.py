@@ -18,7 +18,7 @@ def cdiv(a, b):
 # -------------------------
 # Quantize functions
 # -------------------------
-def quantize_q8_K(a: torch.Tensor):
+def quantize_q8_K(a: torch.Tensor, MR: int, NR: int):
     """
     a: torch.Tensor float32 shape (M, K)
     returns: a_q_ptr (int8), a_bsums_ptr (int16), a_d_ptr (float32)
@@ -75,7 +75,7 @@ def quantize_q8_K(a: torch.Tensor):
     # bring outputs to CPU (kernel's block_ptr expects host tensors)
     return a_q, a_bsums, a_d
 
-def quantize_q4_K(b: torch.Tensor):
+def quantize_q4_K(b: torch.Tensor, MR: int, NR: int):
     """
     非对称 q4_K 实现（解码为:  orig ≈ d * (s_q * q) - dmin * m_q）
     b: (K, N)
@@ -187,6 +187,7 @@ def matmul_kernel(
     b_dmin_ptr_raw,           # float16  b_dmin   (N//NR, K//QK_K, NR)
     c_ptr_raw,                # float32  C        (M, N)
     M, N, K,
+    MR: tl.constexpr, NR: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -325,59 +326,37 @@ class Q4K_Q8K_GEMM(GEMMKernelBase):
         self.NR = NR
 
     def get_name(self) -> str:
-        return f"TritonQ4K_MR{self.MR}_NR{self.NR}"
+        return f"{self.__class__.__name__}_{self.MR}x{self.NR}"
 
-    def prepare(self, m: int, k: int, n: int, should_gen_data: bool = True) -> dict:
-        """
-        Prepare data and pre-quantize. Returns params dict.
-        params includes:
-          - a (float32 cpu), b (float32 cpu), c (float32 cpu)
-          - a_q_ptr, a_bsums_ptr, a_d_ptr
-          - b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr
-          - M,N,K
-        """
-        global MR, NR
-        MR = tl.constexpr(self.MR)
-        NR = tl.constexpr(self.NR)
-
-        # Data are always generated for now.
+    def prepare(self, m, k, n, should_gen_data=True):
         torch.manual_seed(0)
         a = torch.randint(0, 128, (m, k), device='cpu', dtype=torch.float32)
         b = torch.randint(0, 16, (k, n), device='cpu', dtype=torch.float32)
-        a_q_ptr, a_bsums_ptr, a_d_ptr = quantize_q8_K(a)
-        b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr = quantize_q4_K(b)
 
+        a_q_ptr, a_bsums_ptr, a_d_ptr = quantize_q8_K(a, self.MR, self.NR)
+        b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr = quantize_q4_K(b, self.MR, self.NR)
         c = torch.empty((m, n), device='cpu', dtype=torch.float32)
 
-        params = {
+        return {
             'a': a, 'b': b, 'c': c,
             'a_q_ptr': a_q_ptr, 'a_bsums_ptr': a_bsums_ptr, 'a_d_ptr': a_d_ptr,
             'b_q_ptr': b_q_ptr, 'b_scales_ptr': b_scales_ptr, 'b_mins_ptr': b_mins_ptr,
             'b_d_ptr': b_d_ptr, 'b_dmin_ptr': b_dmin_ptr,
             'M': m, 'N': n, 'K': k,
         }
-        return params
 
-    def run(self, params: dict, repeats: int = 1) -> float:
-        """
-        Execute kernel repeats times and return average time in seconds.
-        """
-        global MR, NR
-        MR = tl.constexpr(self.MR)
-        NR = tl.constexpr(self.NR)
-
-        m = params['M']
-        n = params['N']
-        k = params['K']
-
-        grid = (cdiv(m, MR), cdiv(n, NR), repeats)
+    def run(self, params, repeats=1):
+        m, n, k = params['M'], params['N'], params['K']
+        grid = (cdiv(m, self.MR), cdiv(n, self.NR), repeats)
 
         t0 = time.perf_counter()
         matmul_kernel[grid](
             params['a_q_ptr'], params['a_bsums_ptr'], params['a_d_ptr'],
-            params['b_q_ptr'], params['b_scales_ptr'], params['b_mins_ptr'], params['b_d_ptr'], params['b_dmin_ptr'],
+            params['b_q_ptr'], params['b_scales_ptr'], params['b_mins_ptr'],
+            params['b_d_ptr'], params['b_dmin_ptr'],
             params['c'],
-            m, n, k
+            m, n, k,
+            MR=self.MR, NR=self.NR
         )
         t1 = time.perf_counter()
 

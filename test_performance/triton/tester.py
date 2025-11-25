@@ -52,8 +52,10 @@ def performance_test(kernel, test_shapes, device="cpu"):
 
 def main():
     KERNELS = [
-        InnerGEMM(in_dtype="i8", out_dtype="i16"),
-        OuterGEMM(in_dtype="i8", out_dtype="i16"),
+        InnerGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=4),
+        OuterGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=32),
+        OuterGEMM(in_dtype="i8", out_dtype="i16", MR=8, NR=32),
+        OuterGEMM(in_dtype="i8", out_dtype="i16", MR=16, NR=16),
     ]
 
     correctness_shapes = [
