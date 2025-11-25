@@ -386,8 +386,6 @@ class Q4K_Q8K_GEMM(GEMMKernelBase):
     def verify(self, params: dict) -> bool:
         triton_output = params['c']
         torch_output = torch.matmul(params['a'].to(torch.float32), params['b'].to(torch.float32))
-        print(triton_output)
-        print(torch_output)
         ok = torch.allclose(triton_output, torch_output, rtol=0.02, atol=1e-5)
         return bool(ok)
 
