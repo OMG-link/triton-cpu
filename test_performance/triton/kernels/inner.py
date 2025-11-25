@@ -146,7 +146,7 @@ class InnerGEMM(GEMMKernelBase):
         t1 = time.perf_counter()
         return (t1 - t0) / repeats
 
-    def verify(self, params: dict, rtol: float = 1e-5, atol: float = 1e-5) -> bool:
+    def verify(self, params: dict) -> bool:
         a = params['a']
         # original b was (K,N) then we stored b_t in params['b']
         b_t = params['b']
@@ -154,7 +154,7 @@ class InnerGEMM(GEMMKernelBase):
         out = params['out']
         # compute reference
         ref = torch.matmul(a.to(params['torch_out_dtype']), b.to(params['torch_out_dtype']))
-        ok = torch.allclose(out, ref, rtol=rtol, atol=atol)
+        ok = torch.allclose(out, ref, rtol=1e-5, atol=1e-5)
         return bool(ok)
 
     def get_name(self) -> int:

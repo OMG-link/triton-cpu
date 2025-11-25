@@ -49,7 +49,7 @@ class GEMMKernelBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def verify(self, params: dict, rtol: float = 1e-5, atol: float = 1e-5) -> bool:
+    def verify(self, params: dict) -> bool:
         """
         验证结果正确性。
         返回 True/False。
