@@ -7,10 +7,7 @@ from kernels.inner import InnerGEMM
 from kernels.outer import OuterGEMM
 from kernels.q4k_q8k_gemm import Q4K_Q8K_GEMM
 
-# ------------------------------
-# 正确性测试
-# ------------------------------
-def correctness_test(kernel, test_shapes, device="cpu"):
+def correctness_test(kernel, test_shapes):
     print(f"\n===== Correctness Test: {kernel.get_name()} =====")
 
     for (m, k, n) in test_shapes:
@@ -18,28 +15,25 @@ def correctness_test(kernel, test_shapes, device="cpu"):
 
         params = kernel.prepare(m, k, n)
         kernel.run(params)
-        ok = kernel.verify(params)
-        if not ok:
-            print(f"❌ Correctness FAILED for {kernel.get_name()} ({m}x{k}x{n})")
+        if not kernel.verify(params):
+            print(f"❌ FAILED for shape {m}x{k}x{n}")
             return False
-    print(f"✔ Correctness passed for {kernel.get_name()}")
+
+    print(f"✅ Correctness passed for {kernel.get_name()}")
     return True
 
 
-# ------------------------------
-# 性能测试
-# ------------------------------
-def performance_test(kernel, test_shapes, device="cpu"):
+def performance_test(kernel, test_shapes):
     print(f"\n===== Performance Test: {kernel.get_name()} =====")
 
     os.makedirs("results", exist_ok=True)
     csv_file = os.path.join("results", f"{kernel.get_name()}.csv")
-    
+
     with open(csv_file, "w", newline="") as f:
         writer = csv.writer(f)
         for (m, k, n) in test_shapes:
-            repeats = max(1, int(2**36 / (m*k*n)))
-            params = kernel.prepare(m, k, n, should_gen_data=True)
+            repeats = max(1, int(2**36 / (m * k * n)))
+            params = kernel.prepare(m, k, n)
             elapsed = kernel.run(params, repeats=repeats)
             exp_cycles = kernel.expected_cycles(m, k, n)
             perf_ratio = elapsed * 1.6e9 / exp_cycles
@@ -50,30 +44,77 @@ def performance_test(kernel, test_shapes, device="cpu"):
     print(f"CSV saved: {csv_file}")
 
 
-def main():
-    KERNELS = [
-        InnerGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=4),
-        OuterGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=32),
-        OuterGEMM(in_dtype="i8", out_dtype="i16", MR=8, NR=32),
-        OuterGEMM(in_dtype="i8", out_dtype="i16", MR=16, NR=16),
-    ]
-
-    correctness_shapes = [
-        (48, 256, 32),
-    ]
-
-    performance_shapes = [
+TEST_SETS = {
+    "correctness": [
+        (48, 512, 32),
+    ],
+    "normal_1": [
         (32, 256, 32),
         (32, 2048, 32),
         (256, 256, 256),
         (512, 512, 512),
         (1024, 1024, 1024),
         (2048, 2048, 2048),
-    ]
+    ],
+    "q4k_q8k_1": [
+        (4, 256, 32),
+        (512, 1536, 1536),
+        (2048, 2048, 2048),
+    ],
+    "q4k_q8k_2": [
+        (12, 256, 32),
+        (480, 1536, 1536),
+        (1800, 2048, 2048),
+    ],
+}
 
-    for kernel in KERNELS:
-        passed = correctness_test(kernel, correctness_shapes)
-        if not passed:
+KERNELS = [
+    {
+        "kernel": InnerGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=4),
+        "correctness": ["correctness"],
+        "performance": ["normal_1"],
+    }, {
+        "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=32),
+        "correctness": ["correctness"],
+        "performance": ["normal_1"],
+    }, {
+        "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=8, NR=32),
+        "correctness": ["correctness"],
+        "performance": ["normal_1"],
+    }, {
+        "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=16, NR=16),
+        "correctness": ["correctness"],
+        "performance": ["normal_1"],
+    }, {
+        "kernel": Q4K_Q8K_GEMM(MR=4, NR=32),
+        "correctness": ["correctness"],
+        "performance": ["q4k_q8k_1"],
+    }, {
+        "kernel": Q4K_Q8K_GEMM(MR=12, NR=32),
+        "correctness": ["correctness"],
+        "performance": ["q4k_q8k_2"],
+    },
+]
+
+
+def expand_test_sets(test_set_names):
+    shapes = []
+    for name in test_set_names:
+        shapes.extend(TEST_SETS[name])
+    return shapes
+
+def main():
+    for entry in KERNELS:
+        kernel = entry["kernel"]
+
+        correctness_shapes = expand_test_sets(entry["correctness"])
+        performance_shapes = expand_test_sets(entry["performance"])
+
+        print("\n\n------------------------------")
+        print("Testing Kernel:", kernel.get_name())
+        print("------------------------------")
+
+        if not correctness_test(kernel, correctness_shapes):
             continue
         performance_test(kernel, performance_shapes)
 
