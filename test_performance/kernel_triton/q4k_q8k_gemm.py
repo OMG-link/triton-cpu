@@ -192,16 +192,16 @@ def quantize_q4_K(b: torch.Tensor):
 @triton.jit
 def q4k_q8k_matmul_kernel(
     # q8k 输入
-    a_q_ptr_raw,              # int8     A        (M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR)
-    a_bsums_ptr_raw,          # int16    a_bsums  (M//MR, K//QK_K, QK_K//QK_SB_K, MR)
-    a_d_ptr_raw,              # float32  a_d      (M//MR, K//QK_K, MR)
+    q8k_matrix_ptr,              # int8     A        (M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR)
+    q8k_bsums_ptr,          # int16    a_bsums  (M//MR, K//QK_K, QK_K//QK_SB_K, MR)
+    q8k_d_ptr,              # float32  a_d      (M//MR, K//QK_K, MR)
     
-    b_q_ptr_raw,              # int8     Bpacked  (N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR)
-    b_scales_ptr_raw,         # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
-    b_mins_ptr_raw,           # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
-    b_d_ptr_raw,              # float16  b_d      (N//NR, K//QK_K, NR)
-    b_dmin_ptr_raw,           # float16  b_dmin   (N//NR, K//QK_K, NR)
-    c_ptr_raw,                # float32  C        (M, N)
+    q4k_matrix_ptr,              # int8     Bpacked  (N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR)
+    q4k_scale_ptr,         # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
+    q4k_mins_ptr,           # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
+    q4k_d_ptr,              # float16  b_d      (N//NR, K//QK_K, NR)
+    q4k_dmin_ptr,           # float16  b_dmin   (N//NR, K//QK_K, NR)
+    output_ptr,                # float32  C        (M, N)
     M, N, K,
 ):
     pid_m = tl.program_id(axis=0)
@@ -211,7 +211,7 @@ def q4k_q8k_matmul_kernel(
     i_nr = pid_n * NR
 
     a_q_ptr_start = tl.make_block_ptr(
-        base=a_q_ptr_raw,
+        base=q8k_matrix_ptr,
         shape=(M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR),
         strides=(K*MR, QK_K*MR, QK_SB_K*MR, MR, 1),
         offsets=(i_mr//MR, 0, 0, 0, 0),
@@ -220,7 +220,7 @@ def q4k_q8k_matmul_kernel(
     )
 
     a_bsums_ptr_start = tl.make_block_ptr(
-        base=a_bsums_ptr_raw,
+        base=q8k_bsums_ptr,
         shape=(M//MR, K//QK_K, QK_K//QK_SB_K, MR),
         strides=(K//QK_SB_K*MR, QK_K//QK_SB_K*MR, MR, 1),
         offsets=(i_mr//MR, 0, 0, 0),
@@ -229,7 +229,7 @@ def q4k_q8k_matmul_kernel(
     )
 
     a_d_ptr_start = tl.make_block_ptr(
-        base=a_d_ptr_raw,
+        base=q8k_d_ptr,
         shape=(M//MR, K//QK_K, MR),
         strides=(K//QK_K*MR, MR, 1),
         offsets=(i_mr//MR, 0, 0),
@@ -238,7 +238,7 @@ def q4k_q8k_matmul_kernel(
     )
 
     b_q_ptr_start = tl.make_block_ptr(
-        base=b_q_ptr_raw,
+        base=q4k_matrix_ptr,
         shape=(N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR),
         strides=(K*NR, QK_K*NR, QK_SB_K*NR, NR, 1),
         offsets=(i_nr//NR, 0, 0, 0, 0),
@@ -247,7 +247,7 @@ def q4k_q8k_matmul_kernel(
     )
 
     b_mins_ptr_start = tl.make_block_ptr(
-        base=b_mins_ptr_raw,
+        base=q4k_mins_ptr,
         shape=(N//NR, K//QK_K, QK_K//QK_SB_K, NR),
         strides=(K//QK_SB_K*NR, QK_K//QK_SB_K*NR, NR, 1),
         offsets=(i_nr//NR, 0, 0, 0),
@@ -256,7 +256,7 @@ def q4k_q8k_matmul_kernel(
     )
 
     b_scales_ptr_start = tl.make_block_ptr(
-        base=b_scales_ptr_raw,
+        base=q4k_scale_ptr,
         shape=(N//NR, K//QK_K, QK_K//QK_SB_K, NR),
         strides=(K//QK_SB_K*NR, QK_K//QK_SB_K*NR, NR, 1),
         offsets=(i_nr//NR, 0, 0, 0),
@@ -265,7 +265,7 @@ def q4k_q8k_matmul_kernel(
     )
     
     b_d_ptr_start = tl.make_block_ptr(
-        base=b_d_ptr_raw,
+        base=q4k_d_ptr,
         shape=(N//NR, K//QK_K, NR),
         strides=(K//QK_K*NR, NR, 1),
         offsets=(i_nr//NR, 0, 0),
@@ -274,7 +274,7 @@ def q4k_q8k_matmul_kernel(
     )
 
     b_dmin_ptr_start = tl.make_block_ptr(
-        base=b_dmin_ptr_raw,
+        base=q4k_dmin_ptr,
         shape=(N//NR, K//QK_K, NR),
         strides=(K//QK_K*NR, NR, 1),
         offsets=(i_nr//NR, 0, 0),
@@ -283,7 +283,7 @@ def q4k_q8k_matmul_kernel(
     )
 
     c_ptr_start = tl.make_block_ptr(
-        base=c_ptr_raw,
+        base=output_ptr,
         shape=(M, N),
         strides=(N, 1),
         offsets=(i_mr, i_nr),
@@ -341,7 +341,7 @@ def gflo_ps_from_ms(ms, M, N, K):
     # total flops assumed 2*M*N*K
     return 2.0 * M * N * K * 1e-9 / (ms * 1e-3)
 
-def bench_q4k_q8k_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
+def bench_kernel_only_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
     """
     Pre-quantize inputs once, then benchmark only the Triton kernel invocation.
     Returns timing only - performance calculation moved to driver.
@@ -430,7 +430,7 @@ def get_kernel_info():
     """返回 kernel 的基本信息，供 driver 调用"""
     return {
         'name': 'q4k_q8k',
-        'bench_fn': bench_q4k_q8k_case,
+        'bench_fn': bench_kernel_only_case,
         'constraints': {'M': 12, 'N': 32, 'K': 256},  # 块大小约束
         'compute_dtype': 'int8',  # 实际计算使用的数据类型
         'dtype_width': 8,  # bits

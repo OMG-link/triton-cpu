@@ -27,8 +27,10 @@ def q4k_q8k_gemv_kernel(
     output_ptr,      # float32 
     K,
     N,
+    batch: tl.constexpr = 1,
 ):
-    pid_n = tl.program_id(axis=0)
+    pid_b = tl.program_id(axis=0)  # batch id
+    pid_n = tl.program_id(axis=1)  # N id
     NR : tl.constexpr = 32
     QK_K : tl.constexpr = 256
     QK_K_SUB_BLOCK_SIZE : tl.constexpr = 32
@@ -40,101 +42,101 @@ def q4k_q8k_gemv_kernel(
     
     q8k_vector_block_ptr = tl.make_block_ptr(
         base=q8k_vector_ptr,
-        shape=(QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_K_SUB_BLOCK_SIZE, 1),
-        strides=(QK_K, QK_K_SUB_BLOCK_SIZE, 1, 1),
-        offsets=(0, 0, 0, 0),
-        block_shape=(1, 1, 1, 1),
-        order=(3, 2, 1, 0),
+        shape=(batch, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_K_SUB_BLOCK_SIZE, 1),
+        strides=(QK_SUPER_BLOCK_NUMS * QK_K, QK_K, QK_K_SUB_BLOCK_SIZE, 1, 1),
+        offsets=(pid_b, 0, 0, 0, 0),
+        block_shape=(1, 1, 1, 1, 1),
+        order=(4, 3, 2, 1, 0),
     )
 
     q8k_d_block_ptr = tl.make_block_ptr(
         base=q8k_d_ptr,
-        shape=(QK_SUPER_BLOCK_NUMS,),
-        strides=(1,),
-        offsets=(0,),
-        block_shape=(1,),
-        order=(0,),
+        shape=(batch, QK_SUPER_BLOCK_NUMS),
+        strides=(QK_SUPER_BLOCK_NUMS, 1),
+        offsets=(pid_b, 0),
+        block_shape=(1, 1),
+        order=(1, 0),
     )
 
     q8k_bsums_block_ptr = tl.make_block_ptr(
         base=q8_bsums_ptr,
-        shape=(QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, 2, 1),
-        strides=(NUM_SUB_BLOCKS * 2, 2, 1, 1),
-        offsets=(0, 0, 0, 0),
-        block_shape=(1, 1, 1, 1),
-        order=(3, 2, 1, 0),
+        shape=(batch, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, 2, 1),
+        strides=(QK_SUPER_BLOCK_NUMS * NUM_SUB_BLOCKS * 2, NUM_SUB_BLOCKS * 2, 2, 1, 1),
+        offsets=(pid_b, 0, 0, 0, 0),
+        block_shape=(1, 1, 1, 1, 1),
+        order=(4, 3, 2, 1, 0),
     ) # @int16
 
     q4k_block_ptr = tl.make_block_ptr(
         base=q4k_matrix_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR),
-        strides=(K*NR//2, QK_K*NR//2, QK_4_K_SUB_BLOCK_DATA_SIZE * NR, NR, 1),
-        offsets=(pid_n, 0, 0, 0, 0),
-        block_shape=(1, 1, 1, 1, NR),
-        order=(4, 3, 2, 1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * K*NR//2, K*NR//2, QK_K*NR//2, QK_4_K_SUB_BLOCK_DATA_SIZE * NR, NR, 1),
+        offsets=(pid_b, pid_n, 0, 0, 0, 0),
+        block_shape=(1, 1, 1, 1, 1, NR),
+        order=(5, 4, 3, 2, 1, 0),
     )
 
     q4k_scale_l_block_ptr = tl.make_block_ptr(
         base=q4k_scale_l_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 2, NR),
-        strides=(K * NR // QK_K_SUB_BLOCK_SIZE // 2, (NUM_SUB_BLOCKS // 2) * NR, NR, 1),
-        offsets=(pid_n, 0, 0, 0),
-        block_shape=(1, 1, 1, NR),
-        order=(3, 2, 1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 2, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * K * NR // QK_K_SUB_BLOCK_SIZE // 2, K * NR // QK_K_SUB_BLOCK_SIZE // 2, (NUM_SUB_BLOCKS // 2) * NR, NR, 1),
+        offsets=(pid_b, pid_n, 0, 0, 0),
+        block_shape=(1, 1, 1, 1, NR),
+        order=(4, 3, 2, 1, 0),
     )
 
     q4k_scale_h_block_ptr = tl.make_block_ptr(
         base=q4k_scale_h_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 4, NR),
-        strides =(K * NR // QK_K_SUB_BLOCK_SIZE // 4, (NUM_SUB_BLOCKS // 4) * NR, NR, 1),
-        offsets=(pid_n, 0, 0, 0),
-        block_shape=(1, 1, 1, NR),
-        order=(3, 2, 1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 4, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * K * NR // QK_K_SUB_BLOCK_SIZE // 4, K * NR // QK_K_SUB_BLOCK_SIZE // 4, (NUM_SUB_BLOCKS // 4) * NR, NR, 1),
+        offsets=(pid_b, pid_n, 0, 0, 0),
+        block_shape=(1, 1, 1, 1, NR),
+        order=(4, 3, 2, 1, 0),
     )
 
     q4k_mins_l_block_ptr = tl.make_block_ptr(
         base=q4k_mins_l_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 2, NR),
-        strides=(K//QK_K * NR // 2, (NUM_SUB_BLOCKS // 2) * NR, NR, 1),
-        offsets=(pid_n, 0, 0, 0),
-        block_shape=(1, 1, 1, NR),
-        order=(3, 2, 1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 2, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * K//QK_K * NR // 2, K//QK_K * NR // 2, (NUM_SUB_BLOCKS // 2) * NR, NR, 1),
+        offsets=(pid_b, pid_n, 0, 0, 0),
+        block_shape=(1, 1, 1, 1, NR),
+        order=(4, 3, 2, 1, 0),
     )
 
     q4k_mins_h_block_ptr = tl.make_block_ptr(
         base=q4k_mins_h_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 4, NR),
-        strides=(K//QK_K * NR // 4, (NUM_SUB_BLOCKS // 4) * NR, NR, 1),
-        offsets=(pid_n, 0, 0, 0),
-        block_shape=(1, 1, 1, NR),
-        order=(3, 2, 1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, K//QK_K, NUM_SUB_BLOCKS // 4, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * K//QK_K * NR // 4, K//QK_K * NR // 4, (NUM_SUB_BLOCKS // 4) * NR, NR, 1),
+        offsets=(pid_b, pid_n, 0, 0, 0),
+        block_shape=(1, 1, 1, 1, NR),
+        order=(4, 3, 2, 1, 0),
     )
 
     q4k_d_block_ptr = tl.make_block_ptr(
         base=q4k_d_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, K//QK_K, NR),
-        strides=(K//QK_K*NR, NR, 1),
-        offsets=(pid_n, 0, 0),
-        block_shape=(1, 1, NR),
-        order=(2, 1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, K//QK_K, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * K//QK_K*NR, K//QK_K*NR, NR, 1),
+        offsets=(pid_b, pid_n, 0, 0),
+        block_shape=(1, 1, 1, NR),
+        order=(3, 2, 1, 0),
     )
 
     q4k_dmin_block_ptr = tl.make_block_ptr(
         base=q4k_dmin_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, K//QK_K, NR),
-        strides=(K//QK_K*NR, NR, 1),
-        offsets=(pid_n, 0, 0),
-        block_shape=(1, 1, NR),
-        order=(2, 1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, K//QK_K, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * K//QK_K*NR, K//QK_K*NR, NR, 1),
+        offsets=(pid_b, pid_n, 0, 0),
+        block_shape=(1, 1, 1, NR),
+        order=(3, 2, 1, 0),
     )
 
     output_block_ptr = tl.make_block_ptr(
         base=output_ptr,
-        shape=(NR_SUB_BLOCKS_NUMS, NR),
-        strides=(NR, 1),
-        offsets=(pid_n, 0),
-        block_shape=(1, NR),
-        order=(1, 0),
+        shape=(batch, NR_SUB_BLOCKS_NUMS, NR),
+        strides=(NR_SUB_BLOCKS_NUMS * NR, NR, 1),
+        offsets=(pid_b, pid_n, 0),
+        block_shape=(1, 1, NR),
+        order=(2, 1, 0),
     )
 
     # TODO 这里一定得写成 （1, NR), 后面 reshape 成 (1,NR,) 无效果
@@ -142,13 +144,13 @@ def q4k_q8k_gemv_kernel(
 
     for k_block in range(K // QK_K):
 
-        q4k_d_data_ptr = tl.advance(q4k_d_block_ptr, offsets=(0, k_block, 0))
+        q4k_d_data_ptr = tl.advance(q4k_d_block_ptr, offsets=(0, 0, k_block, 0))
         q4k_d_data = tl.load(q4k_d_data_ptr).reshape((NR,))  # [NR]@float32
 
-        q4k_dmin_data_ptr = tl.advance(q4k_dmin_block_ptr, offsets=(0, k_block, 0))
+        q4k_dmin_data_ptr = tl.advance(q4k_dmin_block_ptr, offsets=(0, 0, k_block, 0))
         q4k_dmin_data = tl.load(q4k_dmin_data_ptr).reshape((NR,))  # [NR]@float32
 
-        q8k_d_data_ptr = tl.advance(q8k_d_block_ptr, offsets=(k_block,))
+        q8k_d_data_ptr = tl.advance(q8k_d_block_ptr, offsets=(0, k_block))
         q8k_d_data = tl.load(q8k_d_data_ptr).reshape((1,))  # [1]@float32
 
         sum = tl.zeros((NR,), dtype=tl.int32)
@@ -158,30 +160,30 @@ def q4k_q8k_gemv_kernel(
             # q8k_vector_data_ptr = tl.advance(q8k_vector_block_ptr, offsets=(k_block, k_sub_block, 0)) 
             # q8k_vector_data = tl.load(q8k_vector_data_ptr)  # [QK_K_SUB_BLOCK_SIZE] @int8
 
-            q8k_bsums_data_ptr = tl.advance(q8k_bsums_block_ptr, offsets=(k_block, k_sub_block, 0, 0))
+            q8k_bsums_data_ptr = tl.advance(q8k_bsums_block_ptr, offsets=(0, k_block, k_sub_block, 0, 0))
             q8k_bsums_data_1 = (tl.load(q8k_bsums_data_ptr)).reshape((1,))  # [1] @int32 
-            q8k_bsums_data_ptr = tl.advance(q8k_bsums_block_ptr, offsets=(k_block, k_sub_block, 1, 0))
+            q8k_bsums_data_ptr = tl.advance(q8k_bsums_block_ptr, offsets=(0, k_block, k_sub_block, 1, 0))
             q8k_bsums_data_2 = (tl.load(q8k_bsums_data_ptr)).reshape((1,))  # [1] @int32 
 
-            # q4k_data_ptr = tl.advance(q4k_block_ptr, offsets=(0, k_block, k_sub_block, 0, 0))
+            # q4k_data_ptr = tl.advance(q4k_block_ptr, offsets=(0, 0, k_block, k_sub_block, 0, 0))
             # q4k_data = tl.load(q4k_data_ptr)  # [QK_4_K_SUB_BLOCK_DATA_SIZE, NR]@uint8 
 
             # q4k_data_k0_15 = q4k_data & 0x0F  # [16, NR]@uint8 
             # q4k_data_k16_31 = q4k_data >> 4  # [16, NR]@uint8 
 
-            q4k_scale_l_data_ptr = tl.advance(q4k_scale_l_block_ptr, offsets=(0, k_block, k_sub_block // 2, 0))
+            q4k_scale_l_data_ptr = tl.advance(q4k_scale_l_block_ptr, offsets=(0, 0, k_block, k_sub_block // 2, 0))
             q4k_scale_l_data = ((tl.load(q4k_scale_l_data_ptr)) >> (4 * (k_sub_block % 2))) & 0x0f  # [NR]@uint8 
 
-            q4k_scale_h_data_ptr = tl.advance(q4k_scale_h_block_ptr, offsets=(0, k_block, k_sub_block // 4, 0))
+            q4k_scale_h_data_ptr = tl.advance(q4k_scale_h_block_ptr, offsets=(0, 0, k_block, k_sub_block // 4, 0))
             q4k_scale_h_data = ((tl.load(q4k_scale_h_data_ptr)) >> (2 * (k_sub_block % 4))) & 0x03  # [NR]@uint8 
  
             q4k_scale = ((q4k_scale_l_data) | (q4k_scale_h_data << 4)).reshape((NR,))  # [NR]@uint8 
 
    
-            q4k_mins_l_data_ptr = tl.advance(q4k_mins_l_block_ptr, offsets=(0, k_block, k_sub_block // 2, 0))
+            q4k_mins_l_data_ptr = tl.advance(q4k_mins_l_block_ptr, offsets=(0, 0, k_block, k_sub_block // 2, 0))
             q4k_mins_l_data = ((tl.load(q4k_mins_l_data_ptr)) >> (4 * (k_sub_block % 2))) & 0x0f  # [NR]@uint8 
 
-            q4k_mins_h_data_ptr = tl.advance(q4k_mins_h_block_ptr, offsets=(0, k_block, k_sub_block // 4, 0))
+            q4k_mins_h_data_ptr = tl.advance(q4k_mins_h_block_ptr, offsets=(0, 0, k_block, k_sub_block // 4, 0))
             q4k_mins_h_data = ((tl.load(q4k_mins_h_data_ptr)) >> (2 * (k_sub_block % 4))) & 0x03 # [NR]@uint8 
 
             q4k_mins = ((q4k_mins_l_data) | (q4k_mins_h_data << 4)).reshape((NR,))  # [NR]@uint8 
@@ -195,9 +197,9 @@ def q4k_q8k_gemv_kernel(
             
             for k in range(QK_4_K_SUB_BLOCK_DATA_SIZE):
                 # 自动广播 
-                q8k_data_ptr = tl.advance(q8k_vector_block_ptr, offsets=(k_block, k_sub_block, k, 0))
+                q8k_data_ptr = tl.advance(q8k_vector_block_ptr, offsets=(0, k_block, k_sub_block, k, 0))
                 q8k_data = tl.load(q8k_data_ptr)  # [1] @int8
-                q4_k_data_ptr = tl.advance(q4k_block_ptr, offsets=(0, k_block, k_sub_block, k, 0))
+                q4_k_data_ptr = tl.advance(q4k_block_ptr, offsets=(0, 0, k_block, k_sub_block, k, 0))
                 q4_k_data = tl.load(q4_k_data_ptr)  # [NR] @uint8
 
                 q4k_data_k0_15 = q4_k_data & 0x0F  # [NR]@uint8
@@ -205,7 +207,7 @@ def q4k_q8k_gemv_kernel(
 
                 sum1 += (q8k_data.cast(tl.int16) * q4k_data_k0_15.cast(tl.int16)).reshape((NR,))
 
-                q8k_data_ptr = tl.advance(q8k_vector_block_ptr, offsets=(k_block, k_sub_block, k + QK_4_K_SUB_BLOCK_DATA_SIZE, 0))
+                q8k_data_ptr = tl.advance(q8k_vector_block_ptr, offsets=(0, k_block, k_sub_block, k + QK_4_K_SUB_BLOCK_DATA_SIZE, 0))
                 q8k_data = tl.load(q8k_data_ptr)  # [1] @int8
 
                 sum2 += (q8k_data.cast(tl.int16) * q4k_data_k16_31.cast(tl.int16)).reshape((NR,))
@@ -219,8 +221,9 @@ def q4k_q8k_gemv_kernel(
 
         result += d4d8 * sum.cast(tl.float32) - d8d4min * bsums_min
 
-    # tl.reshape(result, (1, 32))  # shape: [1, 32]
-    output_data_ptr = tl.advance(output_block_ptr, offsets=(0,))
+    # Reshape result to match output_block_ptr's block_shape (1, 1, NR)
+    result = result.reshape((1, 1, NR))
+    output_data_ptr = tl.advance(output_block_ptr, offsets=(0, 0, 0))
     tl.store(output_data_ptr, result)
 
 
@@ -232,13 +235,14 @@ if __name__ == "__main__":
     if os.path.dirname(__file__) not in sys.path:
         sys.path.append(os.path.dirname(__file__))
     try:
-        import gemv_driver
+        import bench_gemv_driver as gemv_driver
     except ImportError:
         gemv_driver = None
 
     parser = argparse.ArgumentParser(description='q4k_q8k GEMV 调试/带宽测试')
     parser.add_argument('--n', type=int, default=512, help='输出维度(32 的倍数)')
     parser.add_argument('--k', type=int, default=256*4, help='输入维度(256 的倍数)')
+    parser.add_argument('--batch', type=int, default=1, help='batch 维度')
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--target-gb', type=float, default=1.0)
@@ -250,6 +254,7 @@ if __name__ == "__main__":
         print('运行 q4k_q8k 简单功能测试...')
         N = args.n
         K = args.k
+        batch = args.batch
         assert N % 32 == 0 and K % 256 == 0
         NR = 32
         QK_K = 256
@@ -260,24 +265,24 @@ if __name__ == "__main__":
         QK_SUPER_BLOCK_NUMS = K // QK_K
         NR_SUB_BLOCKS_NUMS = N // NR
 
-        # q8k 数据准备 (输入激活向量)
-        q8k_vector = torch.randint(-128, 127, (QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_K_SUB_BLOCK_SIZE, 1), dtype=torch.int8)
-        q8k_d = torch.randn((QK_SUPER_BLOCK_NUMS,), dtype=torch.float32)
-        q8_bsums = torch.randint(-32768, 32767, (QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, 2, 1), dtype=torch.int16)
+        # q8k 数据准备 (输入激活向量) - 增加 batch 维度
+        q8k_vector = torch.randint(-128, 127, (batch, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_K_SUB_BLOCK_SIZE, 1), dtype=torch.int8)
+        q8k_d = torch.randn((batch, QK_SUPER_BLOCK_NUMS), dtype=torch.float32)
+        q8_bsums = torch.randint(-32768, 32767, (batch, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, 2, 1), dtype=torch.int16)
         
-        # q4k 数据准备 (权重矩阵)
-        q4k_matrix = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR), dtype=torch.uint8)
-        q4k_scale_l = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
-        q4k_scale_h = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
-        q4k_mins_l = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
-        q4k_mins_h = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
-        q4k_d = torch.randint(0, 65535, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
-        q4k_dmin = torch.randint(0, 65535, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
+        # q4k 数据准备 (权重矩阵) - 增加 batch 维度
+        q4k_matrix = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR), dtype=torch.uint8)
+        q4k_scale_l = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
+        q4k_scale_h = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
+        q4k_mins_l = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
+        q4k_mins_h = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
+        q4k_d = torch.randint(0, 65535, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
+        q4k_dmin = torch.randint(0, 65535, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
         
-        # 输出准备
-        output = torch.zeros((N//NR,NR), dtype=torch.float32)
+        # 输出准备 - 增加 batch 维度
+        output = torch.zeros((batch, N//NR, NR), dtype=torch.float32)
 
-        grid = (N//NR,)
+        grid = (batch, N//NR)
         q4k_q8k_gemv_kernel[grid](
             q8k_vector_ptr=q8k_vector,
             q8k_d_ptr=q8k_d,
@@ -292,6 +297,7 @@ if __name__ == "__main__":
             output_ptr=output,
             K=K,
             N=N,
+            batch=batch,
             num_threads=args.num_threads,
         )
         print('简单测试完成 输出范围:', float(output.min()), float(output.max()))

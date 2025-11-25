@@ -8,20 +8,22 @@
 5. 生成性能折线图 (x: shape, y: GFLOPS 或利用率)
 
 运行示例:
-# 测试所有 kernel
+# 测试所有 kernel（需要在 triton 环境中）
+conda activate triton
 TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --metric gflops --csv-out bench.csv --png-out bench.png
 
 # 仅测试指定的 kernel
 TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k --metric gflops
 
-# 测试特定形状和 kernel
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80 --shapes 48x512x32,96x512x32 --metric gflops
+# 测试特定形状和 kernel（使用 tt.do_bench 进行精确计时）
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80 --shapes 48x512x32,96x512x32 --warmup 3 --rounds 10 --metric gflops
 
 注意:
-  - 可用的 kernel: q40_q80, q4k_q8k, iq4k_q8k 
-  - q40_q80 约束: M%12==0, N%32==0, K%32==0 
-  - q4k_q8k/iq4k_q8k 约束: M%12==0, N%32==0, K%256==0 
-  - iq4k_q8k 当前使用随机伪量化数据，仅用于性能估算 
+  - 可用的 kernel: q40_q80, q4k_q8k, iq4k_q8k
+  - q40_q80 约束: M%12==0, N%32==0, K%32==0
+  - q4k_q8k/iq4k_q8k 约束: M%12==0, N%32==0, K%256==0
+  - 使用 triton.testing.do_bench 进行精确的性能测试
+  - warmup: 预热次数，rounds: 测试轮数
 """
 
 from __future__ import annotations
@@ -29,10 +31,12 @@ import argparse
 import os
 import sys
 import csv
-from typing import List, Tuple
+from typing import List, Tuple, Callable, Dict, Any
+import time
 
-import math
 import torch
+import triton
+import triton.testing as tt
 
 # 保证可以从当前目录导入内核脚本
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,20 +44,221 @@ CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
 
-import q4k_q8k_gemm  # noqa: E402
-import iq4k_q8k_gemm  # noqa: E402
-import q40_q80_gemm  # noqa: E402
+# 直接导入 kernel 函数
+from q4k_q8k_gemm import q4k_q8k_matmul_kernel  # noqa: E402
+from iq4k_q8k_gemm import iq4k_q8k_matmul_kernel  # noqa: E402
+from q40_q80_gemm import q40_q80_gemm_kernel  # noqa: E402
+
+try:
+    from dataclasses import dataclass
+except ImportError:
+    raise RuntimeError("需要 Python 3.7+ 支持 dataclasses")
 
 # -----------------------
-# 注册内核 - 统一格式
+# Kernel 规范定义
 # -----------------------
+
+@dataclass
+class KernelSpec:
+    name: str
+    kernel_fn: Callable
+    gen_dataset: Callable
+    estimate_ops: Callable
+    grid_fn: Callable
+    param_builder: Callable
+    constraints: Dict[str, int]
+    compute_dtype: str = 'int8'
+    dtype_width: int = 8
+
+# -----------------------
+# q40_q80 kernel 相关函数
+# -----------------------
+
+def q40_gen_dataset(M, K, N, seed=42):
+    """生成 q40_q80 测试数据"""
+    torch.manual_seed(seed)
+    MR, NR, QK_8_0 = 12, 32, 32
+    Mb, Nb, Kblocks = M // MR, N // NR, K // QK_8_0
+    QK_4_0_DATA_SIZE = QK_8_0 // 2
+    
+    q8_0_matrix = torch.randint(-128, 127, (Mb, Kblocks, 2, QK_8_0//2, MR), dtype=torch.int8)
+    q8_0_scale = torch.rand((Mb, Kblocks, MR), dtype=torch.float32)
+    q4_0_matrix = torch.randint(0, 255, (Nb, Kblocks, QK_4_0_DATA_SIZE, NR), dtype=torch.uint8)
+    q4_0_scale = torch.rand((Nb, Kblocks, NR), dtype=torch.float32)
+    output = torch.empty((M, N), dtype=torch.float32)
+    
+    return {
+        'q4_0_matrix': q4_0_matrix,
+        'q4_0_scale': q4_0_scale,
+        'q8_0_matrix': q8_0_matrix,
+        'q8_0_scale': q8_0_scale,
+        'output': output
+    }
+
+def q40_estimate_ops(M, N, K):
+    """估算 q40_q80 的操作数"""
+    return 2.0 * M * N * K
+
+def q40_grid(M, N, K, grid_repeat=1):
+    """返回 q40_q80 的 grid 配置"""
+    return (M // 12, N // 32, grid_repeat)
+
+def q40_param_builder(data, M, N, K, threads):
+    """构建 q40_q80 kernel 参数"""
+    return {
+        'q4_0_matrix_ptr': data['q4_0_matrix'],
+        'q4_0_scale_ptr': data['q4_0_scale'],
+        'q8_0_matrix_ptr': data['q8_0_matrix'],
+        'q8_0_scale_ptr': data['q8_0_scale'],
+        'output_ptr': data['output'],
+        'M': M, 'N': N, 'K': K,
+        'num_threads': threads
+    }
+
+# -----------------------
+# q4k_q8k kernel 相关函数
+# -----------------------
+
+def q4k_gen_dataset(M, K, N, seed=42):
+    """生成 q4k_q8k 测试数据"""
+    torch.manual_seed(seed)
+    MR, NR, QK_K = 12, 32, 256
+    Mb, Nb, Ksup = M // MR, N // NR, K // QK_K
+    NUM_SUB_BLOCKS, SUB_BLOCK_SIZE = 8, 32
+    QK_SB_K = 32
+    
+    # q8k 数据: (M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR)
+    q8k_matrix = torch.randint(-128, 127, (Mb, Ksup, NUM_SUB_BLOCKS, QK_SB_K, MR), dtype=torch.int8)
+    q8k_d = torch.rand((Mb, Ksup, MR), dtype=torch.float32)
+    q8k_bsums = torch.randint(-32768, 32767, (Mb, Ksup, NUM_SUB_BLOCKS, MR), dtype=torch.int16)
+    
+    # q4k 数据: (N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR)
+    q4k_matrix = torch.randint(0, 15, (Nb, Ksup, NUM_SUB_BLOCKS, QK_SB_K, NR), dtype=torch.int8)
+    # b_scales: int8, shape (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
+    q4k_scales = torch.randint(-32, 31, (Nb, Ksup, NUM_SUB_BLOCKS, NR), dtype=torch.int8)
+    # b_mins: int8, shape (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
+    q4k_mins = torch.randint(-128, 127, (Nb, Ksup, NUM_SUB_BLOCKS, NR), dtype=torch.int8)
+    # b_d, b_dmin: float16
+    q4k_d = torch.rand((Nb, Ksup, NR), dtype=torch.float16)
+    q4k_dmin = torch.rand((Nb, Ksup, NR), dtype=torch.float16)
+    
+    output = torch.empty((M, N), dtype=torch.float32)
+    
+    return {
+        'q8k_matrix': q8k_matrix, 'q8k_d': q8k_d, 'q8k_bsums': q8k_bsums,
+        'q4k_matrix': q4k_matrix, 'q4k_scale': q4k_scales, 'q4k_mins': q4k_mins,
+        'q4k_d': q4k_d, 'q4k_dmin': q4k_dmin, 'output': output
+    }
+
+def q4k_estimate_ops(M, N, K):
+    """估算 q4k_q8k 的操作数"""
+    return 2.0 * M * N * K
+
+def q4k_grid(M, N, K, grid_repeat=1):
+    """返回 q4k_q8k 的 grid 配置"""
+    return (M // 12, N // 32, grid_repeat)
+
+def q4k_param_builder(data, M, N, K, threads):
+    """构建 q4k_q8k kernel 参数"""
+    return {
+        'q8k_matrix_ptr': data['q8k_matrix'],
+        'q8k_bsums_ptr': data['q8k_bsums'],
+        'q8k_d_ptr': data['q8k_d'],
+        'q4k_matrix_ptr': data['q4k_matrix'],
+        'q4k_scale_ptr': data['q4k_scale'],
+        'q4k_mins_ptr': data['q4k_mins'],
+        'q4k_d_ptr': data['q4k_d'],
+        'q4k_dmin_ptr': data['q4k_dmin'],
+        'output_ptr': data['output'],
+        'M': M, 'N': N, 'K': K,
+        'num_threads': threads
+    }
+
+# -----------------------
+# iq4k_q8k kernel 相关函数
+# -----------------------
+
+def iq4k_gen_dataset(M, K, N, seed=42):
+    """生成 iq4k_q8k 测试数据"""
+    torch.manual_seed(seed)
+    MR, NR, QK_K = 12, 32, 256
+    Mb, Nb, Ksup = M // MR, N // NR, K // QK_K
+    NUM_SUB_BLOCKS, SUB_BLOCK_SIZE = 8, 32
+    QK_4_K_SUB_BLOCK_DATA_SIZE = 16
+    
+    q8k_matrix = torch.randint(-128, 127, (Mb, Ksup, NUM_SUB_BLOCKS, 2, SUB_BLOCK_SIZE//2, MR), dtype=torch.int8)
+    q8k_d = torch.rand((Mb, Ksup, MR), dtype=torch.float32)
+    iq4k_matrix = torch.randint(0, 255, (Nb, Ksup, NUM_SUB_BLOCKS, QK_K//2, NR), dtype=torch.uint8)
+    iq4k_d = torch.rand((Nb, Ksup, NR), dtype=torch.float32)
+    iq4k_extra = torch.randint(0, 0xFFFF, (Nb, Ksup, NR), dtype=torch.int32).to(torch.uint16)
+    iq4k_scale_l = torch.randint(0, 255, (Nb, Ksup, NUM_SUB_BLOCKS, NR), dtype=torch.uint8)
+    iq4k_scale_h = torch.randint(0, 255, (Nb, Ksup, (NUM_SUB_BLOCKS * 2)//4, NR), dtype=torch.uint8)
+    output = torch.empty((M, N), dtype=torch.float32)
+    
+    return {
+        'iq4k_matrix': iq4k_matrix, 'iq4k_d': iq4k_d, 'iq4k_extra': iq4k_extra,
+        'iq4k_scale_l': iq4k_scale_l, 'iq4k_scale_h': iq4k_scale_h,
+        'q8k_matrix': q8k_matrix, 'q8k_d': q8k_d, 'output': output
+    }
+
+def iq4k_estimate_ops(M, N, K):
+    """估算 iq4k_q8k 的操作数"""
+    return 2.0 * M * N * K
+
+def iq4k_grid(M, N, K, grid_repeat=1):
+    """返回 iq4k_q8k 的 grid 配置"""
+    return (M // 12, N // 32, grid_repeat)
+
+def iq4k_param_builder(data, M, N, K, threads):
+    """构建 iq4k_q8k kernel 参数"""
+    return {
+        'iq4k_matrix_ptr': data['iq4k_matrix'], 'iq4k_d_ptr': data['iq4k_d'],
+        'iq4k_extra_ptr': data['iq4k_extra'], 'iq4k_scale_l_ptr': data['iq4k_scale_l'],
+        'iq4k_scale_h_ptr': data['iq4k_scale_h'], 'q8k_matrix_ptr': data['q8k_matrix'],
+        'q8k_d_ptr': data['q8k_d'], 'output_ptr': data['output'],
+        'M': M, 'N': N, 'K': K, 'num_threads': threads
+    }
+
+# -----------------------
+# 注册内核
+# -----------------------
+
 KERNEL_SPECS = [
-    q4k_q8k_gemm.get_kernel_info(),
-    iq4k_q8k_gemm.get_kernel_info(),
-    q40_q80_gemm.get_kernel_info(),
-]
+    KernelSpec(
+        name='q40_q80',
+        kernel_fn=q40_q80_gemm_kernel,
+        gen_dataset=q40_gen_dataset,
+        estimate_ops=q40_estimate_ops,
+        grid_fn=q40_grid,
+        param_builder=q40_param_builder,
+        constraints={'M': 12, 'N': 32, 'K': 32},
+        compute_dtype='int8',
+        dtype_width=8
+    ),
+    KernelSpec(
+        name='q4k_q8k',
+        kernel_fn=q4k_q8k_matmul_kernel,
+        gen_dataset=q4k_gen_dataset,
+        estimate_ops=q4k_estimate_ops,
+        grid_fn=q4k_grid,
+        param_builder=q4k_param_builder,
+        constraints={'M': 12, 'N': 32, 'K': 256},
+        compute_dtype='int8',
+        dtype_width=8
+    ),
+    KernelSpec(
+        name='iq4k_q8k',
+        kernel_fn=iq4k_q8k_matmul_kernel,
+        gen_dataset=iq4k_gen_dataset,
+        estimate_ops=iq4k_estimate_ops,
+        grid_fn=iq4k_grid,
+        param_builder=iq4k_param_builder,
+        constraints={'M': 12, 'N': 32, 'K': 256},
+        compute_dtype='int8',
+        dtype_width=8
+    )
+]# -----------------------
 
-# -----------------------
 # 性能计算工具函数
 # -----------------------
 def calc_ops_per_second(ms: float, M: int, N: int, K: int, dtype_width: int) -> float:
@@ -140,24 +345,57 @@ def parse_shapes_arg(shapes_str: str) -> List[Tuple[int,int,int]]:
             print(f"忽略无效形状 '{item}': {e}")
     return res
 
-def run_bench(shapes: List[Tuple[int,int,int]], rep_ms: int, warmup_ms: int, num_threads: int, freq: float, vlen: int, selected_kernels: List[str] = None):
+def run_single_benchmark(spec: KernelSpec, M: int, K: int, N: int, 
+                         warmup: int, rounds: int, num_threads: int, grid_repeat: int = 1) -> Tuple[float, float, float]:
+    """运行单个形状的性能测试，返回 (median_ms, min_ms, max_ms)
+    
+    参数:
+        grid_repeat: grid 第三维度的重复次数，用于增加单次 kernel 调用的工作量
+                     实际测量的时间会除以 grid_repeat 来得到单次计算的时间
+    """
+    # 生成数据
+    data = spec.gen_dataset(M, K, N)
+    grid = spec.grid_fn(M, N, K, grid_repeat)
+    params = spec.param_builder(data, M, N, K, num_threads)
+    
+    # 定义执行函数
+    def run_kernel():
+        spec.kernel_fn[grid](**params)
+    
+    # 使用 tt.do_bench 进行性能测试
+    # do_bench 返回 [median, min, max] 对应 quantiles=[0.5, 0.2, 0.8]
+    median_ms, min_ms, max_ms = tt.do_bench(
+        run_kernel,
+        warmup=warmup,
+        rep=rounds,
+        quantiles=[0.5, 0.2, 0.8]
+    )
+    
+    # 将时间除以 grid_repeat 得到单次计算的实际时间
+    median_ms /= grid_repeat
+    min_ms /= grid_repeat
+    max_ms /= grid_repeat
+    
+    return median_ms, min_ms, max_ms
+
+def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int, 
+              num_threads: int, freq: float, vlen: int, selected_kernels: List[str] = None, grid_repeat: int = 1):
     all_results = []
     
     # 如果指定了 kernel 列表，过滤出匹配的 kernel
     kernels_to_test = KERNEL_SPECS
     if selected_kernels:
-        kernels_to_test = [spec for spec in KERNEL_SPECS if spec['name'] in selected_kernels]
+        kernels_to_test = [spec for spec in KERNEL_SPECS if spec.name in selected_kernels]
         if not kernels_to_test:
-            print(f"错误: 未找到匹配的 kernel。可用的 kernel: {[s['name'] for s in KERNEL_SPECS]}")
+            print(f"错误: 未找到匹配的 kernel。可用的 kernel: {[s.name for s in KERNEL_SPECS]}")
             return []
-        print(f"已选择 kernel: {[s['name'] for s in kernels_to_test]}")
+        print(f"已选择 kernel: {[s.name for s in kernels_to_test]}")
     
     for kernel_idx, spec in enumerate(kernels_to_test, 1):
-        bench_fn = spec['bench_fn']
-        name = spec['name']
-        dtype_width = spec.get('dtype_width', 8)
-        compute_dtype = spec.get('compute_dtype', 'int8')
-        constraints = spec.get('constraints', {})
+        name = spec.name
+        dtype_width = spec.dtype_width
+        compute_dtype = spec.compute_dtype
+        constraints = spec.constraints
         
         # 计算该 kernel 的理论峰值
         peak_gops = calc_peak_ops(freq, vlen, dtype_width)
@@ -182,12 +420,15 @@ def run_bench(shapes: List[Tuple[int,int,int]], rep_ms: int, warmup_ms: int, num
         print(f"  理论峰值: {peak_gops:.2f} GOPS@{compute_dtype}")
         print(f"  块约束: M%{constraints.get('M',1)}==0, N%{constraints.get('N',1)}==0, K%{constraints.get('K',1)}==0")
         print(f"  测试形状数量: {len(valid_shapes)}")
+        print(f"  Grid 重复次数: {grid_repeat}x (增加单次调用工作量)")
         print(f"{'='*80}")
         
         # 逐个测试并实时显示进度
         for idx, (M, K, N) in enumerate(valid_shapes, 1):
-            # 调用 kernel 的 bench 函数
-            median_ms, min_ms, max_ms = bench_fn(M, K, N, rep_ms=rep_ms, warmup_ms=warmup_ms, num_threads=num_threads)
+            # 调用 benchmark 函数
+            median_ms, min_ms, max_ms = run_single_benchmark(
+                spec, M, K, N, warmup, rounds, num_threads, grid_repeat
+            )
             
             # 计算性能指标
             gops_med = calc_ops_per_second(median_ms, M, N, K, dtype_width)
@@ -254,7 +495,7 @@ def plot_results(results, metric: str, path: str):
     
     # 为每个 kernel 分配标记形状
     markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x']
-    kernel_marker_map = {spec['name']: markers[i % len(markers)] for i, spec in enumerate(KERNEL_SPECS)}
+    kernel_marker_map = {spec.name: markers[i % len(markers)] for i, spec in enumerate(KERNEL_SPECS)}
     
     # 创建 x 轴位置和标签
     x_labels = [f"{K}×{N}" for (K, N) in k_n_pairs]
@@ -277,7 +518,7 @@ def plot_results(results, metric: str, path: str):
         x_pos = x_positions[x_idx]
         
         # 为每个 kernel 添加小的随机偏移，避免重叠
-        kernel_idx = [spec['name'] for spec in KERNEL_SPECS].index(r['kernel'])
+        kernel_idx = [spec.name for spec in KERNEL_SPECS].index(r['kernel'])
         offset = (kernel_idx - len(KERNEL_SPECS)/2) * 0.15
         
         marker = kernel_marker_map[r['kernel']]
@@ -290,7 +531,7 @@ def plot_results(results, metric: str, path: str):
     # 创建图例
     # Kernel 图例（不同形状）
     for spec in KERNEL_SPECS:
-        name = spec['name']
+        name = spec.name
         legend_elements_kernel.append(
             plt.Line2D([0], [0], marker=kernel_marker_map[name], color='gray', 
                       label=name, markersize=8, linestyle='None', 
@@ -381,9 +622,10 @@ def main():
     parser = argparse.ArgumentParser(description='统一 GEMM Kernel 性能测试驱动')
     parser.add_argument('--shapes', type=str, default='', help='逗号分隔形状列表，例如 48x512x32,96x512x32')
     parser.add_argument('--kernels', type=str, default='', help='逗号分隔的 kernel 名称列表，例如 q40_q80,q4k_q8k。留空表示测试所有 kernel')
-    parser.add_argument('--rep-ms', type=int, default=200, help='基准测试重复时长 (与 do_bench 语义类似)')
-    parser.add_argument('--warmup-ms', type=int, default=50, help='预热时长')
+    parser.add_argument('--warmup', type=int, default=3, help='预热次数')
+    parser.add_argument('--rounds', type=int, default=10, help='测试轮数')
     parser.add_argument('--num-threads', type=int, default=8, help='CPU线程数 (None 保持不变)')
+    parser.add_argument('--grid-repeat', type=int, default=10, help='Grid 第三维重复次数，增加单次 kernel 调用工作量以减少启动开销影响 (默认 10)')
     parser.add_argument('--freq', type=float, default=1.6, help='芯片频率 GHz (默认 1.6)')
     parser.add_argument('--vlen', type=int, default=256, help='向量宽度 bits (默认 256)')
     parser.add_argument('--csv-out', type=str, default='kernel_bench_results.csv', help='CSV 输出路径')
@@ -409,7 +651,7 @@ def main():
     selected_kernels = None
     if args.kernels:
         selected_kernels = [k.strip() for k in args.kernels.split(',') if k.strip()]
-        available_kernels = [spec['name'] for spec in KERNEL_SPECS]
+        available_kernels = [spec.name for spec in KERNEL_SPECS]
         print(f"可用的 kernel: {', '.join(available_kernels)}")
         print(f"选择的 kernel: {', '.join(selected_kernels)}")
 
@@ -417,14 +659,16 @@ def main():
     print(f"性能测试配置")
     print(f"{'='*80}")
     print(f"芯片参数: Freq={args.freq} GHz, VLEN={args.vlen} bits")
-    print(f"测试参数: rep={args.rep_ms}ms, warmup={args.warmup_ms}ms, threads={args.num_threads}")
+    print(f"测试参数: warmup={args.warmup}, rounds={args.rounds}, threads={args.num_threads}, grid_repeat={args.grid_repeat}")
     print(f"总形状数: {len(shapes)}")
     print(f"注册 Kernel 数: {len(KERNEL_SPECS)}")
     if selected_kernels:
         print(f"测试 Kernel 数: {len(selected_kernels)}")
     print(f"{'='*80}\n")
     
-    results = run_bench(shapes, rep_ms=args.rep_ms, warmup_ms=args.warmup_ms, num_threads=args.num_threads, freq=args.freq, vlen=args.vlen, selected_kernels=selected_kernels)
+    results = run_bench(shapes, warmup=args.warmup, rounds=args.rounds, 
+                        num_threads=args.num_threads, freq=args.freq, 
+                        vlen=args.vlen, selected_kernels=selected_kernels, grid_repeat=args.grid_repeat)
     if not results:
         print("\n无结果产生, 退出")
         return

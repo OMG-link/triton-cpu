@@ -156,51 +156,6 @@ def prepare_random_q40_q80_inputs(M, K, N):
     return q4_0_matrix, q4_0_scale, q8_0_matrix, q8_0_scale, output
 
 
-# -----------------------
-# 性能测试函数
-# -----------------------
-
-def bench_q40_q80_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
-    """对 q40_q80 kernel 进行单个形状性能测试, 返回时间"""
-    q4_0_matrix, q4_0_scale, q8_0_matrix, q8_0_scale, output = prepare_random_q40_q80_inputs(M, K, N)
-    grid = (M//MR, N//NR)
-    
-    def fn():
-        q40_q80_gemm_kernel[grid](
-            q4_0_matrix, q4_0_scale, q8_0_matrix, q8_0_scale, 
-            output, M, N, K, num_threads=num_threads
-        )
-    
-    # 简易基准测试
-    warmup_iter = max(5, warmup_ms // 10)
-    for _ in range(warmup_iter):
-        fn()
-    
-    iters = max(20, rep_ms // 10)
-    timings = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        fn()
-        t1 = time.perf_counter()
-        timings.append((t1 - t0) * 1000.0)
-    
-    timings.sort()
-    ms = timings[len(timings)//2]
-    min_ms = min(timings)
-    max_ms = max(timings)
-    return ms, min_ms, max_ms
-
-
-def get_kernel_info():
-    """返回 kernel 的基本信息，供 driver 调用"""
-    return {
-        'name': 'q40_q80',
-        'bench_fn': bench_q40_q80_case,
-        'constraints': {'M': 12, 'N': 32, 'K': 32},
-        'compute_dtype': 'int8',  # q4 x int8, 有效计算宽度 int4
-        'dtype_width': 8,  # bits
-    }
-
 
 # -----------------------
 # 调试测试接口

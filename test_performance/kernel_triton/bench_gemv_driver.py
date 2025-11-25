@@ -143,19 +143,19 @@ def _q40_constraint(N, K):
     assert K % 32 == 0, "q40_q80: K 必须是32的倍数"
 
 
-def _q40_gen_dataset(N, K, seed):
+def _q40_gen_dataset(N, K, seed, batch=1):
     torch.manual_seed(seed)
-    q8_0_vector = torch.randint(-128, 127, (K,), dtype=torch.int8)
-    q8_0_scale = torch.randint(1, 255, (K // 32,), dtype=torch.uint16)
-    q4_0_matrix = torch.randint(0, 255, (N * (K // 2),), dtype=torch.uint8)
-    q4_0_scale = torch.randint(1, 255, (N * (K // 32),), dtype=torch.uint16)
-    output = torch.zeros((N,), dtype=torch.float32)
+    q8_0_vector = torch.randint(-128, 127, (batch, K), dtype=torch.int8)
+    q8_0_scale = torch.randint(1, 255, (batch, K // 32), dtype=torch.uint16)
+    q4_0_matrix = torch.randint(0, 255, (batch, N * (K // 2)), dtype=torch.uint8)
+    q4_0_scale = torch.randint(1, 255, (batch, N * (K // 32)), dtype=torch.uint16)
+    output = torch.zeros((batch, N), dtype=torch.float32)
     return {
-        'q8_0_vector': q8_0_vector,
-        'q8_0_scale': q8_0_scale,
-        'q4_0_matrix': q4_0_matrix,
-        'q4_0_scale': q4_0_scale,
-        'output': output,
+        'q8_0_vector': q8_0_vector.contiguous(),
+        'q8_0_scale': q8_0_scale.contiguous(),
+        'q4_0_matrix': q4_0_matrix.contiguous(),
+        'q4_0_scale': q4_0_scale.contiguous(),
+        'output': output.contiguous(),
     }
 
 
@@ -166,11 +166,11 @@ def _q40_estimate_bytes(N, K):
     return weight_bytes + activation_bytes + output_bytes
 
 
-def _q40_grid(N, K):
-    return (N // 32,)
+def _q40_grid(N, K, batch=1):
+    return (batch, N // 32)
 
 
-def _q40_params(data, N, K, threads):
+def _q40_params(data, N, K, threads, batch=1):
     return dict(
         q8_0_vector_ptr=data['q8_0_vector'],
         q8_0_scale_ptr=data['q8_0_scale'],
@@ -179,6 +179,7 @@ def _q40_params(data, N, K, threads):
         output_ptr=data['output'],
         K=K,
         N=N,
+        batch=batch,
         num_threads=threads,
     )
 
@@ -189,7 +190,7 @@ def _q4k_constraint(N, K):
     assert K % 256 == 0, "q4k_q8k: K 必须是256的倍数"
 
 
-def _q4k_gen_dataset(N, K, seed):
+def _q4k_gen_dataset(N, K, seed, batch=1):
     torch.manual_seed(seed)
     NR = 32
     QK_K = 256
@@ -206,21 +207,21 @@ def _q4k_gen_dataset(N, K, seed):
     assert NR_SUB_BLOCKS_NUMS > 0, f"N={N} 太小，必须至少为 {NR}"
     assert QK_SUPER_BLOCK_NUMS > 0, f"K={K} 太小，必须至少为 {QK_K}" 
 
-    # q8k 数据准备 (输入激活向量) - 按照 kernel 中的 make_block_ptr shape 定义
-    q8k_vector = torch.randint(-128, 127, (QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_K_SUB_BLOCK_SIZE, 1), dtype=torch.int8)
-    q8k_d = torch.randn((QK_SUPER_BLOCK_NUMS,), dtype=torch.float32)
-    q8_bsums = torch.randint(-32768, 32767, (QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, 2, 1), dtype=torch.int16)
+    # q8k 数据准备 (输入激活向量) - 按照 kernel 中的 make_block_ptr shape 定义，增加 batch 维度
+    q8k_vector = torch.randint(-128, 127, (batch, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_K_SUB_BLOCK_SIZE, 1), dtype=torch.int8)
+    q8k_d = torch.randn((batch, QK_SUPER_BLOCK_NUMS), dtype=torch.float32)
+    q8_bsums = torch.randint(-32768, 32767, (batch, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, 2, 1), dtype=torch.int16)
 
-    # q4k 数据准备 (权重矩阵) - 按照 kernel 中的 make_block_ptr shape 定义
-    q4k_matrix = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR), dtype=torch.uint8)
-    q4k_scale_l = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
-    q4k_scale_h = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
-    q4k_mins_l = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
-    q4k_mins_h = torch.randint(0, 255, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
-    q4k_d = torch.randint(0, 65535, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
-    q4k_dmin = torch.randint(0, 65535, (NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
+    # q4k 数据准备 (权重矩阵) - 按照 kernel 中的 make_block_ptr shape 定义，增加 batch 维度
+    q4k_matrix = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR), dtype=torch.uint8)
+    q4k_scale_l = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
+    q4k_scale_h = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
+    q4k_mins_l = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
+    q4k_mins_h = torch.randint(0, 255, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NUM_SUB_BLOCKS // 4, NR), dtype=torch.uint8)
+    q4k_d = torch.randint(0, 65535, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
+    q4k_dmin = torch.randint(0, 65535, (batch, NR_SUB_BLOCKS_NUMS, QK_SUPER_BLOCK_NUMS, NR), dtype=torch.uint16)
     
-    output = torch.zeros((NR_SUB_BLOCKS_NUMS, NR), dtype=torch.float32)
+    output = torch.zeros((batch, NR_SUB_BLOCKS_NUMS, NR), dtype=torch.float32)
     
     # 确保所有张量内存连续
     tensors_dict = {
@@ -261,11 +262,11 @@ def _q4k_estimate_bytes(N, K):
     return size
 
 
-def _q4k_grid(N, K):
-    return (N // 32,)
+def _q4k_grid(N, K, batch=1):
+    return (batch, N // 32)
 
 
-def _q4k_params(data, N, K, threads):
+def _q4k_params(data, N, K, threads, batch=1):
     return dict(
         q8k_vector_ptr=data['q8k_vector'],
         q8k_d_ptr=data['q8k_d'],
@@ -280,6 +281,7 @@ def _q4k_params(data, N, K, threads):
         output_ptr=data['output'],
         K=K,
         N=N,
+        batch=batch,
         num_threads=threads,
     )
 
@@ -290,7 +292,7 @@ def _iq4k_constraint(N, K):
     assert K % 256 == 0, "iq4k_q8k: K 必须是256的倍数"
 
 
-def _iq4k_gen_dataset(N, K, seed):
+def _iq4k_gen_dataset(N, K, seed, batch=1):
     torch.manual_seed(seed)
     NR = 32
     QK_K = 256
@@ -298,17 +300,17 @@ def _iq4k_gen_dataset(N, K, seed):
     QK_K_SUB_BLOCK_SIZE = 32
     QK_4_K_SUB_BLOCK_DATA_SIZE = 16
 
-    # 修复: q8k_vector 应该是 4D 以匹配 kernel 中的 block_ptr
-    q8k_vector = torch.randint(-128, 127, (K // QK_K, QK_K // QK_K_SUB_BLOCK_SIZE, QK_K_SUB_BLOCK_SIZE, 1), dtype=torch.int8)
-    q8k_d = torch.randn((K // QK_K,), dtype=torch.float32)
+    # 修复: q8k_vector 应该是 4D 以匹配 kernel 中的 block_ptr，增加 batch 维度
+    q8k_vector = torch.randint(-128, 127, (batch, K // QK_K, QK_K // QK_K_SUB_BLOCK_SIZE, QK_K_SUB_BLOCK_SIZE, 1), dtype=torch.int8)
+    q8k_d = torch.randn((batch, K // QK_K), dtype=torch.float32)
     
-    iq4k_extra = torch.randint(0, 65535, (N // NR, K // QK_K, NR), dtype=torch.uint16)
-    iq4k_matrix = torch.randint(0, 255, (N // NR, K // QK_K, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR), dtype=torch.uint8)
-    iq4k_d = torch.randint(0, 65535, (N // NR, K // QK_K, NR), dtype=torch.uint16)
-    iq4k_scale_l = torch.randint(0, 255, (N // NR, K // QK_K, NUM_SUB_BLOCKS, NR), dtype=torch.uint8)
-    iq4k_scale_h = torch.randint(0, 255, (N // NR, K // QK_K, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
-    # 修复: output 应该是 2D 以匹配 kernel 中的 block_ptr
-    output = torch.zeros((N // NR, NR), dtype=torch.float32)
+    iq4k_extra = torch.randint(0, 65535, (batch, N // NR, K // QK_K, NR), dtype=torch.uint16)
+    iq4k_matrix = torch.randint(0, 255, (batch, N // NR, K // QK_K, NUM_SUB_BLOCKS, QK_4_K_SUB_BLOCK_DATA_SIZE, NR), dtype=torch.uint8)
+    iq4k_d = torch.randint(0, 65535, (batch, N // NR, K // QK_K, NR), dtype=torch.uint16)
+    iq4k_scale_l = torch.randint(0, 255, (batch, N // NR, K // QK_K, NUM_SUB_BLOCKS, NR), dtype=torch.uint8)
+    iq4k_scale_h = torch.randint(0, 255, (batch, N // NR, K // QK_K, NUM_SUB_BLOCKS // 2, NR), dtype=torch.uint8)
+    # 修复: output 应该是 2D 以匹配 kernel 中的 block_ptr，增加 batch 维度
+    output = torch.zeros((batch, N // NR, NR), dtype=torch.float32)
 
     return {
         'q8k_vector': q8k_vector.contiguous(),
@@ -339,11 +341,11 @@ def _iq4k_estimate_bytes(N, K):
     return size
 
 
-def _iq4k_grid(N, K):
-    return (N // 32,)
+def _iq4k_grid(N, K, batch=1):
+    return (batch, N // 32)
 
 
-def _iq4k_params(data, N, K, threads):
+def _iq4k_params(data, N, K, threads, batch=1):
     return dict(
         q8k_vector_ptr=data['q8k_vector'],
         q8k_d_ptr=data['q8k_d'],
@@ -355,6 +357,7 @@ def _iq4k_params(data, N, K, threads):
         output_ptr=data['output'],
         K=K,
         N=N,
+        batch=batch,
         num_threads=threads,
     )
 
@@ -398,65 +401,59 @@ def calculate_num_batches(spec: KernelSpec, N, K, target_gb):
     return max(batches, 1)
 
 
-def run_bandwidth(kernel_name: str, N: int, K: int, rounds: int = 5, warmup: int = 3, target_gb: float = 2.0, threads: int = 4, peak_bw: float = DEFAULT_PEAK_BW, verbose: bool = True):
+
+def run_bandwidth(kernel_name: str, N: int, K: int, rounds: int = 5, warmup: int = 3, target_gb: float = 2.0, threads: int = 4, peak_bw: float = DEFAULT_PEAK_BW, verbose: bool = True, batch: int = None):
     assert kernel_name in REGISTRY, f"未注册 kernel: {kernel_name}"
     spec = REGISTRY[kernel_name]
     spec.constraint(N, K)
 
-    num_batches = calculate_num_batches(spec, N, K, target_gb)
+    # 计算 batch 数量
+    if batch is None:
+        num_batches = calculate_num_batches(spec, N, K, target_gb)
+    else:
+        num_batches = batch
     if verbose:
         print(f"Kernel: {kernel_name}")
-        print(f"维度: [1 x {K}] x [{K} x {N}]  (N={N}, K={K})")
+        print(f"维度: [batch x {K}] x [{K} x {N}]  (N={N}, K={K}, batch={num_batches})")
         print(f"数据批次数: {num_batches} (目标 ~{target_gb} GB)")
 
-    # 初始化不同批次数据
-    batches = []
-    for b in range(num_batches):
-        data = spec.gen_dataset(N, K, seed=12345 + b)
-        batches.append(data)
-
+    # 生成带 batch 维度的数据
+    data = spec.gen_dataset(N, K, seed=12345, batch=num_batches)
     total_bytes_all = spec.estimate_bytes(N, K) * num_batches
     total_mb = total_bytes_all / (1024 ** 2)
     total_gb = total_mb / 1024
     if verbose:
         print(f"总数据量估算: {total_mb:.2f} MB ({total_gb:.2f} GB)\n")
 
-    # 准备 kernel 执行函数
-    grid = spec.grid_fn(N, K)
-    
-    def run_all_batches():
-        for batch_idx, data in enumerate(batches):
-            try:
-                params = spec.param_builder(data, N, K, threads)
-                spec.fn[grid](**params)
-            except Exception as e:
-                print(f"\n[ERROR] Batch {batch_idx}/{num_batches} 执行失败:")
-                print(f"  形状: N={N}, K={K}")
-                print(f"  异常: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
-    
+    # grid 增加 batch 维度
+    grid = spec.grid_fn(N, K, batch=num_batches)
+
+    def run_kernel():
+        try:
+            params = spec.param_builder(data, N, K, threads, batch=num_batches)
+            spec.fn[grid](**params)
+        except Exception as e:
+            print(f"\n[ERROR] 执行失败:")
+            print(f"  形状: N={N}, K={K}, batch={num_batches}")
+            print(f"  异常: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
     if verbose:
         print("开始性能测试 (使用 triton.testing.do_bench)...")
-    
-    # 使用 triton.testing.do_bench 进行性能测试
-    # do_bench 返回 [median, min, max] 对应 quantiles=[0.5, 0.2, 0.8]
+
     median_ms, min_ms, max_ms = tt.do_bench(
-        run_all_batches,
+        run_kernel,
         warmup=warmup,
         rep=rounds,
         quantiles=[0.5, 0.2, 0.8]
     )
-    
-    # 计算带宽 (GB/s)
-    bw_median = total_gb / (median_ms / 1000.0)
-    bw_min = total_gb / (max_ms / 1000.0)  # 最大时间对应最小带宽
-    bw_max = total_gb / (min_ms / 1000.0)  # 最小时间对应最大带宽
-    
-    # 计算标准差（近似估计）
-    std_bw = (bw_max - bw_min) / 4.0  # 基于 min/max 的粗略估计
 
+    bw_median = total_gb / (median_ms / 1000.0)
+    bw_min = total_gb / (max_ms / 1000.0)
+    bw_max = total_gb / (min_ms / 1000.0)
+    std_bw = (bw_max - bw_min) / 4.0
     util = bw_median / peak_bw * 100
 
     if verbose:
@@ -468,24 +465,26 @@ def run_bandwidth(kernel_name: str, N: int, K: int, rounds: int = 5, warmup: int
         print(f"中位数延迟: {median_ms:.3f} ms")
         print(f"延迟范围: [{min_ms:.3f}, {max_ms:.3f}] ms")
         print(f"理论峰值带宽: {peak_bw:.2f} GB/s | 利用率: {util:.2f}%")
+        print(f"batch: {num_batches}")
         print("="*60)
 
     return {
         'kernel_name': kernel_name,
         'N': N,
         'K': K,
-        'avg_bandwidth': bw_median,  # 使用中位数作为代表值
+        'avg_bandwidth': bw_median,
         'std_bandwidth': std_bw,
         'min_bandwidth': bw_min,
         'max_bandwidth': bw_max,
         'avg_latency': median_ms,
         'bandwidth_util': util,
-        'bandwidths': [bw_median],  # 兼容旧接口
-        'latencies': [median_ms],   # 兼容旧接口
+        'bandwidths': [bw_median],
+        'latencies': [median_ms],
         'rounds': rounds,
         'target_gb': target_gb,
         'num_batches': num_batches,
         'peak_bw': peak_bw,
+        'batch': num_batches,
     }
 
 

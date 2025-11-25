@@ -22,23 +22,32 @@ def q40_q80_gemv_kernel(
     output_ptr,       # float32 
     K,
     N,
+    batch: tl.constexpr = 1,
 ):
-    start_n = tl.program_id(axis=0)
+    pid_b = tl.program_id(axis=0)  # batch id
+    start_n = tl.program_id(axis=1)  # N id
 
     QK_8_0 = tl.constexpr(32)
     QK_8_0_DATA_SIZE = tl.constexpr(QK_8_0 // 2)  # 每个 uint8 包含两个 int4
     NR = tl.constexpr(32)
     N_block = tl.constexpr(K // QK_8_0)
 
-    q4_0_matrix_offset = start_n * N_block * (QK_8_0_DATA_SIZE * NR)
-    q4_0_scales_offset = start_n * N_block * NR
+    # 增加 batch 维度偏移
+    batch_q8_offset = pid_b * K
+    batch_q8_scale_offset = pid_b * (K // QK_8_0)
+    batch_q4_matrix_offset = pid_b * N * (K // 2)
+    batch_q4_scale_offset = pid_b * N * (K // 32)
+    batch_output_offset = pid_b * N
+
+    q4_0_matrix_offset = batch_q4_matrix_offset + start_n * N_block * (QK_8_0_DATA_SIZE * NR)
+    q4_0_scales_offset = batch_q4_scale_offset + start_n * N_block * NR
     # float result_row[N]
     sumK_32_scale_f32 = tl.zeros((32,), dtype=tl.float32)
-    result_row_offset = start_n * NR
+    result_row_offset = batch_output_offset + start_n * NR
     
     for n_block in range(N_block):
         q4_0_block_offset = q4_0_matrix_offset + n_block * (QK_8_0_DATA_SIZE * NR)
-        q8_0_block_offset = n_block * QK_8_0
+        q8_0_block_offset = batch_q8_offset + n_block * QK_8_0
 
         sumK_32 = tl.zeros((32,), dtype=tl.int32)  # k 维度 32 次累加 
         sumK_16 = tl.zeros((32,), dtype=tl.int16) # k 维度 16 次累加 
@@ -72,7 +81,7 @@ def q40_q80_gemv_kernel(
         # dequant
         # weight_scale_data
         q4_0_scales_block_offset = q4_0_scales_offset + n_block * NR
-        q8_0_scale_offset = n_block
+        q8_0_scale_offset = batch_q8_scale_offset + n_block
 
         q4_scale_data = tl.load(q4_0_scale_ptr + q4_0_scales_block_offset + tl.arange(0, 32))
         q8_scale_data = tl.load(q8_0_scale_ptr + q8_0_scale_offset)
@@ -90,7 +99,7 @@ def q40_q80_gemv_kernel(
 if os.path.dirname(__file__) not in sys.path:
     sys.path.append(os.path.dirname(__file__))
 try:
-    import gemv_driver  # 提供 run_bandwidth
+    import bench_gemv_driver as gemv_driver  # 提供 run_bandwidth
 except ImportError:
     gemv_driver = None  # 允许单独脚本存在
 
@@ -101,6 +110,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='GEMV Q4_0 x Q8_0 带宽性能测试')
     parser.add_argument('--n', type=int, default=512, help='输出维度 (必须是32的倍数)')
     parser.add_argument('--k', type=int, default=1024, help='输入维度 (必须是32的倍数)')
+    parser.add_argument('--batch', type=int, default=1, help='batch 维度')
     parser.add_argument('--rounds', type=int, default=5, help='测试轮数')
     parser.add_argument('--warmup', type=int, default=3, help='预热轮数')
     parser.add_argument('--target-gb', type=float, default=2.0, help='目标数据总量 (GB)')
@@ -114,15 +124,16 @@ if __name__ == "__main__":
         print("运行简单功能测试...")
         K = 1024
         N = 512
+        batch = args.batch
         NR = 32
 
-        q8_0_vector = torch.randint(-128, 127, (K,), dtype=torch.int8)
-        q8_0_scale = torch.randint(1, 255, (K // 32,), dtype=torch.uint16)
-        q4_0_matrix = torch.randint(0, 255, (N * (K // 2),), dtype=torch.uint8)
-        q4_0_scale = torch.randint(1, 255, (N * (K // 32),), dtype=torch.uint16)
-        output = torch.zeros((N,), dtype=torch.float32)
+        q8_0_vector = torch.randint(-128, 127, (batch, K), dtype=torch.int8)
+        q8_0_scale = torch.randint(1, 255, (batch, K // 32), dtype=torch.uint16)
+        q4_0_matrix = torch.randint(0, 255, (batch, N * (K // 2)), dtype=torch.uint8)
+        q4_0_scale = torch.randint(1, 255, (batch, N * (K // 32)), dtype=torch.uint16)
+        output = torch.zeros((batch, N), dtype=torch.float32)
 
-        grid = (N // NR, )
+        grid = (batch, N // NR)
         q40_q80_gemv_kernel[grid](
             q8_0_vector_ptr=q8_0_vector,
             q8_0_scale_ptr=q8_0_scale,
@@ -131,6 +142,8 @@ if __name__ == "__main__":
             output_ptr=output,
             K=K,
             N=N,
+            batch=batch,
+            num_threads=args.num_threads,
         )
         print("简单测试完成")
         print(f"输出形状: {output.shape}")
