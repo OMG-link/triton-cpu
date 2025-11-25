@@ -5,7 +5,7 @@ import csv
 
 from kernels.inner import InnerGEMM
 from kernels.outer import OuterGEMM
-
+from kernels.q4k_q8k_gemm import Q4K_Q8K_GEMM
 
 # ------------------------------
 # 正确性测试

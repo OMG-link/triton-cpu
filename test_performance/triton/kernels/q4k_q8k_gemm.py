@@ -1,30 +1,23 @@
-"""
-GGUF q4k x q8k
-=====================
-In this test, matmul on CPU with k-quantize is tested.
-
-Transpose is done by 'tl.transpose'(A.T) operand.
-
-"""
-
-import argparse
-import math
-import os
+# triton_q4k_gemm.py
+import time
 import torch
-
 import triton
 import triton.language as tl
-import triton.testing as tt
 
-MR = tl.constexpr(12)
-NR = tl.constexpr(32) # 如何获取CPU的VLEN作为NR?
+from gemm_base import GEMMKernelBase
 
+# -------------------------
+# Module-level Triton constants
+# -------------------------
 QK_K = tl.constexpr(256)
 QK_SB_K = tl.constexpr(32)
 
 def cdiv(a, b):
     return (a + b - 1) // b
 
+# -------------------------
+# Quantize functions
+# -------------------------
 def quantize_q8_K(a: torch.Tensor):
     """
     a: torch.Tensor float32 shape (M, K)
@@ -38,7 +31,7 @@ def quantize_q8_K(a: torch.Tensor):
     device = a.device
     Mb = cdiv(M, MR)
     Ksup = cdiv(K, QK_K)
-    Ksub = QK_K // QK_SB_K  # typically 8
+    Ksub = QK_K // QK_SB_K
 
     # pad rows & cols to block multiples
     M_p = Mb * MR
@@ -47,7 +40,7 @@ def quantize_q8_K(a: torch.Tensor):
     a_pad[:M, :K] = a
 
     # allocate outputs on CPU with layout matching kernel's make_block_ptr expectation:
-    # shape: (Mb, Ksup, Ksub, MR, QK_SB_K)
+    # shape: (Mb, Ksup, Ksub, QK_SB_K, MR)
     a_q = torch.zeros((Mb, Ksup, Ksub, QK_SB_K, MR), dtype=torch.int8, device='cpu')
     a_bsums = torch.zeros((Mb, Ksup, Ksub, MR), dtype=torch.int16, device='cpu')
     a_d = torch.zeros((Mb, Ksup, MR), dtype=torch.float32, device='cpu')
@@ -81,13 +74,14 @@ def quantize_q8_K(a: torch.Tensor):
 
     # bring outputs to CPU (kernel's block_ptr expects host tensors)
     return a_q, a_bsums, a_d
+
 def quantize_q4_K(b: torch.Tensor):
     """
     非对称 q4_K 实现（解码为:  orig ≈ d * (s_q * q) - dmin * m_q）
     b: (K, N)
     returns: b_q (Nb, Ksup, Ksub, QK_SB_K, NR) int8 [0..15]
              b_scales (Nb, Ksup, Ksub, NR)   int8  (signed, -32..31)
-             b_mins (Nb, Ksup, Ksub, NR)     int16 (signed, we store -m_q)
+             b_mins (Nb, Ksup, Ksub, NR)     int16 (store -m_q)
              b_d (Nb, Ksup, NR)              float16
              b_dmin (Nb, Ksup, NR)           float16
     """
@@ -106,7 +100,7 @@ def quantize_q4_K(b: torch.Tensor):
     # outputs
     b_q = torch.zeros((Nb, Ksup, Ksub, QK_SB_K, NR), dtype=torch.int8, device='cpu')   # 0..15
     b_scales = torch.zeros((Nb, Ksup, Ksub, NR), dtype=torch.int8, device='cpu')      # signed 6-bit stored in int8
-    b_mins = torch.zeros((Nb, Ksup, ksub := Ksub, NR), dtype=torch.int16, device='cpu')  # store -m_q (int16)
+    b_mins = torch.zeros((Nb, Ksup, Ksub, NR), dtype=torch.int16, device='cpu')  # store -m_q (int16)
     b_d = torch.zeros((Nb, Ksup, NR), dtype=torch.float16, device='cpu')
     b_dmin = torch.zeros((Nb, Ksup, NR), dtype=torch.float16, device='cpu')
 
@@ -145,14 +139,11 @@ def quantize_q4_K(b: torch.Tensor):
             b_dmin[nb, ksup, :] = dmin.to(torch.float16)
 
             # compute per-subblock integer s_q and m_q
-            # s_q = round(s_real / d)  (should be non-negative, clamp to [-32,31])
-            # m_q = round(m_real / dmin)
             for s in range(Ksub):
                 s_real = s_reals[s, :]   # (NR,)
                 m_real = m_reals[s, :]   # (NR,)
 
                 # s_q (signed 6-bit). Use division by d chosen above.
-                # if s_real is zero, s_q becomes 0.
                 s_q = torch.round(torch.where(d > 0, s_real / d, torch.zeros_like(s_real))).to(torch.int32)
                 s_q = torch.clamp(s_q, -32, 31).to(torch.int8)
 
@@ -181,9 +172,9 @@ def quantize_q4_K(b: torch.Tensor):
 
     return b_q, b_scales, b_mins, b_d, b_dmin
 
-# -----------------------
+# -------------------------
 # Triton kernel
-# -----------------------
+# -------------------------
 @triton.jit
 def matmul_kernel(
     a_q_ptr_raw,              # int8     A        (M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR)
@@ -191,7 +182,7 @@ def matmul_kernel(
     a_d_ptr_raw,              # float32  a_d      (M//MR, K//QK_K, MR)
     b_q_ptr_raw,              # int8     Bpacked  (N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR)
     b_scales_ptr_raw,         # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
-    b_mins_ptr_raw,           # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
+    b_mins_ptr_raw,           # int16    b_mins   (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
     b_d_ptr_raw,              # float16  b_d      (N//NR, K//QK_K, NR)
     b_dmin_ptr_raw,           # float16  b_dmin   (N//NR, K//QK_K, NR)
     c_ptr_raw,                # float32  C        (M, N)
@@ -209,7 +200,7 @@ def matmul_kernel(
         strides=(K*MR, QK_K*MR, QK_SB_K*MR, MR, 1),
         offsets=(i_mr//MR, 0, 0, 0, 0),
         block_shape=(1, 1, 1, QK_SB_K, MR),
-        order=(4, 3, 2, 1, 0), # CPU上这个参数并不重要，这是为warp并行而设计的参数
+        order=(4, 3, 2, 1, 0),
     )
     a_bsums_ptr_start = tl.make_block_ptr(
         base=a_bsums_ptr_raw,
@@ -292,21 +283,21 @@ def matmul_kernel(
             b_scales = tl.load(b_scales_ptr).reshape((1, NR))
             sum_block += tl.cast(suml, tl.int32) * tl.cast(b_scales, tl.int32)
             # i_subb++
-            a_q_ptr = tl.advance(a_q_ptr, (0, 0, 1, 0, 0)) 
-            b_q_ptr = tl.advance(b_q_ptr, (0, 0, 1, 0, 0)) 
+            a_q_ptr = tl.advance(a_q_ptr, (0, 0, 1, 0, 0))
+            b_q_ptr = tl.advance(b_q_ptr, (0, 0, 1, 0, 0))
             b_scales_ptr = tl.advance(b_scales_ptr, (0, 0, 1, 0))
         a_d = tl.load(a_d_ptr).reshape((1, MR))
         b_d = tl.cast(tl.load(b_d_ptr).reshape((1, NR)), tl.float32)
         sum_row += tl.cast(sum_block, tl.float32) * tl.dot(a_d.T, b_d, out_dtype=tl.float32)
         # i_supb++
-        a_d_ptr = tl.advance(a_d_ptr, (0, 1, 0)) 
+        a_d_ptr = tl.advance(a_d_ptr, (0, 1, 0))
         b_d_ptr = tl.advance(b_d_ptr, (0, 1, 0))
     # sum_min_row
     sum_min_row = tl.zeros((MR, NR), dtype=tl.float32)
     a_bsums_ptr = a_bsums_ptr_start
-    b_mins_ptr  = b_mins_ptr_start 
-    a_d_ptr     = a_d_ptr_start    
-    b_dmin_ptr  = b_dmin_ptr_start  
+    b_mins_ptr  = b_mins_ptr_start
+    a_d_ptr     = a_d_ptr_start
+    b_dmin_ptr  = b_dmin_ptr_start
     for i_supb in range(0, tl.cdiv(K, QK_K)):
         a_bsums = tl.load(a_bsums_ptr).reshape((QK_K//QK_SB_K, MR))
         b_mins = tl.cast(tl.load(b_mins_ptr).reshape((QK_K//QK_SB_K, NR)), tl.int16)
@@ -316,146 +307,92 @@ def matmul_kernel(
         # i_supb++
         a_bsums_ptr = tl.advance(a_bsums_ptr, (0, 1, 0, 0))
         b_mins_ptr = tl.advance(b_mins_ptr, (0, 1, 0, 0))
-        a_d_ptr = tl.advance(a_d_ptr, (0, 1, 0)) 
+        a_d_ptr = tl.advance(a_d_ptr, (0, 1, 0))
         b_dmin_ptr = tl.advance(b_dmin_ptr, (0, 1, 0))
     # compute final result
     c_ptr = c_ptr_start
-    tl.store(c_ptr, sum_row-sum_min_row)
-    
-def matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, M, N, K, num_threads=0):
-    # a_q_ptr      = torch.zeros((M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR), device='cpu', dtype=torch.int8   )
-    # a_bsums_ptr  = torch.zeros((M//MR, K//QK_K, QK_K//QK_SB_K, MR         ), device='cpu', dtype=torch.int16  )
-    # a_d_ptr      = torch.zeros((M//MR, K//QK_K, MR                        ), device='cpu', dtype=torch.float32)
-    # b_q_ptr      = torch.zeros((N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR), device='cpu', dtype=torch.int8   )
-    # b_scales_ptr = torch.zeros((N//NR, K//QK_K, QK_K//QK_SB_K, NR         ), device='cpu', dtype=torch.int8   )
-    # b_mins_ptr   = torch.zeros((N//NR, K//QK_K, QK_K//QK_SB_K, NR         ), device='cpu', dtype=torch.int8   )
-    # b_d_ptr      = torch.zeros((N//NR, K//QK_K, NR                        ), device='cpu', dtype=torch.float16)
-    # b_dmin_ptr   = torch.zeros((N//NR, K//QK_K, NR                        ), device='cpu', dtype=torch.float16)
-    a_q_ptr, a_bsums_ptr, a_d_ptr = quantize_q8_K(a)
-    b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr = quantize_q4_K(b)
-    c_ptr = c
-    matmul_kernel[(cdiv(M, MR), cdiv(N, NR))](
-        a_q_ptr, a_bsums_ptr, a_d_ptr,  #
-        b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr, #
-        c_ptr, #
-        M, N, K,  #
-    )
-    return c_ptr
+    tl.store(c_ptr, sum_row - sum_min_row)
 
-# %%
-# Unit Test
-# ---------
-#
-# We can test our custom matrix multiplication operation against a native torch implementation.
-def test_correctness(M, K, N):
-    in_dtype = torch.float32
-    out_dtype = torch.float32
-
-    torch.manual_seed(0)
-
-    triton.runtime.driver.set_active_to_cpu()
-
-    # gen data
-    a = torch.randint(0, 128, (M, K), device='cpu').to(in_dtype)
-    b = torch.randint(0, 16, (K, N), device='cpu').to(in_dtype)
-    c = torch.empty((M, N), device='cpu', dtype=out_dtype)
-
-    # do matmul
-    triton_output = matmul(a=a, b=b, c=c, M=M, K=K, N=N)
-    torch_output = torch.matmul(a.to(out_dtype), b.to(out_dtype))
-
-    # diff output
-    if torch.allclose(triton_output, torch_output, rtol=0.02, atol=1e-5):
-        print("✅ TritonCPU and TorchCPU match")
-    else:
-        diff = triton_output - torch_output
-        print("❌ TritonCPU and TorchCPU differ, the maximum difference is "
-            f'{torch.max(torch.abs(diff/torch_output)) * 100}' "%")
-        return False
-    
-    return True
-
-def gflo_ps_from_ms(ms, M, N, K):
-    # total flops assumed 2*M*N*K
-    return 2.0 * M * N * K * 1e-9 / (ms * 1e-3)
-
-def bench_kernel_only_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
+# -------------------------
+# Q4K_Q8K_GEMM
+# -------------------------
+class Q4K_Q8K_GEMM(GEMMKernelBase):
     """
-    Pre-quantize inputs once, then benchmark only the Triton kernel invocation:
-      matmul_kernel[(cdiv(M,MR), cdiv(N,NR))](a_q, a_bsums, a_d, b_q, b_scales, b_mins, b_d, b_dmin, c, M, N, K)
-    Excludes quantize time.
+    Triton + q4/q8 packing CPU GEMM kernel wrapper.
     """
-    device = 'cpu'
+    def __init__(self, MR:int, NR:int):
+        self.MR = MR
+        self.NR = NR
 
-    # create random original tensors (only to create quantized inputs)
-    torch.manual_seed(0)
-    a = torch.randn((M, K), device=device, dtype=torch.float32)
-    b = torch.randn((K, N), device=device, dtype=torch.float32)
+    def get_name(self) -> str:
+        return f"TritonQ4K_MR{self.MR}_NR{self.NR}"
 
-    # Precompute quantized representations (these are CPU tensors and are reused)
-    a_q_ptr, a_bsums_ptr, a_d_ptr = quantize_q8_K(a)
-    b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr = quantize_q4_K(b)
+    def prepare(self, m: int, k: int, n: int, should_gen_data: bool = True) -> dict:
+        """
+        Prepare data and pre-quantize. Returns params dict.
+        params includes:
+          - a (float32 cpu), b (float32 cpu), c (float32 cpu)
+          - a_q_ptr, a_bsums_ptr, a_d_ptr
+          - b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr
+          - M,N,K
+        """
+        global MR, NR
+        MR = tl.constexpr(self.MR)
+        NR = tl.constexpr(self.NR)
 
-    # pre-allocate output
-    c = torch.empty((M, N), device='cpu', dtype=torch.float32)
+        # Data are always generated for now.
+        torch.manual_seed(0)
+        a = torch.randint(0, 128, (m, k), device='cpu', dtype=torch.float32)
+        b = torch.randint(0, 16, (k, n), device='cpu', dtype=torch.float32)
+        a_q_ptr, a_bsums_ptr, a_d_ptr = quantize_q8_K(a)
+        b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr = quantize_q4_K(b)
 
-    # grid size (same pattern your matmul used)
-    grid = (cdiv(M, MR), cdiv(N, NR))
+        c = torch.empty((m, n), device='cpu', dtype=torch.float32)
 
-    # function to benchmark: only the kernel launch
-    def fn():
+        params = {
+            'a': a, 'b': b, 'c': c,
+            'a_q_ptr': a_q_ptr, 'a_bsums_ptr': a_bsums_ptr, 'a_d_ptr': a_d_ptr,
+            'b_q_ptr': b_q_ptr, 'b_scales_ptr': b_scales_ptr, 'b_mins_ptr': b_mins_ptr,
+            'b_d_ptr': b_d_ptr, 'b_dmin_ptr': b_dmin_ptr,
+            'M': m, 'N': n, 'K': k,
+        }
+        return params
+
+    def run(self, params: dict, repeats: int = 1) -> float:
+        """
+        Execute kernel repeats times and return average time in seconds.
+        """
+        global MR, NR
+        MR = tl.constexpr(self.MR)
+        NR = tl.constexpr(self.NR)
+
+        m = params['M']
+        n = params['N']
+        k = params['K']
+
+        grid = (cdiv(m, MR), cdiv(n, NR), repeats)
+
+        t0 = time.perf_counter()
         matmul_kernel[grid](
-            a_q_ptr, a_bsums_ptr, a_d_ptr,
-            b_q_ptr, b_scales_ptr, b_mins_ptr, b_d_ptr, b_dmin_ptr,
-            c, M, N, K, num_threads=num_threads
+            params['a_q_ptr'], params['a_bsums_ptr'], params['a_d_ptr'],
+            params['b_q_ptr'], params['b_scales_ptr'], params['b_mins_ptr'], params['b_d_ptr'], params['b_dmin_ptr'],
+            params['c'],
+            m, n, k
         )
+        t1 = time.perf_counter()
 
-    # run benchmark (request mean mode with quantiles returned)
-    # do_bench signature: (fn, warmup=25, rep=100, quantiles=None, return_mode='mean')
-    ms, min_ms, max_ms = tt.do_bench(fn, warmup=warmup_ms, rep=rep_ms, quantiles=[0.5, 0.2, 0.8])
+        return (t1 - t0) / repeats
 
-    gflops = gflo_ps_from_ms(ms, M, N, K)
-    gflops_max = gflo_ps_from_ms(min_ms, M, N, K)
-    gflops_min = gflo_ps_from_ms(max_ms, M, N, K)
-    print(f"[KERNEL BENCH] M={M} K={K} N={N} | median_ms={ms:.3f} min_ms={min_ms:.3f} max_ms={max_ms:.3f} | "
-          f"GFLOPS(med)={gflops:.2f} GFLOPS(min)={gflops_min:.2f} GFLOPS(max)={gflops_max:.2f}")
-    return ms, min_ms, max_ms
+    def verify(self, params: dict, rtol: float = 1e-3, atol: float = 1e-5) -> bool:
+        triton_output = params['c']
+        torch_output = torch.matmul(params['a'].to(torch.float32), params['b'].to(torch.float32))
+        print(triton_output)
+        print(torch_output)
+        ok = torch.allclose(triton_output, torch_output, rtol=0.02, atol=1e-5)
+        return bool(ok)
 
-def run_kernel_bench_cases(cases=None, rep_ms=200, warmup_ms=50, num_threads=None):
-    if cases is None:
-        cases = [
-            (12, 256, 32),
-            (480, 1536, 1536),
-            (1800, 2048, 2048),
-        ]
-    print("Running kernel-only benchmarks...")
-    for M, K, N in cases:
-        try:
-            bench_kernel_only_case(M, K, N, rep_ms=rep_ms, warmup_ms=warmup_ms, num_threads=num_threads)
-        except Exception as e:
-            print(f"[ERROR] Kernel bench failed for M={M},K={K},N={N}: {e}")
-
-# Integrate with argparse: add a --bench-kernel flag
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run correctness tests or kernel-only benchmarks.")
-    parser.add_argument('--bench-kernel', action='store_true', help='Run kernel-only benchmarks (pre-quantize once, then measure kernel)')
-    parser.add_argument('--rep-ms', type=int, default=200, help='do_bench rep time in ms')
-    parser.add_argument('--warmup-ms', type=int, default=50, help='do_bench warmup time in ms')
-    parser.add_argument('--num-threads', type=int, default=None, help='torch.set_num_threads() (None = unchanged)')
-    args, unknown = parser.parse_known_args()
-
-    # run the original correctness tests (keeps previous behavior)
-    tests = (
-        (48, 512, 32),
-    )
-    all_ok = True
-    for (M, K, N) in tests:
-        if not test_correctness(M=M, K=K, N=N):
-            print(f"Test failed: M={M}, K={K}, N={N}")
-            all_ok = False
-
-    if args.bench_kernel:
-        if all_ok:
-            run_kernel_bench_cases(rep_ms=args.rep_ms, warmup_ms=args.warmup_ms, num_threads=args.num_threads)
-        else:
-            print("Skipping kernel benchmark because correctness tests failed.")
+    def expected_cycles(self, m: int, k: int, n: int) -> int:
+        total_mac = m * k * n
+        mac_per_cycle = 256 // 16
+        total_cycles = total_mac // mac_per_cycle
+        return total_cycles
