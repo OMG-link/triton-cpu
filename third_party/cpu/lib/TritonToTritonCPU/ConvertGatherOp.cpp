@@ -37,7 +37,7 @@ public:
     addLegalDialect<arith::ArithDialect>();
     addLegalDialect<memref::MemRefDialect>();
     addLegalDialect<vector::VectorDialect>();
-    addLegalDialect<LLVM::LLVMDialect>();
+    addLegalDialect<ub::UBDialect>();
     addLegalDialect<TritonCPUDialect>();
 
     addIllegalOp<triton::GatherOp>();
@@ -135,7 +135,7 @@ struct GatherOpConversion : public OpConversionPattern<triton::GatherOp> {
     // -------------------------
     // Build pass_thru (poison of result vector type)
     // -------------------------
-    Value passThru = rewriter.create<mlir::LLVM::PoisonOp>(loc, vecResultType);
+    Value passThru = rewriter.create<ub::PoisonOp>(loc, vecResultType);
 
     // -------------------------
     // Create the vector.gather op:
