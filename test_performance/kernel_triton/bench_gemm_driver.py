@@ -12,11 +12,11 @@
 conda activate triton
 TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --metric gflops --csv-out bench.csv --png-out bench.png
 
-# 仅测试指定的 kernel
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k --metric gflops
+# 仅测试指定的 kernel，指定核心数
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k --metric gflops --num-threads 8
 
 # 测试特定形状和 kernel（使用 tt.do_bench 进行精确计时）
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k,iq4k_q8k --warmup 3 --rounds 5 --metric gflops --num-threads=8 --grid-repeat 10
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k,iq4k_q8k --warmup 3 --rounds 5 --metric gflops --num-threads 8 --grid-repeat 10
 
 注意:
   - 可用的 kernel: q40_q80, q4k_q8k, iq4k_q8k
@@ -24,6 +24,7 @@ TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kerne
   - q4k_q8k/iq4k_q8k 约束: M%12==0, N%32==0, K%256==0
   - 使用 triton.testing.do_bench 进行精确的性能测试
   - warmup: 预热次数，rounds: 测试轮数
+  - num-threads: CPU核心/线程数，用于多核理论峰值计算 (峰值 = 2 * VLEN/dtype_width * Freq * num_cores)
 """
 
 from __future__ import annotations
@@ -271,13 +272,19 @@ def calc_ops_per_second(ms: float, M: int, N: int, K: int, dtype_width: int) -> 
     ops_per_sec = total_ops / (ms * 1e-3)  # ops/s
     return ops_per_sec * 1e-9  # GOPS
 
-def calc_peak_ops(freq: float, vlen: int, dtype_width: int) -> float:
+def calc_peak_ops(freq: float, vlen: int, dtype_width: int, num_cores: int = 1) -> float:
     """
-    计算理论峰值 OPS
-    峰值 = 2 * (VLEN / dtype_width) * Freq
+    计算理论峰值 OPS（考虑多核）
+    峰值 = 2 * (VLEN / dtype_width) * Freq * num_cores
     返回单位：GOPS
+    
+    Args:
+        freq: 芯片频率 (GHz)
+        vlen: 向量宽度 (bits)
+        dtype_width: 数据类型宽度 (bits)
+        num_cores: CPU 核心数
     """
-    return 2.0 * (vlen / dtype_width) * freq
+    return 2.0 * (vlen / dtype_width) * freq * num_cores
 
 # -----------------------
 # 默认形状注册区 (可在此扩展)
@@ -397,8 +404,8 @@ def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int,
         compute_dtype = spec.compute_dtype
         constraints = spec.constraints
         
-        # 计算该 kernel 的理论峰值
-        peak_gops = calc_peak_ops(freq, vlen, dtype_width)
+        # 计算该 kernel 的理论峰值（考虑多核）
+        peak_gops = calc_peak_ops(freq, vlen, dtype_width, num_threads)
         
         # 过滤不满足约束的形状
         valid_shapes = []
@@ -417,7 +424,7 @@ def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int,
         print(f"\n{'='*80}")
         print(f"[Kernel {kernel_idx}/{len(kernels_to_test)}] {name}")
         print(f"  计算数据类型: {compute_dtype} ({dtype_width} bits)")
-        print(f"  理论峰值: {peak_gops:.2f} GOPS@{compute_dtype}")
+        print(f"  理论峰值: {peak_gops:.2f} GOPS@{compute_dtype} ({num_threads} cores)")
         print(f"  块约束: M%{constraints.get('M',1)}==0, N%{constraints.get('N',1)}==0, K%{constraints.get('K',1)}==0")
         print(f"  测试形状数量: {len(valid_shapes)}")
         print(f"  Grid 重复次数: {grid_repeat}x (增加单次调用工作量)")
@@ -624,7 +631,7 @@ def main():
     parser.add_argument('--kernels', type=str, default='', help='逗号分隔的 kernel 名称列表，例如 q40_q80,q4k_q8k。留空表示测试所有 kernel')
     parser.add_argument('--warmup', type=int, default=3, help='预热次数')
     parser.add_argument('--rounds', type=int, default=10, help='测试轮数')
-    parser.add_argument('--num-threads', type=int, default=8, help='CPU线程数 (None 保持不变)')
+    parser.add_argument('--num-threads', type=int, default=8, help='CPU核心/线程数，用于多核理论峰值计算和 torch 线程设置')
     parser.add_argument('--grid-repeat', type=int, default=10, help='Grid 第三维重复次数，增加单次 kernel 调用工作量以减少启动开销影响 (默认 10)')
     parser.add_argument('--freq', type=float, default=1.6, help='芯片频率 GHz (默认 1.6)')
     parser.add_argument('--vlen', type=int, default=256, help='向量宽度 bits (默认 256)')
@@ -658,7 +665,7 @@ def main():
     print(f"\n{'='*80}")
     print(f"性能测试配置")
     print(f"{'='*80}")
-    print(f"芯片参数: Freq={args.freq} GHz, VLEN={args.vlen} bits")
+    print(f"芯片参数: Freq={args.freq} GHz, VLEN={args.vlen} bits, Cores={args.num_threads}")
     print(f"测试参数: warmup={args.warmup}, rounds={args.rounds}, threads={args.num_threads}, grid_repeat={args.grid_repeat}")
     print(f"总形状数: {len(shapes)}")
     print(f"注册 Kernel 数: {len(KERNEL_SPECS)}")
