@@ -1,6 +1,6 @@
 '''
 # 测试所有 kernel 在所有预定义形状上的性能
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --rounds 5
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --rounds 3
 
 # 只测试特定 kernel
 TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel q40_q80 --rounds 3
@@ -21,7 +21,7 @@ TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_tr
 TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --plot bandwidth_comparison.png
 
 # 同时指定 CSV 和图片，以及峰值带宽 (推荐)
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python ./gemv_driver.py --sweep --kernel all --num_threads=8 --csv bandwidth_comparison.csv --plot bandwidth_comparison.png --rounds 5 --target-gb 1.5 --peak-bw 5.83
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python ./gemv_driver.py --sweep --kernel all --num_threads=8 --csv bandwidth_comparison.csv --plot bandwidth_comparison.png --rounds 3 --target-gb 1.5 --peak-bw 5.83
 '''
 
 

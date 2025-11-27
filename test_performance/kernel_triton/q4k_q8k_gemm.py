@@ -307,9 +307,10 @@ def q4k_q8k_matmul_kernel(
             b_scales = tl.load(b_scales_ptr).reshape((1, NR))
             sum_block += tl.cast(suml, tl.int32) * tl.cast(b_scales, tl.int32)
             # i_subb++
-            a_q_ptr = tl.advance(a_q_ptr, (0, 0, 1, 0, 0)) 
-            b_q_ptr = tl.advance(b_q_ptr, (0, 0, 1, 0, 0)) 
-            b_scales_ptr = tl.advance(b_scales_ptr, (0, 0, 1, 0))
+            a_q_ptr = tl.advance(a_q_ptr, (0, 0, i_subb, 0, 0)) 
+            b_q_ptr = tl.advance(b_q_ptr, (0, 0, i_subb, 0, 0)) 
+            b_scales_ptr = tl.advance(b_scales_ptr, (0, 0, i_subb, 0))
+
         a_d = tl.load(a_d_ptr).reshape((1, MR))
         b_d = tl.cast(tl.load(b_d_ptr).reshape((1, NR)), tl.float32)
         sum_row += tl.cast(sum_block, tl.float32) * tl.dot(a_d.T, b_d, out_dtype=tl.float32)
@@ -389,6 +390,7 @@ if __name__ == '__main__':
     tests = [
         (48, 512, 32),
     ]
+    
     if args.shapes:
         for item in args.shapes.split(','):
             item = item.strip()

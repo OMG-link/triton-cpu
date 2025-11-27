@@ -55,6 +55,9 @@ class CPUOptions:
 
     # TODO: We may introduce CPU-specific options like # of cores.
     ukernels: str = None
+    # repeat kernel n times inside the kernel to reduce jit kernel
+    # launch overhead for precise benchmarking
+    n_kernel_repeat: int = 0
 
     def __post_init__(self):
         pass

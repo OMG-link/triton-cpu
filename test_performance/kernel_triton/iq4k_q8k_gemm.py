@@ -189,10 +189,8 @@ def iq4k_q8k_matmul_kernel(
             iq4k_data_2 = (iq4k_data_packed >> 4).reshape(16, NR)  # uint4, [16, NR] 
 
             # 按行维度 (axis=1) gather：iq4k_data_1 / iq4k_data_2 的取值范围 0..15 
-            iq4k_data_k0_15_dequant_data = tl.gather(src=value_tlb1, index=iq4k_data_1, axis=1)  # (16, NR)
-            iq4k_data_k16_31_dequant_data = tl.gather(src=value_tlb2, index=iq4k_data_2, axis=1)  # (16, NR)
-
-
+            iq4k_data_k0_15_dequant_data = tl.gather(src=value_tlb1, index=iq4k_data_1, axis=1)  # (16, NR) 
+            iq4k_data_k16_31_dequant_data = tl.gather(src=value_tlb2, index=iq4k_data_2, axis=1)  # (16, NR) 
 
             iq4k_scale_1 = iq4k_scale_1.reshape((1, NR)).broadcast_to((MR, NR))
             # （16， NR) (16, MR)

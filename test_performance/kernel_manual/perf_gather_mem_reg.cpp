@@ -1,5 +1,6 @@
 #include <stdio.h>
 
+#define __riscv
 // 希望写一个测试程序，对比 riscv 架构下，使用寄存器 gather 操作和 cache 命中的内存级别 gather 性能有多大差距
 // 寄存器 gather 指令: vrgather.vv vd, vs2, vs1, vm
 // 内存 gather 为 vluxe 指令: vluxe.v vd, (rs1), vs2, vm
@@ -119,34 +120,36 @@ double test_register_gather_scalar(const std::vector<int8_t>& table,
     return time;
 }
 
-// 使用RVV内联汇编的实际测试（如果环境支持）
+// 使用RVV内联汇编的实际测试(如果环境支持)
 #ifdef __riscv
-#define RVV_GATHER_MEM_E8(dst, base, indices) \
-    asm volatile("vluxei8.v %0, (%1), %2" : "=v"(dst) : "r"(base), "v"(indices))
-
-#define RVV_GATHER_REG_E8(dst, table, indices) \
-    asm volatile("vrgather.vv %0, %1, %2" : "=v"(dst) : "v"(table), "v"(indices))
-
-#define RVV_SET_VL_E8(length) \
-    asm volatile("vsetvli zero, %0, e8, m1" : : "r"(length))
+#include <riscv_vector.h>
 
 double test_memory_gather_rvv(const std::vector<int8_t>& table, 
                              const std::vector<uint8_t>& indices) {
     PerformanceTimer timer;
     std::vector<int8_t> result(VECTOR_LENGTH);
     
+    size_t vl;
+    
     // 预热
     for (size_t i = 0; i < 1000; ++i) {
-        RVV_SET_VL_E8(VECTOR_LENGTH);
-        RVV_GATHER_MEM_E8(result.data(), table.data(), indices.data());
+        vl = __riscv_vsetvl_e8m1(VECTOR_LENGTH);
+        vuint8m1_t v_indices = __riscv_vle8_v_u8m1(indices.data(), vl);
+        vint8m1_t v_result = __riscv_vluxei8_v_i8m1(table.data(), v_indices, vl);
+        __riscv_vse8_v_i8m1(result.data(), v_result, vl);
     }
     
     timer.start();
     for (size_t iter = 0; iter < ITERATIONS; ++iter) {
-        RVV_SET_VL_E8(VECTOR_LENGTH);
-        RVV_GATHER_MEM_E8(result.data(), table.data(), indices.data());
+        vl = __riscv_vsetvl_e8m1(VECTOR_LENGTH);
+        vuint8m1_t v_indices = __riscv_vle8_v_u8m1(indices.data(), vl);
+        vint8m1_t v_result = __riscv_vluxei8_v_i8m1(table.data(), v_indices, vl);
+        __riscv_vse8_v_i8m1(result.data(), v_result, vl);
     }
     double time = timer.stop();
+    
+    volatile int8_t dummy = result[0];
+    (void)dummy;
     
     return time;
 }
@@ -157,18 +160,29 @@ double test_register_gather_rvv(const std::vector<int8_t>& table,
     std::vector<int8_t> result(VECTOR_LENGTH);
     std::vector<int8_t> table_reg = table; // 模拟表在寄存器中
     
+    size_t vl;
+    
     // 预热
     for (size_t i = 0; i < 1000; ++i) {
-        RVV_SET_VL_E8(VECTOR_LENGTH);
-        RVV_GATHER_REG_E8(result.data(), table_reg.data(), indices.data());
+        vl = __riscv_vsetvl_e8m1(VECTOR_LENGTH);
+        vint8m1_t v_table = __riscv_vle8_v_i8m1(table_reg.data(), vl);
+        vuint8m1_t v_indices = __riscv_vle8_v_u8m1(indices.data(), vl);
+        vint8m1_t v_result = __riscv_vrgather_vv_i8m1(v_table, v_indices, vl);
+        __riscv_vse8_v_i8m1(result.data(), v_result, vl);
     }
     
     timer.start();
     for (size_t iter = 0; iter < ITERATIONS; ++iter) {
-        RVV_SET_VL_E8(VECTOR_LENGTH);
-        RVV_GATHER_REG_E8(result.data(), table_reg.data(), indices.data());
+        vl = __riscv_vsetvl_e8m1(VECTOR_LENGTH);
+        vint8m1_t v_table = __riscv_vle8_v_i8m1(table_reg.data(), vl);
+        vuint8m1_t v_indices = __riscv_vle8_v_u8m1(indices.data(), vl);
+        vint8m1_t v_result = __riscv_vrgather_vv_i8m1(v_table, v_indices, vl);
+        __riscv_vse8_v_i8m1(result.data(), v_result, vl);
     }
     double time = timer.stop();
+    
+    volatile int8_t dummy = result[0];
+    (void)dummy;
     
     return time;
 }

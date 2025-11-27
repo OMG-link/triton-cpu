@@ -13,7 +13,7 @@ LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
 LLVM_SYSPATH=$LLVM_BUILD_DIR \
 MAX_JOBS=1 \
 SETUPTOOLS_ENABLE_FEATURES="legacy-editable" \
-pip install -e python --no-build-isolation 
+pip install -e python --no-build-isolation -vvv
 ```
 
 # run demos on k1
@@ -24,16 +24,22 @@ CC=/opt/llvm/llvm20/bin/clang TRITON_ALWAYS_COMPILE=1 TRITON_KERNEL_DUMP=1 TRITO
 ```
 
 # build on macos
-TRITON_LOCAL_LIBOMP_PATH=/opt/homebrew/opt/libomp \
-LLVM_SYSPATH="~/.triton/llvm/llvm-adba14ac-macos-arm64" \
-JSON_SYSPATH="~/.triton/json" \
+rm -rf python/build/ python/triton.egg-info/
+find python -name "*.so" -delete
+find python -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+
+TRITON_BUILD_WITH_CLANG_LLD=true \                                   
 TRITON_OFFLINE_BUILD=1 \
-TRITON_BUILD_WITH_CLANG_LLD=true \
-LLVM_INCLUDE_DIRS=$LLVM_SYSPATH/include \
-LLVM_LIBRARY_DIR=$LLVM_SYSPATH/lib \
+JSON_SYSPATH="/home/shenrh/.triton/json" \
+LLVM_BUILD_DIR=/opt/llvm/llvm21 \
+LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
+LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
+LLVM_SYSPATH=$LLVM_BUILD_DIR \
 MAX_JOBS=6 \
 SETUPTOOLS_ENABLE_FEATURES="legacy-editable" \
-pip install -e python --no-build-isolation 
+SETUPTOOLS_BUILD_FORCE_RECONFIGURE=1 \
+SOURCE_DATE_EPOCH=$(date +%s) \
+pip install --force-reinstall --no-deps --no-cache-dir -e python --no-build-isolation -vvv
 
 
 TRITON_LOCAL_LIBOMP_PATH=/opt/homebrew/opt/libomp/ \

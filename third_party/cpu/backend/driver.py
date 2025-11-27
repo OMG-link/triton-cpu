@@ -268,11 +268,15 @@ static std::unique_ptr<uint32_t[][3]> get_all_grids(uint32_t gridX, uint32_t gri
   return grids;
 }}
 
-static void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
+static void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, int n_kernel_repeat, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
   // TODO: Consider using omp collapse(3) clause for simplicity?
   size_t N = gridX * gridY * gridZ;
+  int repeat = (n_kernel_repeat > 0) ? n_kernel_repeat : 1;
+  
   if (N == 1) {{
-      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} 0, 0, 0, 1, 1, 1);
+      for (int r = 0; r < repeat; ++r) {{
+          (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} 0, 0, 0, 1, 1, 1);
+      }}
       return;
   }}
 
@@ -285,20 +289,24 @@ static void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int 
 
   // Don't pay OMP overhead price when a single thread is used.
   if (max_threads == 1) {{
-    for (size_t i = 0; i < N; ++i) {{
-      const auto [x, y, z] = all_grids[i];
-      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+    for (int r = 0; r < repeat; ++r) {{
+      for (size_t i = 0; i < N; ++i) {{
+        const auto [x, y, z] = all_grids[i];
+        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+      }}
     }}
     return;
   }}
 
   // For now, use the default chunk size, total iterations / max_threads.
+  for (int r = 0; r < repeat; ++r) {{
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(max_threads)
 #endif // _OPENMP
-  for (size_t i = 0; i < N; ++i) {{
-    const auto [x, y, z] = all_grids[i];
-    (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+    for (size_t i = 0; i < N; ++i) {{
+      const auto [x, y, z] = all_grids[i];
+      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+    }}
   }}
 }}
 
@@ -327,6 +335,12 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   if (num_threads_attr && PyLong_Check(num_threads_attr))
     num_threads = PyLong_AsLong(num_threads_attr);
 
+  // Extract n_kernel_repeat metadata.
+  int n_kernel_repeat = 0;
+  PyObject *n_kernel_repeat_attr = PyObject_GetAttrString(kernel_metadata, "n_kernel_repeat");
+  if (n_kernel_repeat_attr && PyLong_Check(n_kernel_repeat_attr))
+    n_kernel_repeat = PyLong_AsLong(n_kernel_repeat_attr);
+
   // extract launch metadata
   if (launch_enter_hook != Py_None){{
     PyObject* args = Py_BuildValue("(O)", launch_metadata);
@@ -337,7 +351,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   }}
 
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
-  run_omp_kernels(gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+  run_omp_kernels(gridX, gridY, gridZ, num_threads, n_kernel_repeat, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
 
   if(launch_exit_hook != Py_None){{
     PyObject* args = Py_BuildValue("(O)", launch_metadata);

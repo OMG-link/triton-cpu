@@ -54,7 +54,7 @@ def i8_i8_gemm_kernel(
     )
 
     # 精度对齐需求
-    acc = tl.zeros((MR, NR), dtype=tl.int32)
+    acc = tl.zeros((MR, NR), dtype=tl.int16)
 
     for k_block in range(N_block):
         # 加载 a 数据块: 原始形状 (1, 1, QK_8_0, MR)
@@ -70,7 +70,7 @@ def i8_i8_gemm_kernel(
         
         # 矩阵乘法: (MR, K) @ (K, NR) = (MR, NR) = (12, 32)
         # 直接使用 int32 避免溢出
-        tmp_result = tl.dot(a_data.to(tl.int16), b_data.to(tl.int16), out_dtype=tl.int32)
+        tmp_result = tl.dot(a_data, b_data, out_dtype=tl.int16)
 
         acc += tmp_result
 
@@ -180,7 +180,7 @@ def simple_benchmark(M=48, N=512, K=32, warmup=10, rep=100):
     torch.manual_seed(42)
     a_matrix = torch.randint(-128, 127, (M, K), dtype=torch.int8)
     b_matrix = torch.randint(-128, 127, (K, N), dtype=torch.int8)
-    output = torch.zeros((M, N), dtype=torch.int32)
+    output = torch.zeros((M, N), dtype=torch.int16)
     
     grid = (M // MR, N // NR)
     

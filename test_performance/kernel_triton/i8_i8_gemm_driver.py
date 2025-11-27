@@ -35,7 +35,7 @@ CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
 
-from i8_i8_gemm import q40_q80_gemm_kernel
+from i8_i8_gemm import i8_i8_gemm_kernel
 
 # ============================================================================
 # 配置区域
@@ -161,7 +161,7 @@ def generate_test_data(M: int, N: int, K: int, seed: int = 42) -> Dict:
     # A: [M, K], B: [K, N]
     a_matrix = torch.randint(-128, 127, (M, K), dtype=torch.int8)
     b_matrix = torch.randint(-128, 127, (K, N), dtype=torch.int8)
-    output = torch.zeros((M, N), dtype=torch.int32)
+    output = torch.zeros((M, N), dtype=torch.int16)
     
     return {
         'a_matrix': a_matrix,
@@ -184,7 +184,8 @@ def benchmark_single_shape(
     warmup_ms: int = 25,
     rep_ms: int = 100,
     threads: int = None,
-    peak_gops: float = None
+    peak_gops: float = None,
+    n_kernel_repeat: int = 10
 ) -> Dict:
     """对单个矩阵形状进行性能测试
     
@@ -194,6 +195,7 @@ def benchmark_single_shape(
         rep_ms: 测试时间（毫秒）
         num_threads: CPU 线程数
         peak_gops: 理论峰值 GOPS（用于计算效率）
+        n_kernel_repeat: kernel 内部重复次数（减少启动开销）
     
     Returns:
         包含性能统计的字典
@@ -215,18 +217,19 @@ def benchmark_single_shape(
     
     # 定义执行函数
     def run_kernel():
-        q40_q80_gemm_kernel[grid](
+        i8_i8_gemm_kernel[grid](
             a_matrix_ptr=a_matrix,
             b_matrix_ptr=b_matrix,
             output_ptr=output,
             M=M,
             N=N,
             K=K,
-            num_threads=threads
+            num_threads=threads,
+            n_kernel_repeat=n_kernel_repeat
         )
     
     # 使用 triton.testing.do_bench 进行性能测试
-    print(f"  使用 Triton do_bench 测试 (warmup={warmup_ms}ms, rep={rep_ms}ms)...")
+    print(f"  使用 Triton do_bench 测试 (warmup={warmup_ms}ms, rep={rep_ms}ms, n_kernel_repeat={n_kernel_repeat})...")
     median_ms, min_ms, max_ms = tt.do_bench(
         run_kernel, 
         warmup=warmup_ms, 
@@ -236,10 +239,12 @@ def benchmark_single_shape(
     
     # 计算 GOPS
     # GEMM 的计算量: 2*M*N*K (乘法 + 加法)
-    ops = 2 * M * N * K
-    gops_median = ops / (median_ms * 1e6)  # GOPS
-    gops_min = ops / (max_ms * 1e6)  # 最大时间对应最小GOPS
-    gops_max = ops / (min_ms * 1e6)  # 最小时间对应最大GOPS
+    # 注意: 如果使用了 n_kernel_repeat,需要乘以重复次数来计算总计算量
+    ops_per_call = 2 * M * N * K
+    total_ops = ops_per_call * n_kernel_repeat
+    gops_median = total_ops / (median_ms * 1e6)  # GOPS
+    gops_min = total_ops / (max_ms * 1e6)  # 最大时间对应最小GOPS
+    gops_max = total_ops / (min_ms * 1e6)  # 最小时间对应最大GOPS
     
     # 计算效率（如果提供了峰值GOPS）
     efficiency_median = (gops_median / peak_gops * 100.0) if peak_gops else None
@@ -260,7 +265,8 @@ def benchmark_single_shape(
         'efficiency_median': efficiency_median,
         'efficiency_min': efficiency_min,
         'efficiency_max': efficiency_max,
-        'ops': ops,
+        'ops': total_ops,
+        'n_kernel_repeat': n_kernel_repeat,
     }
     
     return result

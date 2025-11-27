@@ -15,8 +15,12 @@ TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --metri
 # 仅测试指定的 kernel，指定核心数
 TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k --metric gflops --num-threads 8
 
-# 测试特定形状和 kernel（使用 tt.do_bench 进行精确计时）
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k,iq4k_q8k --warmup 3 --rounds 5 --metric gflops --num-threads 8 --grid-repeat 10
+# 使用 n_kernel_repeat 减少启动开销影响（适合小规模 kernel 的精确测量）
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k,iq4k_q8k --warmup 3 --rounds 3 --metric gflops --num-threads 1 --n-kernel-repeat 20
+
+# 对比不同 n_kernel_repeat 值的影响
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --shapes 12x256x32 --kernels q40_q80 --n-kernel-repeat 1
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --shapes 12x256x32 --kernels q40_q80 --n-kernel-repeat 100  --num-threads 1 
 
 注意:
   - 可用的 kernel: q40_q80, q4k_q8k, iq4k_q8k
@@ -25,6 +29,10 @@ TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kerne
   - 使用 triton.testing.do_bench 进行精确的性能测试
   - warmup: 预热次数，rounds: 测试轮数
   - num-threads: CPU核心/线程数，用于多核理论峰值计算 (峰值 = 2 * VLEN/dtype_width * Freq * num_cores)
+  - n_kernel_repeat: 在单次 kernel 调用中重复执行的次数
+    * 减少 Python->C++ 调用开销和 OpenMP 线程池启动开销
+    * 提高小规模 kernel 的性能测量精度
+    * 建议值: 小型 kernel 用 10-100, 大型 kernel 用 1 即可
 """
 
 from __future__ import annotations
@@ -100,9 +108,9 @@ def q40_estimate_ops(M, N, K):
     """估算 q40_q80 的操作数"""
     return 2.0 * M * N * K
 
-def q40_grid(M, N, K, grid_repeat=1):
+def q40_grid(M, N, K):
     """返回 q40_q80 的 grid 配置"""
-    return (M // 12, N // 32, grid_repeat)
+    return (M // 12, N // 32)
 
 def q40_param_builder(data, M, N, K, threads):
     """构建 q40_q80 kernel 参数"""
@@ -155,9 +163,9 @@ def q4k_estimate_ops(M, N, K):
     """估算 q4k_q8k 的操作数"""
     return 2.0 * M * N * K
 
-def q4k_grid(M, N, K, grid_repeat=1):
+def q4k_grid(M, N, K):
     """返回 q4k_q8k 的 grid 配置"""
-    return (M // 12, N // 32, grid_repeat)
+    return (M // 12, N // 32)
 
 def q4k_param_builder(data, M, N, K, threads):
     """构建 q4k_q8k kernel 参数"""
@@ -206,9 +214,9 @@ def iq4k_estimate_ops(M, N, K):
     """估算 iq4k_q8k 的操作数"""
     return 2.0 * M * N * K
 
-def iq4k_grid(M, N, K, grid_repeat=1):
+def iq4k_grid(M, N, K):
     """返回 iq4k_q8k 的 grid 配置"""
-    return (M // 12, N // 32, grid_repeat)
+    return (M // 12, N // 32)
 
 def iq4k_param_builder(data, M, N, K, threads):
     """构建 iq4k_q8k kernel 参数"""
@@ -353,21 +361,20 @@ def parse_shapes_arg(shapes_str: str) -> List[Tuple[int,int,int]]:
     return res
 
 def run_single_benchmark(spec: KernelSpec, M: int, K: int, N: int, 
-                         warmup: int, rounds: int, num_threads: int, grid_repeat: int = 1) -> Tuple[float, float, float]:
-    """运行单个形状的性能测试，返回 (median_ms, min_ms, max_ms)
+                         warmup: int, rounds: int, num_threads: int, n_kernel_repeat: int = 1) -> Tuple[float, float, float]:
+    """运行单个形状的性能测试,返回 (median_ms, min_ms, max_ms)
     
     参数:
-        grid_repeat: grid 第三维度的重复次数，用于增加单次 kernel 调用的工作量
-                     实际测量的时间会除以 grid_repeat 来得到单次计算的时间
+        n_kernel_repeat: 在单次 kernel 调用中重复执行的次数，用于减少启动开销影响
     """
     # 生成数据
     data = spec.gen_dataset(M, K, N)
-    grid = spec.grid_fn(M, N, K, grid_repeat)
+    grid = spec.grid_fn(M, N, K)
     params = spec.param_builder(data, M, N, K, num_threads)
     
     # 定义执行函数
     def run_kernel():
-        spec.kernel_fn[grid](**params)
+        spec.kernel_fn[grid](**params, n_kernel_repeat=n_kernel_repeat)
     
     # 使用 tt.do_bench 进行性能测试
     # do_bench 返回 [median, min, max] 对应 quantiles=[0.5, 0.2, 0.8]
@@ -378,15 +385,15 @@ def run_single_benchmark(spec: KernelSpec, M: int, K: int, N: int,
         quantiles=[0.5, 0.2, 0.8]
     )
     
-    # 将时间除以 grid_repeat 得到单次计算的实际时间
-    median_ms /= grid_repeat
-    min_ms /= grid_repeat
-    max_ms /= grid_repeat
+    # 除以 n_kernel_repeat 得到单次执行的时间
+    median_ms /= n_kernel_repeat
+    min_ms /= n_kernel_repeat
+    max_ms /= n_kernel_repeat
     
     return median_ms, min_ms, max_ms
 
 def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int, 
-              num_threads: int, freq: float, vlen: int, selected_kernels: List[str] = None, grid_repeat: int = 1):
+              num_threads: int, freq: float, vlen: int, selected_kernels: List[str] = None, n_kernel_repeat: int = 1):
     all_results = []
     
     # 如果指定了 kernel 列表，过滤出匹配的 kernel
@@ -427,14 +434,15 @@ def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int,
         print(f"  理论峰值: {peak_gops:.2f} GOPS@{compute_dtype} ({num_threads} cores)")
         print(f"  块约束: M%{constraints.get('M',1)}==0, N%{constraints.get('N',1)}==0, K%{constraints.get('K',1)}==0")
         print(f"  测试形状数量: {len(valid_shapes)}")
-        print(f"  Grid 重复次数: {grid_repeat}x (增加单次调用工作量)")
+        if n_kernel_repeat > 1:
+            print(f"  内核重复次数: {n_kernel_repeat}x (减少启动开销影响)")
         print(f"{'='*80}")
         
         # 逐个测试并实时显示进度
         for idx, (M, K, N) in enumerate(valid_shapes, 1):
             # 调用 benchmark 函数
             median_ms, min_ms, max_ms = run_single_benchmark(
-                spec, M, K, N, warmup, rounds, num_threads, grid_repeat
+                spec, M, K, N, warmup, rounds, num_threads, n_kernel_repeat
             )
             
             # 计算性能指标
@@ -632,7 +640,7 @@ def main():
     parser.add_argument('--warmup', type=int, default=3, help='预热次数')
     parser.add_argument('--rounds', type=int, default=10, help='测试轮数')
     parser.add_argument('--num-threads', type=int, default=8, help='CPU核心/线程数，用于多核理论峰值计算和 torch 线程设置')
-    parser.add_argument('--grid-repeat', type=int, default=10, help='Grid 第三维重复次数，增加单次 kernel 调用工作量以减少启动开销影响 (默认 10)')
+    parser.add_argument('--n-kernel-repeat', type=int, default=1, help='单次 kernel 调用中的重复执行次数，用于减少启动开销影响 (默认 1)')
     parser.add_argument('--freq', type=float, default=1.6, help='芯片频率 GHz (默认 1.6)')
     parser.add_argument('--vlen', type=int, default=256, help='向量宽度 bits (默认 256)')
     parser.add_argument('--csv-out', type=str, default='kernel_bench_results.csv', help='CSV 输出路径')
@@ -666,7 +674,7 @@ def main():
     print(f"性能测试配置")
     print(f"{'='*80}")
     print(f"芯片参数: Freq={args.freq} GHz, VLEN={args.vlen} bits, Cores={args.num_threads}")
-    print(f"测试参数: warmup={args.warmup}, rounds={args.rounds}, threads={args.num_threads}, grid_repeat={args.grid_repeat}")
+    print(f"测试参数: warmup={args.warmup}, rounds={args.rounds}, threads={args.num_threads}, n_kernel_repeat={args.n_kernel_repeat}")
     print(f"总形状数: {len(shapes)}")
     print(f"注册 Kernel 数: {len(KERNEL_SPECS)}")
     if selected_kernels:
@@ -675,7 +683,8 @@ def main():
     
     results = run_bench(shapes, warmup=args.warmup, rounds=args.rounds, 
                         num_threads=args.num_threads, freq=args.freq, 
-                        vlen=args.vlen, selected_kernels=selected_kernels, grid_repeat=args.grid_repeat)
+                        vlen=args.vlen, selected_kernels=selected_kernels, 
+                        n_kernel_repeat=args.n_kernel_repeat)
     if not results:
         print("\n无结果产生, 退出")
         return
