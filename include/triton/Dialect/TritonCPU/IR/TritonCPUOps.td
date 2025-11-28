@@ -240,6 +240,8 @@ def TTC_RGatherOp : TTC_Op<"rgather", [Pure,
   let summary = "gather on register operation";
   let description = [{
     Gather elements from the input vector based on the provided indices.
+    'src' must have exactly one dimension. The result of this operation
+    can be written as: result[idx] = src[indices[idx]].
   }];
 
   let arguments = (ins
@@ -252,6 +254,8 @@ def TTC_RGatherOp : TTC_Op<"rgather", [Pure,
     $src `[` $indices `]` attr-dict `:`
     functional-type(operands, results)
   }];
+
+  let hasVerifier = 1;
 }
 
 #endif

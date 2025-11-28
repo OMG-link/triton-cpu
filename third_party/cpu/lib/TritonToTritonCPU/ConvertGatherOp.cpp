@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -37,6 +38,8 @@ public:
     addLegalDialect<arith::ArithDialect>();
     addLegalDialect<memref::MemRefDialect>();
     addLegalDialect<vector::VectorDialect>();
+    addLegalDialect<scf::SCFDialect>();
+    addLegalDialect<ub::UBDialect>();
     addLegalDialect<TritonCPUDialect>();
 
     addIllegalOp<triton::GatherOp>();
@@ -49,6 +52,7 @@ struct GatherOpConversion : public OpConversionPattern<triton::GatherOp> {
   LogicalResult
   matchAndRewrite(triton::GatherOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
     Value baseVec = rewriter.getRemappedValue(op.getSrc());
     Value indexVec = rewriter.getRemappedValue(op.getIndices());
 
@@ -63,16 +67,43 @@ struct GatherOpConversion : public OpConversionPattern<triton::GatherOp> {
       return op.emitError("missing axis attribute");
     }
     int64_t axis = axisAttr.getValue().getSExtValue();
-    // If axis is not the last dimension, we need to multiply indices with some
-    // value. For simplicity, we currently just assume the axis is always the
-    // last dimension here.
+    // If axis is not the last dimension, we need to transpose the gather
+    // dimension to the last one. For simplicity, we currently just assume the
+    // axis is always the last dimension here.
     if (axis != baseRank - 1) {
       return op.emitError(
           "currently only lowering gather when axis == last dimension; please "
           "transpose src/indices so axis is innermost before lowering");
     }
 
-    rewriter.replaceOpWithNewOp<cpu::RGatherOp>(op, baseVec, indexVec);
+    // Dimensions of 'baseVec' can not be dynamic.
+    for (int64_t i = 0; i < baseRank; i++) {
+      if (baseShape.isDynamicDim(i)) {
+        return op.emitError("dimensions of gather source can not be dynamic");
+      }
+    }
+
+    auto build = [&rewriter, &loc](auto &build, Value baseVec,
+                                   Value indexVec) -> Value {
+      VectorType baseTy = cast<VectorType>(baseVec.getType());
+      VectorType indexTy = cast<VectorType>(indexVec.getType());
+      if (baseTy.getRank() == 1) {
+        return rewriter.create<RGatherOp>(loc, baseVec, indexVec);
+      } else {
+        Value result = rewriter.create<ub::PoisonOp>(
+            loc, indexTy.cloneWith(std::nullopt, baseTy.getElementType()));
+        for (int64_t i = 0; i < baseTy.getDimSize(0); i++) {
+          Value subBaseVec =
+              rewriter.create<vector::ExtractOp>(loc, baseVec, i);
+          Value subIndexVec =
+              rewriter.create<vector::ExtractOp>(loc, indexVec, i);
+          Value subResult = build(build, subBaseVec, subIndexVec);
+          result = rewriter.create<vector::InsertOp>(loc, subResult, result, i);
+        }
+        return result;
+      }
+    };
+    rewriter.replaceOp(op, build(build, baseVec, indexVec));
 
     return success();
   }

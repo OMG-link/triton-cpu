@@ -48,4 +48,21 @@ LogicalResult RGatherOp::inferReturnTypes(
   return success();
 }
 
+LogicalResult RGatherOp::verify() {
+  VectorType indicesTy = getIndices().getType();
+  VectorType srcTy = getSrc().getType();
+  VectorType resTy = getResult().getType();
+
+  if (srcTy.getRank() != 1) {
+    return emitOpError("rgather can only gather data at one dimension");
+  }
+  if (indicesTy.getShape() != resTy.getShape()) {
+    return emitOpError("indices and output shapes must match");
+  }
+  if (srcTy.getElementType() != resTy.getElementType()) {
+    return emitOpError("input and output element types must match");
+  }
+  return success();
+}
+
 } // namespace mlir::triton::cpu
