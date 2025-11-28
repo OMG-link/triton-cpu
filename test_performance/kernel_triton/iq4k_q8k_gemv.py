@@ -37,8 +37,8 @@ def iq4k_q8k_gemv_kernel(
     NR : tl.constexpr = 32
 
 
-    value_table1 = tl.arange(0, 16).cast(tl.int8).reshape(16,1).broadcast_to((16,NR))
-    value_table2 = tl.arange(0, 16).cast(tl.int8).reshape(16,1).broadcast_to((16,NR))
+    value_table1 = tl.arange(0, 16).cast(tl.int8).reshape(1, 16).broadcast_to((NR, 16))
+    value_table2 = tl.arange(0, 16).cast(tl.int8).reshape(1, 16).broadcast_to((NR, 16))
 
 
 
@@ -152,8 +152,8 @@ def iq4k_q8k_gemv_kernel(
             iq4k_data_block_ptr = tl.advance(iq4k_block_ptr, offsets=(0, 0, k_block, k_sub_block, 0, 0))
             iq4k_data_packed = tl.load(iq4k_data_block_ptr)  # uint8 * NR, 每个 uint8 包含两个 iq4k 数据 [16, NR]@uint8 => [32, NR]@uint4
 
-            iq4k_data_1 = (iq4k_data_packed & 0x0F).reshape(16, NR) # uint4, [16, NR] 
-            iq4k_data_2 = (iq4k_data_packed >> 4).reshape(16, NR) # uint4, [16, NR] 
+            iq4k_data_1 = (iq4k_data_packed & 0x0F).reshape(16, NR).permute(1, 0)  # uint4, [16, NR] 
+            iq4k_data_2 = (iq4k_data_packed >> 4).reshape(16, NR).permute(1, 0)  # uint4, [16, NR] 
 
             # dequant by lookup table
             tlb_start_idx = (iq4k_extra_data >> (2 * k_sub_block))   # [NR] 
@@ -161,27 +161,24 @@ def iq4k_q8k_gemv_kernel(
             # FIXME 不支持 bool 类型
             # tlb_start_idx_1 = (tlb_start_idx & 0x01).cast(tl.bool) # [NR]  
             # tlb_start_idx_2 = (tlb_start_idx & 0x02).cast(tl.bool) # [NR]  
-            tlb_start_idx_1 = (tlb_start_idx & 0x01)  # [NR] 
-            tlb_start_idx_2 = (tlb_start_idx & 0x02)  # [NR] 
+            tlb_start_idx_1 = (tlb_start_idx & 0x01).reshape(NR,1)  # [NR] 
+            tlb_start_idx_2 = (tlb_start_idx & 0x02).reshape(NR,1)  # [NR] 
 
             # # 构造低/高表 (16,1) => 通过广播按列选择，避免不支持的二维切片语法 
             # value_table_lo = tl.reshape(tl.constexpr(value_table[:16]), (16, 1))  # (16,1) 
             # value_table_hi = tl.reshape(tl.constexpr(value_table[16:]), (16, 1))  # (16,1) 
 
             # tlb_start_idx_1 / tlb_start_idx_2 是 (NR,) -> (1,NR) 以便广播到 (16,NR) 
-            mask1 = tl.reshape(tlb_start_idx_1, (1, NR)).broadcast_to((QK_4_K_SUB_BLOCK_DATA_SIZE, NR)).cast(tl.int1)  # (16,NR) 
-            mask2 = tl.reshape(tlb_start_idx_2, (1, NR)).broadcast_to((QK_4_K_SUB_BLOCK_DATA_SIZE, NR)).cast(tl.int1)  # (16,NR) 
+            mask1 = tlb_start_idx_1.broadcast_to((NR, QK_4_K_SUB_BLOCK_DATA_SIZE)).cast(tl.int1)  # (NR,16) 
+            mask2 = tlb_start_idx_2.broadcast_to((NR, QK_4_K_SUB_BLOCK_DATA_SIZE)).cast(tl.int1)  # (NR,16) 
 
             # 按列选择对应表 (16,NR)
-            value_tlb1 = tl.where(mask1, value_table1, value_table2)  # (16, NR)
-            value_tlb2 = tl.where(mask2, value_table1, value_table2)  # (16, NR)
+            value_tlb1 = tl.where(mask1, value_table1, value_table2)  # (NR, 16)
+            value_tlb2 = tl.where(mask2, value_table1, value_table2)  # (NR, 16)
 
             # 按行维度 (axis=0) gather：iq4k_data_1 / iq4k_data_2 的取值范围 0..15 
-            iq4k_data_k0_15_dequant_data = (tl.gather(src=value_tlb1, index=iq4k_data_1, axis=1)) # (16,NR)  
-            iq4k_data_k0_15_dequant_data = tl.permute(iq4k_data_k0_15_dequant_data, (1,0))  # (16,NR) -> (NR,16)
-
-            iq4k_data_k16_31_dequant_data = (tl.gather(src=value_tlb2, index=iq4k_data_2, axis=1)).reshape(16,NR)  # (16,NR) 
-            iq4k_data_k16_31_dequant_data = tl.permute(iq4k_data_k16_31_dequant_data, (1, 0))  # (16,NR) -> (NR,16)
+            iq4k_data_k0_15_dequant_data = (tl.gather(src=value_tlb1, index=iq4k_data_1, axis=1)) # (NR,16)  
+            iq4k_data_k16_31_dequant_data = (tl.gather(src=value_tlb2, index=iq4k_data_2, axis=1))  # (NR,16) 
 
             sum1 = tl.zeros((NR,), dtype=tl.int16)
             sum2 = tl.zeros((NR,), dtype=tl.int16)
@@ -191,8 +188,8 @@ def iq4k_q8k_gemv_kernel(
                 k_idx = tl.full((NR,), k, dtype=tl.int32).reshape((NR,1))
                 
                 # 从 [16,NR] 矩阵中提取第 k 行 -> [NR]
-                iq4k_data_lo = tl.reshape(tl.gather(src=iq4k_data_k0_15_dequant_data, index=k_idx, axis=1), (NR,))
-                iq4k_data_hi = tl.reshape(tl.gather(src=iq4k_data_k16_31_dequant_data, index=k_idx, axis=1), (NR,))
+                iq4k_data_lo = tl.reshape(tl.gather(src=iq4k_data_k0_15_dequant_data, index=k_idx, axis=1), (NR,)) # [NR] vector
+                iq4k_data_hi = tl.reshape(tl.gather(src=iq4k_data_k16_31_dequant_data, index=k_idx, axis=1), (NR,)) # [NR] vector
 
                 q8k_data_ptr = tl.advance(q8k_block_ptr, offsets=(0, k_block, k_sub_block, k, 0))
 
