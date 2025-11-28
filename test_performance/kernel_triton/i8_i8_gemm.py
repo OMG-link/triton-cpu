@@ -53,30 +53,28 @@ def i8_i8_gemm_kernel(
         order=(3,2,1,0)
     )
 
+
     # 精度对齐需求
     acc = tl.zeros((MR, NR), dtype=tl.int16)
 
     for k_block in range(N_block):
         # 加载 a 数据块: 原始形状 (1, 1, QK_8_0, MR)
         a_data_ptr = tl.advance(a_block_ptr, offsets = (0, k_block, 0, 0))
-        a_data = tl.load(a_data_ptr)  # shape: (1, 1, QK_8_0, MR)
-        a_data = tl.reshape(a_data, (QK_8_0, MR))  # reshape to (32, 12)
-        a_data = tl.trans(a_data)  # transpose to (MR, QK_8_0) = (12, 32)
+        a_data = tl.load(a_data_ptr).reshape(QK_8_0, MR)  # shape: (32, 12)
 
         # 加载 b 数据块: 原始形状 (1, 1, QK_8_0, NR)
         b_data_ptr = tl.advance(b_block_ptr, offsets = (0, k_block, 0, 0))
-        b_data = tl.load(b_data_ptr)  # shape: (1, 1, QK_8_0, NR)
-        b_data = tl.reshape(b_data, (QK_8_0, NR))  # reshape to (32, 32)
-        
+        b_data = tl.load(b_data_ptr).reshape(QK_8_0, NR)  # shape: (32, 32)
+
         # 矩阵乘法: (MR, K) @ (K, NR) = (MR, NR) = (12, 32)
         # 直接使用 int32 避免溢出
-        tmp_result = tl.dot(a_data, b_data, out_dtype=tl.int16)
+        tmp_result = tl.dot(a_data.T, b_data, out_dtype=tl.int16)
 
         acc += tmp_result
 
 
     # 写回结果: 需要将 (MR, NR) reshape 成 (1, 1, MR, NR) 以匹配 block_ptr
-    output_data = tl.reshape(acc, (1, 1, MR, NR))
+    output_data = tl.reshape(acc, (1, 1, MR, NR)).cast(tl.int32)
     output_ptr = tl.advance(output_block_ptr, offsets=(0, 0, 0, 0))
     tl.store(output_ptr, output_data)
 
@@ -112,7 +110,12 @@ def simple_test(M=48, N=512, K=32, verbose=True):
     torch.manual_seed(42)
     a_matrix = torch.randint(-10, 10, (M, K), dtype=torch.int8)
     b_matrix = torch.randint(-10, 10, (K, N), dtype=torch.int8)
+
+    a_matrix_para = a_matrix.reshape(M//MR, MR, K//QK_8_0, QK_8_0).permute(0,2,3,1).contiguous()
+    b_matrix_para = b_matrix.permute(1,0).reshape(N//NR, NR, K//QK_8_0, QK_8_0).permute(0,2,3,1).contiguous()
+
     output = torch.zeros((M, N), dtype=torch.int32)
+    output_para = output.reshape(M//MR, MR, N//NR, NR).permute(0,2,1,3).contiguous() # [M//MR, N//NR, MR, NR]
     
     # 计算参考结果 (使用 PyTorch)
     reference = torch.matmul(a_matrix.to(torch.int32), b_matrix.to(torch.int32))
@@ -120,15 +123,16 @@ def simple_test(M=48, N=512, K=32, verbose=True):
     # 执行 Triton kernel
     grid = (M // MR, N // NR)
     i8_i8_gemm_kernel[grid](
-        a_matrix_ptr=a_matrix,
-        b_matrix_ptr=b_matrix,
-        output_ptr=output,
+        a_matrix_ptr=a_matrix_para,
+        b_matrix_ptr=b_matrix_para,
+        output_ptr=output_para,
         M=M,
         N=N,
         K=K,
     )
     
     # 验证结果
+    output = output_para.permute(0,2,1,3).reshape(M, N).contiguous()
     max_diff = torch.max(torch.abs(output - reference)).item()
     allclose = torch.allclose(output, reference, atol=0)
     
@@ -180,7 +184,7 @@ def simple_benchmark(M=48, N=512, K=32, warmup=10, rep=100):
     torch.manual_seed(42)
     a_matrix = torch.randint(-128, 127, (M, K), dtype=torch.int8)
     b_matrix = torch.randint(-128, 127, (K, N), dtype=torch.int8)
-    output = torch.zeros((M, N), dtype=torch.int16)
+    output = torch.zeros((M, N), dtype=torch.int32)
     
     grid = (M // MR, N // NR)
     

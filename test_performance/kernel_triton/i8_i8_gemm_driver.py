@@ -11,7 +11,7 @@ i8_i8_gemm 性能测试驱动程序
 运行示例:
   TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python i8_i8_gemm_driver.py --shapes 48x512x32,96x1024x64 --csv-out results.csv --plot-out results.png
   TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python i8_i8_gemm_driver.py --sweep  # 使用默认的多组形状测试
-  TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python i8_i8_gemm_driver.py --m 48 --n 512 --k 32  # 单个形状测试
+  TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python i8_i8_gemm_driver.py --num-threads=1 --m 48 --n 512 --k 32  # 单个形状测试
 
 注意:
   - 形状约束: M % 12 == 0, N % 32 == 0, K % 32 == 0
@@ -99,10 +99,10 @@ QK_8_0 = 32
 # 机器峰值性能配置（默认值）
 DEFAULT_FREQ = 1.6  # GHz
 DEFAULT_VLEN = 256  # bits
-DEFAULT_DTYPE_WIDTH = 8  # int8
+DEFAULT_DTYPE_WIDTH = 16  # int16
 
 
-def calculate_peak_gops(freq: float, vlen: int, dtype_width: int = 8, threads: int = 1) -> float:
+def calculate_peak_gops(freq: float, vlen: int, dtype_width: int = 16, threads: int = 1) -> float:
     """计算理论峰值 GOPS (考虑线程数)
 
     Args:
@@ -161,12 +161,18 @@ def generate_test_data(M: int, N: int, K: int, seed: int = 42) -> Dict:
     # A: [M, K], B: [K, N]
     a_matrix = torch.randint(-128, 127, (M, K), dtype=torch.int8)
     b_matrix = torch.randint(-128, 127, (K, N), dtype=torch.int8)
-    output = torch.zeros((M, N), dtype=torch.int16)
-    
+    output = torch.zeros((M, N), dtype=torch.int32)
+
+    a_matrix_para = a_matrix.reshape(M//MR, MR, K//QK_8_0, QK_8_0).permute(0,2,3,1).contiguous()
+    b_matrix_para = b_matrix.permute(1,0).reshape(N//NR, NR, K//QK_8_0, QK_8_0).permute(0,2,3,1).contiguous()
+
+    output = torch.zeros((M, N), dtype=torch.int32)
+    output_para = output.reshape(M//MR, MR, N//NR, NR).permute(0,2,1,3).contiguous() # [M//MR, N//NR, MR, NR]
+
     return {
-        'a_matrix': a_matrix,
-        'b_matrix': b_matrix,
-        'output': output,
+        'a_matrix': a_matrix_para,
+        'b_matrix': b_matrix_para,
+        'output': output_para,
         'M': M,
         'N': N,
         'K': K,
@@ -183,7 +189,7 @@ def benchmark_single_shape(
     K: int,
     warmup_ms: int = 25,
     rep_ms: int = 100,
-    threads: int = None,
+    threads: int = 1,
     peak_gops: float = None,
     n_kernel_repeat: int = 10
 ) -> Dict:
@@ -214,6 +220,8 @@ def benchmark_single_shape(
     
     # 计算 grid 配置
     grid = (M // MR, N // NR)
+
+    # 根据
     
     # 定义执行函数
     def run_kernel():
@@ -306,6 +314,7 @@ def benchmark_shapes(
     num_threads: int = None,
     freq: float = None,
     vlen: int = None,
+    n_kernel_repeat: int = 10
 ) -> List[Dict]:
     """对多个矩阵形状进行性能测试
     
@@ -348,6 +357,8 @@ def benchmark_shapes(
             perf_str = f"{result['gops_median']:.2f} GOPS"
             if result.get('efficiency_median'):
                 perf_str += f" ({result['efficiency_median']:.2f}% eff.)"
+            if result.get('median_ms'):
+                perf_str += f", Median Time: {result['median_ms']:.4f} ms"
             print(f"  ✓ 完成: {perf_str}")
         except Exception as e:
             print(f"  ✗ 错误: {e}")
@@ -555,6 +566,13 @@ def main():
         type=str,
         help='性能图输出路径'
     )
+
+    parser.add_argument(
+        '--n-kernel-repeat',
+        type=int,
+        default=20,
+        help='kernel repeat nums to reduce jit launch overhead'
+    )
     
     args = parser.parse_args()
     
@@ -605,7 +623,8 @@ def main():
         rep_ms=args.rep,
         num_threads=effective_threads,
         freq=args.freq,
-        vlen=args.vlen
+        vlen=args.vlen,
+        n_kernel_repeat=args.n_kernel_repeat,
     )
     
     # 输出结果
