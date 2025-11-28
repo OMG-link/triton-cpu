@@ -221,8 +221,12 @@ def benchmark_single_shape(
     # 计算 grid 配置
     grid = (M // MR, N // NR)
 
-    # 根据
-    
+    # 根据测试数据大小动态选择 n_kernel_repeat
+    # 根据 峰值 GOPS 计算需要考虑重复次数，使得每launch 一次 kernel 最少能跑 10s
+    ops_per_call = 2 * M * N * K
+    if peak_gops:
+        n_kernel_repeat = max(n_kernel_repeat, int(peak_gops * 1e9 / ops_per_call))
+
     # 定义执行函数
     def run_kernel():
         i8_i8_gemm_kernel[grid](
@@ -248,7 +252,6 @@ def benchmark_single_shape(
     # 计算 GOPS
     # GEMM 的计算量: 2*M*N*K (乘法 + 加法)
     # 注意: 如果使用了 n_kernel_repeat,需要乘以重复次数来计算总计算量
-    ops_per_call = 2 * M * N * K
     total_ops = ops_per_call * n_kernel_repeat
     gops_median = total_ops / (median_ms * 1e6)  # GOPS
     gops_min = total_ops / (max_ms * 1e6)  # 最大时间对应最小GOPS

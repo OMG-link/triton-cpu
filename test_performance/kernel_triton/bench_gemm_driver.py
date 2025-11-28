@@ -20,7 +20,7 @@ TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kerne
 
 # 对比不同 n_kernel_repeat 值的影响
 TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --shapes 12x256x32 --kernels q40_q80 --n-kernel-repeat 1
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --shapes 12x256x32 --kernels q40_q80 --n-kernel-repeat 100  --num-threads 1 
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q4k_q8k --n-kernel-repeat 20  --num-threads 1 
 
 注意:
   - 可用的 kernel: q40_q80, q4k_q8k, iq4k_q8k
@@ -29,10 +29,10 @@ TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --shape
   - 使用 triton.testing.do_bench 进行精确的性能测试
   - warmup: 预热次数，rounds: 测试轮数
   - num-threads: CPU核心/线程数，用于多核理论峰值计算 (峰值 = 2 * VLEN/dtype_width * Freq * num_cores)
-  - n_kernel_repeat: 在单次 kernel 调用中重复执行的次数
-    * 减少 Python->C++ 调用开销和 OpenMP 线程池启动开销
-    * 提高小规模 kernel 的性能测量精度
-    * 建议值: 小型 kernel 用 10-100, 大型 kernel 用 1 即可
+  - n_kernel_repeat: 在单次 kernel 调用中重复执行的次数 
+    * 减少 Python->C++ 调用开销和 OpenMP 线程池启动开销 
+    * 提高小规模 kernel 的性能测量精度 
+    * 建议值: 小型 kernel 用 10-100, 大型 kernel 用 1 即可 
 """
 
 from __future__ import annotations
@@ -76,8 +76,8 @@ class KernelSpec:
     grid_fn: Callable
     param_builder: Callable
     constraints: Dict[str, int]
-    compute_dtype: str = 'int8'
-    dtype_width: int = 8
+    compute_dtype: str = 'int16'
+    dtype_width: int = 16  # 位宽
 
 # -----------------------
 # q40_q80 kernel 相关函数
@@ -241,8 +241,8 @@ KERNEL_SPECS = [
         grid_fn=q40_grid,
         param_builder=q40_param_builder,
         constraints={'M': 12, 'N': 32, 'K': 32},
-        compute_dtype='int8',
-        dtype_width=8
+        compute_dtype='int16',
+        dtype_width=16
     ),
     KernelSpec(
         name='q4k_q8k',
@@ -252,8 +252,8 @@ KERNEL_SPECS = [
         grid_fn=q4k_grid,
         param_builder=q4k_param_builder,
         constraints={'M': 12, 'N': 32, 'K': 256},
-        compute_dtype='int8',
-        dtype_width=8
+        compute_dtype='int16',
+        dtype_width=16
     ),
     KernelSpec(
         name='iq4k_q8k',
@@ -263,14 +263,14 @@ KERNEL_SPECS = [
         grid_fn=iq4k_grid,
         param_builder=iq4k_param_builder,
         constraints={'M': 12, 'N': 32, 'K': 256},
-        compute_dtype='int8',
-        dtype_width=8
+        compute_dtype='int16',
+        dtype_width=16
     )
 ]# -----------------------
 
 # 性能计算工具函数
 # -----------------------
-def calc_ops_per_second(ms: float, M: int, N: int, K: int, dtype_width: int) -> float:
+def calc_gops_per_second(ms: float, M: int, N: int, K: int, dtype_width: int) -> float:
     """
     计算 OPS (Operations Per Second)
     对于 GEMM: 总操作数 = 2 * M * N * K (每个输出元素需要 K 次乘加)
@@ -440,15 +440,20 @@ def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int,
         
         # 逐个测试并实时显示进度
         for idx, (M, K, N) in enumerate(valid_shapes, 1):
+            # 根据测试数据大小动态选择 n_kernel_repeat
+            # 根据 峰值 GOPS 计算需要考虑重复次数，使得每launch 一次 kernel 最少能跑 10s
+            ops_per_call = 2 * M * N * K
+            n_kernel_repeat = max(n_kernel_repeat, int(peak_gops * 1e9 / ops_per_call))
+            
             # 调用 benchmark 函数
             median_ms, min_ms, max_ms = run_single_benchmark(
                 spec, M, K, N, warmup, rounds, num_threads, n_kernel_repeat
             )
             
             # 计算性能指标
-            gops_med = calc_ops_per_second(median_ms, M, N, K, dtype_width)
-            gops_min = calc_ops_per_second(max_ms, M, N, K, dtype_width)
-            gops_max = calc_ops_per_second(min_ms, M, N, K, dtype_width)
+            gops_med = calc_gops_per_second(median_ms, M, N, K, dtype_width)
+            gops_min = calc_gops_per_second(max_ms, M, N, K, dtype_width)
+            gops_max = calc_gops_per_second(min_ms, M, N, K, dtype_width)
             
             util_med = (gops_med / peak_gops * 100.0) if peak_gops > 0 else 0.0
             util_min = (gops_min / peak_gops * 100.0) if peak_gops > 0 else 0.0
@@ -637,8 +642,8 @@ def main():
     parser = argparse.ArgumentParser(description='统一 GEMM Kernel 性能测试驱动')
     parser.add_argument('--shapes', type=str, default='', help='逗号分隔形状列表，例如 48x512x32,96x512x32')
     parser.add_argument('--kernels', type=str, default='', help='逗号分隔的 kernel 名称列表，例如 q40_q80,q4k_q8k。留空表示测试所有 kernel')
-    parser.add_argument('--warmup', type=int, default=3, help='预热次数')
-    parser.add_argument('--rounds', type=int, default=10, help='测试轮数')
+    parser.add_argument('--warmup', type=int, default=25, help='预热时间 ms')
+    parser.add_argument('--rounds', type=int, default=100, help='测试时间 ms')
     parser.add_argument('--num-threads', type=int, default=8, help='CPU核心/线程数，用于多核理论峰值计算和 torch 线程设置')
     parser.add_argument('--n-kernel-repeat', type=int, default=1, help='单次 kernel 调用中的重复执行次数，用于减少启动开销影响 (默认 1)')
     parser.add_argument('--freq', type=float, default=1.6, help='芯片频率 GHz (默认 1.6)')
