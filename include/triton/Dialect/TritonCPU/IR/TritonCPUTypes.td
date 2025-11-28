@@ -26,6 +26,8 @@ def TTC_TokenType : TTC_TypeDef<"Token", "token"> {
 
 def TTC_Vector :  VectorOfAnyRankOf<[TT_Float, TT_Int]>;
 
+def TTC_IntVector :  VectorOfAnyRankOf<[TT_Int]>;
+
 def TTC_Type : AnyTypeOf<[TT_Float, TT_Int, TTC_Vector]>;
 
 #endif

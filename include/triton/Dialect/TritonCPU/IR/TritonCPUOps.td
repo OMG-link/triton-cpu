@@ -235,4 +235,23 @@ def TTC_BrgemmExecute : TTC_Op<"brgemm_execute",
   );
 }
 
+def TTC_RGatherOp : TTC_Op<"rgather", [Pure,
+    DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "gather on register operation";
+  let description = [{
+    Gather elements from the input vector based on the provided indices.
+  }];
+
+  let arguments = (ins
+    TTC_Vector:$src,
+    TTC_IntVector:$indices
+  );
+  let results = (outs TTC_Vector:$result);
+
+  let assemblyFormat = [{
+    $src `[` $indices `]` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
 #endif

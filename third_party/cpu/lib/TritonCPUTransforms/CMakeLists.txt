@@ -7,6 +7,7 @@ add_triton_library(TritonCPUTransforms
     ConvertDotOp/ConvertDotOpToUkernelOps.cpp
     Canonicalize.cpp
     ConvertDotProduct.cpp
+    ConvertRGatherOp.cpp
     ConvertUnsupportedOps.cpp
     DecomposeFpConversions.cpp
     OptimizeMasks.cpp

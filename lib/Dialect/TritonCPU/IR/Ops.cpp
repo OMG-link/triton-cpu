@@ -37,4 +37,15 @@ DotOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   return success();
 }
 
+LogicalResult RGatherOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto elemTy = cast<VectorType>(operands[0].getType()).getElementType();
+  auto shape = cast<VectorType>(operands[1].getType()).getShape();
+  auto retTy = VectorType::get(shape, elemTy);
+  inferredReturnTypes.push_back(retTy);
+  return success();
+}
+
 } // namespace mlir::triton::cpu

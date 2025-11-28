@@ -91,7 +91,6 @@ def ConvertGatherOp : Pass<"triton-cpu-convert-gather-op", "mlir::ModuleOp"> {
                              "mlir::memref::MemRefDialect",
                              "mlir::vector::VectorDialect",
                              "mlir::triton::TritonDialect",
-                             "mlir::ub::UBDialect",
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 

@@ -147,6 +147,22 @@ def ConvertDotToRVV : Pass<"triton-cpu-convert-dot-to-rvv", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def ConvertRGatherOp : Pass<"triton-cpu-convert-rgather-op", "mlir::ModuleOp"> {
+    let summary = "Lower rgather op according to backends.";
+    let description = [{
+        If the target backend supports rgather instruction, this pass converts rgather
+        op to the target-specific rgather intrinsic. Otherwise, it lowers rgather op to
+        'vector.gather', which performs gather in memory.
+    }];
+
+    let constructor = "mlir::triton::cpu::createConvertRGatherOp()";
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::LLVM::LLVMDialect",
+                             "mlir::vector::VectorDialect",
+                             "mlir::triton::cpu::TritonCPUDialect",
+                             "mlir::ub::UBDialect"];
+}
+
 def ConvertDotOpToUkernelOps : Pass<"triton-cpu-convert-dot-to-ukernels", "mlir::ModuleOp"> {
     let summary = "Convert dot product op to ukernel ops.";
     let description = [{
