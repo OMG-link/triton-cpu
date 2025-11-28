@@ -1,0 +1,82 @@
+#include "triton/Tools/Sys/GetEnv.hpp"
+
+#include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+
+namespace mlir::triton::cpu {
+namespace rvv {
+
+// Get RVV VSCALE.
+//
+// VSCALE is a implement-defined value. Program can only know that value at
+// runtime. In triton, we use JIT, so we may be possible to get VSCALE when
+// compiling. We support three ways to specific VSCALE using environment
+// variable RVV_VLEN:
+//
+// 1) When RVV_VLEN is an integer, compiler uses RVV_VLEN/64 as VSCALE. (If it
+// is a valid VLEN: RVV_VLEN is power of 2 && RVV_VLEN >= 64)
+// 2) When RVV_VLEN is "dynamic", compiler uses a runtime call @vector.vscale to
+// get VSCALE.
+// 3) When RVV_VLEN is "local", compiler executes assembly `csrr %0, vlenb` to
+// get VSCALE.
+//
+// If RVV_VLEN is undefined or invalid(including RVV_VLEN is "local" but the
+// compiler is running on a machine that doesn't support RISCV-V-Extension),
+// compiler will fallback and tries the following ways one by one:
+// - Executes assembly `csrr %0, vlenb` to get VSCALE if possible.
+// - Return a runtime call @vector.vscale.
+
+static inline int64_t tryReadVlenb() {
+#ifdef __riscv_vector
+  int64_t vlenb;
+  asm volatile("csrr %0, vlenb" : "=r"(vlenb));
+  return vlenb;
+#else
+  return -1;
+#endif
+}
+
+static inline int64_t getVlen() {
+  std::string RVV_VLEN = mlir::triton::tools::getStrEnv("RVV_VLEN");
+  // if RVV_VLEN is defined
+  if (!RVV_VLEN.empty()) {
+    if (RVV_VLEN == "dynamic") {
+      return -1;
+    } else if (RVV_VLEN == "local") {
+      int vlenb = tryReadVlenb();
+      if (vlenb > 0) {
+        return vlenb * 8;
+      } else {
+        return -1;
+      }
+    } else {
+      char *end;
+      long vlen = strtol(RVV_VLEN.c_str(), &end, 10);
+      if (*end == '\0') {
+        if (vlen >= 64 && (vlen & (vlen - 1)) == 0) {
+          return vlen;
+        }
+      }
+    }
+  }
+  // fallback
+  int vlenb = tryReadVlenb();
+  if (vlenb > 0) {
+    return vlenb * 8;
+  }
+  return -1;
+}
+
+// Returns: VSCALE of type 'index'
+static inline Value getVscale(Location loc, PatternRewriter &rewriter) {
+  int vlen = getVlen();
+  if (vlen > 0) {
+    return rewriter.create<arith::ConstantIndexOp>(loc, vlen / 64);
+  } else {
+    return rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+  }
+}
+
+} // namespace rvv
+} // namespace mlir::triton::cpu

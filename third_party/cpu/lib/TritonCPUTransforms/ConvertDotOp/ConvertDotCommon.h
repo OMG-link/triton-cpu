@@ -1,3 +1,4 @@
+#include "../Utils.h"
 #include "cpu/include/TritonCPUTransforms/OptCommon.h"
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
