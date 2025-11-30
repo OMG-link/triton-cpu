@@ -12,7 +12,7 @@ import triton.language as tl
 def i8_i8_gemm_kernel(
     a_matrix_ptr,         # 输入 a 矩阵指针, int8
     b_matrix_ptr,         # 输入 b 矩阵指针, int8
-    output_ptr,           # 输出指针，intel2
+    output_ptr,           # 输出指针，int32
     M,                    # 矩阵行数
     N,                    # 矩阵列数
     K,                    # 矩阵公共维度，这里表示元素数量而不是字节数
@@ -77,7 +77,6 @@ def i8_i8_gemm_kernel(
     output_data = tl.reshape(acc, (1, 1, MR, NR)).cast(tl.int32)
     output_ptr = tl.advance(output_block_ptr, offsets=(0, 0, 0, 0))
     tl.store(output_ptr, output_data)
-
 
 # ============================================================================
 # 简单驱动程序 - 用于快速测试和调试

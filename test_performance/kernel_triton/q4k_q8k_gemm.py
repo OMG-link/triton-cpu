@@ -19,6 +19,7 @@ import numpy as np
 import triton
 import triton.language as tl
 import triton.testing as tt
+import time
 
 MR = tl.constexpr(12)
 NR = tl.constexpr(32) # 如何获取CPU的VLEN作为NR?
@@ -86,6 +87,7 @@ def quantize_q8_K(a: torch.Tensor):
 
     # bring outputs to CPU (kernel's block_ptr expects host tensors)
     return a_q, a_bsums, a_d
+
 def quantize_q4_K(b: torch.Tensor):
     """
     非对称 q4_K 实现（解码为:  orig ≈ d * (s_q * q) - dmin * m_q）
@@ -307,9 +309,9 @@ def q4k_q8k_matmul_kernel(
             b_scales = tl.load(b_scales_ptr).reshape((1, NR))
             sum_block += tl.cast(suml, tl.int32) * tl.cast(b_scales, tl.int32)
             # i_subb++
-            a_q_ptr = tl.advance(a_q_ptr, (0, 0, i_subb, 0, 0)) 
-            b_q_ptr = tl.advance(b_q_ptr, (0, 0, i_subb, 0, 0)) 
-            b_scales_ptr = tl.advance(b_scales_ptr, (0, 0, i_subb, 0))
+            a_q_ptr = tl.advance(a_q_ptr, (0, 0, 1, 0, 0)) 
+            b_q_ptr = tl.advance(b_q_ptr, (0, 0, 1, 0, 0)) 
+            b_scales_ptr = tl.advance(b_scales_ptr, (0, 0, 1, 0))
 
         a_d = tl.load(a_d_ptr).reshape((1, MR))
         b_d = tl.cast(tl.load(b_d_ptr).reshape((1, NR)), tl.float32)
@@ -342,7 +344,7 @@ def gflo_ps_from_ms(ms, M, N, K):
     # total flops assumed 2*M*N*K
     return 2.0 * M * N * K * 1e-9 / (ms * 1e-3)
 
-def bench_kernel_only_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
+def bench_kernel_only_case(M, K, N, rep_ms=100, warmup_ms=10, num_threads=None, n_kernel_repeat=1):
     """
     Pre-quantize inputs once, then benchmark only the Triton kernel invocation.
     Returns timing only - performance calculation moved to driver.
@@ -380,15 +382,16 @@ def bench_kernel_only_case(M, K, N, rep_ms=200, warmup_ms=50, num_threads=None):
 # Integrate with argparse: add a --bench-kernel flag
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run kernel-only benchmarks.")
-    parser.add_argument('--rep-ms', type=int, default=200, help='do_bench rep time in ms')
-    parser.add_argument('--warmup-ms', type=int, default=50, help='do_bench warmup time in ms')
-    parser.add_argument('--num-threads', type=int, default=8, help='torch.set_num_threads() (None = unchanged)')
+    parser.add_argument('--rep-ms', type=int, default=100, help='do_bench rep time in ms')
+    parser.add_argument('--warmup-ms', type=int, default=10, help='do_bench warmup time in ms')
+    parser.add_argument('--num-threads', type=int, default=1, help='torch.set_num_threads() (None = unchanged)')
     parser.add_argument('--shapes', type=str, default='', help='额外形状, 逗号分隔, 例如 48x512x32,96x256x32')
+    parser.add_argument('--n-kernel-repeat', type=int, default=30, help='每次调用内核时重复的次数')
     args, unknown = parser.parse_known_args()
 
     # run the original correctness tests (keeps previous behavior)
     tests = [
-        (48, 512, 32),
+        (1200, 2048, 2048),
     ]
     
     if args.shapes:
@@ -410,10 +413,12 @@ if __name__ == '__main__':
             rep_ms=args.rep_ms,
             warmup_ms=args.warmup_ms,
             num_threads=args.num_threads,
+            n_kernel_repeat=args.n_kernel_repeat
         )
+        
         # 使用默认芯片参数计算性能（独立运行时）
         freq, vlen = 1.6, 256
-        peak_flops = 2.0 * vlen / 8 * freq
+        peak_flops = 2.0 * vlen / 16 * freq
         gflops = gflo_ps_from_ms(mean_ms, M, N, K)
         gflops_max = gflo_ps_from_ms(min_ms, M, N, K)
         gflops_min = gflo_ps_from_ms(max_ms, M, N, K)

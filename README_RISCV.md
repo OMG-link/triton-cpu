@@ -13,6 +13,20 @@ LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
 LLVM_SYSPATH=$LLVM_BUILD_DIR \
 MAX_JOBS=1 \
 SETUPTOOLS_ENABLE_FEATURES="legacy-editable" \
+pip install -e python --no-build-isolation -vvv 
+```
+
+baseline-test: change the compiler 
+```
+TRITON_BUILD_WITH_CLANG_LLD=true \
+TRITON_OFFLINE_BUILD=1 \
+JSON_SYSPATH="/home/shenrh/.triton/json" \
+LLVM_BUILD_DIR=/opt/llvm/llvm21-raw \
+LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
+LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
+LLVM_SYSPATH=$LLVM_BUILD_DIR \
+MAX_JOBS=7 \
+SETUPTOOLS_ENABLE_FEATURES="legacy-editable" \
 pip install -e python --no-build-isolation -vvv
 ```
 

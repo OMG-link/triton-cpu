@@ -460,7 +460,7 @@ def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int,
             util_max = (gops_max / peak_gops * 100.0) if peak_gops > 0 else 0.0
             
             # 实时输出进度
-            print(f"  [{idx:3d}/{len(valid_shapes)}] M={M:4d} K={K:5d} N={N:5d} | "
+            print(f"  [{idx:3d}/{len(valid_shapes)}] M={M:4d} K={K:5d} N={N:5d} n_kernel_repeat={n_kernel_repeat} | "
                   f"时间: {median_ms:7.3f}ms | "
                   f"性能: {gops_med:6.2f} GOPS@{compute_dtype} ({util_med:5.1f}%)")
             

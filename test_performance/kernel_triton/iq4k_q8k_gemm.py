@@ -4,6 +4,7 @@ import numpy as np
 
 import triton
 import triton.language as tl
+import time
 
 # typedef struct {
 #     ggml_half d;  
@@ -265,16 +266,26 @@ def prepare_random_iq4k_q8k_inputs(M, K, N):
 # debug 测试接口
 if __name__ == "__main__":
     # 简单的功能测试
-    M = 12
-    N = 32
-    K = 256
+    M = 1200
+    N = 2048
+    K = 2048
 
     iq4k_matrix, iq4k_d, iq4k_extra, iq4k_scale_l, iq4k_scale_h, q8k_matrix, q8k_d, output = prepare_random_iq4k_q8k_inputs(M, K, N)
 
     grid = (M//MR, N//NR)
+
+    t0 = time.perf_counter()
     iq4k_q8k_matmul_kernel[grid](
         iq4k_matrix, iq4k_d, iq4k_extra, iq4k_scale_l, iq4k_scale_h,
-        q8k_matrix, q8k_d, output, M, N, K
+        q8k_matrix, q8k_d, output, M, N, K, num_threads=1, n_kernel_repeat=30
     )
-
+    t1 = time.perf_counter()
+    msec = (t1 - t0) / 30
+    print(f"Kernel execution time: {msec:.4f} ms")
+    print(f"GFLOPS: {_gflo_ps_from_ms(msec, M, N, K):.4f}")
+    freq, vlen = 1.6, 256
+    peak_flops = 2.0 * vlen / 16 * freq  # GOPS
+    print(f"Peak GFLOPS: {peak_flops:.4f}")
+    print(f"Utilization: {_gflo_ps_from_ms(msec, M, N, K) / peak_flops * 100:.2f} %")
+    
     print("Output:", output)

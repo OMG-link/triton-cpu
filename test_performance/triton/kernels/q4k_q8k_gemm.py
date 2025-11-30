@@ -356,7 +356,8 @@ class Q4K_Q8K_GEMM(GEMMKernelBase):
             params['b_d_ptr'], params['b_dmin_ptr'],
             params['c'],
             m, n, k,
-            MR=self.MR, NR=self.NR
+            MR=self.MR, NR=self.NR,
+            num_threads=1,
         )
         t1 = time.perf_counter()
 
