@@ -3,6 +3,8 @@ import time
 import torch
 import csv
 
+import k1_cache_fix_tool
+
 from kernels.inner import InnerGEMM
 from kernels.outer import OuterGEMM
 from kernels.q4k_q8k_gemm import Q4K_Q8K_GEMM
@@ -32,6 +34,22 @@ def performance_test(kernel, test_shapes):
     with open(csv_file, "w", newline="") as f:
         writer = csv.writer(f)
         for (m, k, n) in test_shapes:
+            try:
+                k1_cache_fix_tool.fix_cache_if_corrupted()
+            except RuntimeError as e:
+                global IGNORE_CACHE_WARNING
+                if 'IGNORE_CACHE_WARNING' not in globals():
+                    IGNORE_CACHE_WARNING = False
+                print(f"Cache may not be in good state: {e}")
+                if not IGNORE_CACHE_WARNING:
+                    print("Do you want to continue? (y/n): ", end="")
+                    choice = input().strip().lower()
+                    if choice != 'y':
+                        print("Aborting performance test due to cache state.")
+                        sys.exit(1)
+                    else:
+                        IGNORE_CACHE_WARNING = True
+
             repeats = max(1, int(2**36 / (m * k * n)))
             params = kernel.prepare(m, k, n)
             kernel.run(params, repeats=1) # Warmup
