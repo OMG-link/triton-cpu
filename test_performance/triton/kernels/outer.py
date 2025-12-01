@@ -83,15 +83,8 @@ class OuterGEMM(GEMMKernelBase):
         MR = self.MR
         NR = self.NR
 
-        a_out = torch.empty((M // MR, K, MR), dtype=a.dtype, device=a.device)
-        for i in range(M // MR):
-            block = a[i * MR:(i + 1) * MR, :].contiguous().T  # (K,MR)
-            a_out[i, :, :] = block
-
-        b_out = torch.empty((N // NR, K, NR), dtype=b.dtype, device=b.device)
-        for j in range(N // NR):
-            block = b[:, j * NR:(j + 1) * NR].contiguous()  # (K,NR)
-            b_out[j, :, :] = block
+        a_out = a.reshape((M // MR, MR, K)).permute((0, 2, 1))
+        b_out = b.reshape((K, N // NR, NR)).permute((1, 0, 2))
 
         return a_out.contiguous(), b_out.contiguous()
 
