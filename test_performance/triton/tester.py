@@ -74,23 +74,28 @@ KERNELS = [
         "kernel": InnerGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=4),
         "correctness": ["correctness"],
         "performance": ["normal_1"],
-    }, {
+    },
+    {
         "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=32),
         "correctness": ["correctness"],
         "performance": ["normal_1"],
-    }, {
+    },
+    {
         "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=8, NR=32),
         "correctness": ["correctness"],
         "performance": ["normal_1"],
-    }, {
+    },
+    {
         "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=16, NR=16),
         "correctness": ["correctness"],
         "performance": ["normal_1"],
-    }, {
+    },
+    {
         "kernel": Q4K_Q8K_GEMM(MR=4, NR=32),
         "correctness": ["correctness"],
         "performance": ["q4k_q8k_1"],
-    }, {
+    },
+    {
         "kernel": Q4K_Q8K_GEMM(MR=12, NR=32),
         "correctness": ["correctness"],
         "performance": ["q4k_q8k_2"],
