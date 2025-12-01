@@ -133,7 +133,7 @@ class OuterGEMM(GEMMKernelBase):
         MR, NR, KC = params['MR'], params['NR'], params['KC']
         TL_OUT_DTYPE = params['tl_out_dtype']
 
-        grid = (cdiv(M, MR), cdiv(N, NR), repeats)
+        grid = (cdiv(M, MR), cdiv(N, NR))
 
         t0 = time.perf_counter()
         matmul_outer_kernel[grid](
@@ -141,6 +141,7 @@ class OuterGEMM(GEMMKernelBase):
             M=M, K=K, N=N,
             MR=MR, NR=NR, KC=KC,
             out_dtype=TL_OUT_DTYPE,
+            n_kernel_repeat=repeats,
         )
         t1 = time.perf_counter()
         return (t1 - t0) / repeats

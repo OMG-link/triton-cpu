@@ -347,7 +347,7 @@ class Q4K_Q8K_GEMM(GEMMKernelBase):
 
     def run(self, params, repeats=1):
         m, n, k = params['M'], params['N'], params['K']
-        grid = (cdiv(m, self.MR), cdiv(n, self.NR), repeats)
+        grid = (cdiv(m, self.MR), cdiv(n, self.NR))
 
         t0 = time.perf_counter()
         matmul_kernel[grid](
@@ -357,7 +357,7 @@ class Q4K_Q8K_GEMM(GEMMKernelBase):
             params['c'],
             m, n, k,
             MR=self.MR, NR=self.NR,
-            num_threads=1,
+            n_kernel_repeat=repeats,
         )
         t1 = time.perf_counter()
 
