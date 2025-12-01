@@ -53,7 +53,9 @@ def performance_test(kernel, test_shapes):
 
             repeats = max(1, int(2**36 / (m * k * n)))
             params = kernel.prepare(m, k, n)
-            kernel.run(params, repeats=1) # Warmup
+            # Warmup (repeats must be exacly 'repeats' because this is part of hash key of kernel cache)
+            kernel.run(params, repeats=repeats)
+            # Measure
             elapsed = kernel.run(params, repeats=repeats)
             exp_cycles = kernel.expected_cycles(m, k, n)
             perf_ratio = elapsed * 1.6e9 / exp_cycles
