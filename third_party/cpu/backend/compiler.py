@@ -122,7 +122,6 @@ class CPUBackend(BaseBackend):
         self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
         self.cpu_name = llvm.get_cpu_name()
         self.cpu_features = llvm.get_cpu_features()
-        print(f"Detected CPU: arch={self.cpu_arch}, name={self.cpu_name}, features={self.cpu_features}")
         
         if 'amx-tile' in self.cpu_features:
             if not cpu.enable_amx():
