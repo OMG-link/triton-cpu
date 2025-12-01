@@ -739,12 +739,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
 
-        # These aregument are used in C++ glue code and will not affect compile result of kernels.
-        # Remove them from kernel hash to avoid unnecessary compiling.
-        # FIXME: Maybe we should write such logic somewhere else. But I did not find a proper place for it.
-        del options['num_threads']
-        del options['n_kernel_repeat']
-
         # add a cache field to the kernel specializations for kernel specific
         # pass pipelines
         if knobs.runtime.add_stages_inspection_hook is not None:
