@@ -11,6 +11,7 @@ add_triton_library(TritonCPUTransforms
     ConvertUnsupportedOps.cpp
     DecomposeFpConversions.cpp
     OptimizeMasks.cpp
+    Utils.cpp
 
     DEPENDS
     TritonCPUTransformsPassIncGen

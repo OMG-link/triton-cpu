@@ -78,5 +78,39 @@ static inline Value getVscale(Location loc, PatternRewriter &rewriter) {
   }
 }
 
+static inline int64_t getBaseVlmax(Type elemTy) {
+  int elemBits = elemTy.getIntOrFloatBitWidth();
+  return 64 / elemBits;
+}
+
+static inline Value getVlmax(Location loc, PatternRewriter &rewriter,
+                             Type elemTy) {
+  Value vscale = getVscale(loc, rewriter);
+  int64_t baseVlmax = getBaseVlmax(elemTy);
+  Value baseVlmax_cIndex =
+      rewriter.create<arith::ConstantIndexOp>(loc, baseVlmax);
+  Value vlmax =
+      rewriter.createOrFold<arith::MulIOp>(loc, vscale, baseVlmax_cIndex);
+  return vlmax;
+}
+
+namespace intrinsic {
+
+Value createLoad(Location loc, PatternRewriter &rewriter, VectorType resTy,
+                 Value basePtr, Value vl);
+void createStoreMasked(Location loc, PatternRewriter &rewriter, Value basePtr,
+                       Value val, Value mask, Value vl);
+Value createRgather(Location loc, PatternRewriter &rewriter, VectorType resTy,
+                    Value table, Value indices, Value vl);
+
+} // namespace intrinsic
+
 } // namespace rvv
+
+Value createBroadcast(Location loc, PatternRewriter &rewriter,
+                      VectorType vectorTy, Value scalar);
+
+Value createExtuiOrTrunc(Location loc, PatternRewriter &rewriter, Type targetTy,
+                         Value val);
+
 } // namespace mlir::triton::cpu
