@@ -56,7 +56,8 @@ LogicalResult RGatherOp::verify() {
   if (srcTy.getRank() != 1) {
     return emitOpError("rgather can only gather data at one dimension");
   }
-  if (indicesTy.getShape() != resTy.getShape()) {
+  if (indicesTy.getShape() != resTy.getShape() ||
+      indicesTy.getScalableDims() != resTy.getScalableDims()) {
     return emitOpError("indices and output shapes must match");
   }
   if (srcTy.getElementType() != resTy.getElementType()) {
