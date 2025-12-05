@@ -30,6 +30,9 @@ Value createRgather(Location loc, PatternRewriter &rewriter, VectorType resTy,
                     Value table, Value indices, Value vl) {
   VectorType tableTy = cast<VectorType>(table.getType());
   VectorType indicesTy = cast<VectorType>(indices.getType());
+  // LLVM IR intrinsic requires all operands has the same number of elements.
+  assert(resTy.getNumElements() == tableTy.getNumElements() &&
+         resTy.getNumElements() == indicesTy.getNumElements());
   if (tableTy.getElementTypeBitWidth() == indicesTy.getElementTypeBitWidth() &&
       tableTy.getNumElements() == indicesTy.getNumElements()) {
     StringAttr intrinsicName = rewriter.getStringAttr("llvm.riscv.vrgather.vv");

@@ -67,7 +67,45 @@ LogicalResult convertToVectorGather(RGatherOp op, PatternRewriter &rewriter) {
   return success();
 }
 
+static inline int64_t nextPowerOf2(int64_t x) {
+  if (x <= 1)
+    return 1;
+  return 1ll << (64 - __builtin_clzll(x - 1));
+}
+
+static inline Value extendVector(Location loc, PatternRewriter &rewriter,
+                                 Value src, int64_t dstSize) {
+  VectorType srcTy = cast<VectorType>(src.getType());
+  assert(srcTy.getRank() == 1 && srcTy.isScalable() == false);
+  int64_t srcSize = srcTy.getDimSize(0);
+  assert(srcSize <= dstSize);
+  if (srcSize == dstSize)
+    return src;
+  VectorType dstTy =
+      VectorType::get({dstSize}, srcTy.getElementType(), {false});
+  Value background = rewriter.create<ub::PoisonOp>(loc, dstTy);
+  return rewriter.create<vector::InsertStridedSliceOp>(
+      loc, src, background, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
+}
+
+static inline Value truncVector(Location loc, PatternRewriter &rewriter,
+                                Value src, int64_t dstSize) {
+  VectorType srcTy = cast<VectorType>(src.getType());
+  assert(srcTy.getRank() == 1 && srcTy.isScalable() == false);
+  int64_t srcSize = srcTy.getDimSize(0);
+  assert(srcSize >= dstSize);
+  if (srcSize == dstSize)
+    return src;
+  VectorType dstTy =
+      VectorType::get({dstSize}, srcTy.getElementType(), {false});
+  return rewriter.create<vector::ExtractStridedSliceOp>(
+      loc, src, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{dstSize},
+      ArrayRef<int64_t>{1});
+}
+
 LogicalResult convertToRvvIntrinsic(RGatherOp op, PatternRewriter &rewriter) {
+  LDBG("Attempt to lower with RVV intrinsic: " << op);
+
   Location loc = op.getLoc();
   Value table = op.getSrc();
   Value indices = op.getIndices();
@@ -76,6 +114,11 @@ LogicalResult convertToRvvIntrinsic(RGatherOp op, PatternRewriter &rewriter) {
   VectorType indicesTy = cast<VectorType>(indices.getType());
   VectorType resultTy = cast<VectorType>(op.getResult().getType());
 
+  int64_t indicesSize = indicesTy.getDimSize(0);
+  int64_t tableSize = tableTy.getDimSize(0);
+  // LLVM IR intrinsic requires indicesSize and tableSize to be the same
+  int64_t intrinsicSize = nextPowerOf2(std::max(indicesSize, tableSize));
+
   /// Pre-check
   // By definition of vrgather, tableTy must be 1-D vector.
   // We only need to check indices type.
@@ -83,165 +126,44 @@ LogicalResult convertToRvvIntrinsic(RGatherOp op, PatternRewriter &rewriter) {
     LDBG("  RVV intrinsic lowering failed: indices must be 1-D vector.");
     return failure();
   }
-
-  /// Store vectors to memory
-  // We need to call RVV intrinsic later, which requires scalable vector.
-  // To cast fixed vector to scalable vector, we need transition via memory.
-  Value tablePtr;
-  {
-    MemRefType tableMemRefTy =
-        MemRefType::get(tableTy.getShape(), tableTy.getElementType());
-    Value tableMemRef = rewriter.create<memref::AllocaOp>(loc, tableMemRefTy);
-    auto transferWriteIndices = SmallVector<Value>(
-        tableTy.getRank(), rewriter.create<arith::ConstantIndexOp>(loc, 0));
-    rewriter.create<vector::TransferWriteOp>(loc, table, tableMemRef,
-                                             transferWriteIndices);
-    Value tablePtr_index =
-        rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc,
-                                                                tableMemRef);
-    Value tablePtr_i64 = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI64Type(), tablePtr_index);
-    tablePtr = rewriter.create<LLVM::IntToPtrOp>(
-        loc, LLVM::LLVMPointerType::get(rewriter.getContext()), tablePtr_i64);
+  // Triton frontend will not produce scalable inputs.
+  // Bail out when seeing scalable vectors for simplicity.
+  if (tableTy.isScalable() || indicesTy.isScalable() || resultTy.isScalable()) {
+    LDBG(
+        "  RVV intrinsic lowering failed: scalable vectors are not supported.");
+    return failure();
   }
-  Value indicesPtr;
-  {
-    MemRefType indicesMemRefTy =
-        MemRefType::get(indicesTy.getShape(), indicesTy.getElementType());
-    Value indicesMemRef =
-        rewriter.create<memref::AllocaOp>(loc, indicesMemRefTy);
-    auto transferWriteIndices = SmallVector<Value>(
-        indicesTy.getRank(), rewriter.create<arith::ConstantIndexOp>(loc, 0));
-    rewriter.create<vector::TransferWriteOp>(loc, indices, indicesMemRef,
-                                             transferWriteIndices);
-    Value indicesPtr_index =
-        rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc,
-                                                                indicesMemRef);
-    Value indicesPtr_i64 = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI64Type(), indicesPtr_index);
-    indicesPtr = rewriter.create<LLVM::IntToPtrOp>(
-        loc, LLVM::LLVMPointerType::get(rewriter.getContext()), indicesPtr_i64);
+  // If the indices or result cannot be held with 8 VREGs, bail out.
+  int64_t vlen = rvv::getVlen();
+  if (vlen < 0) {
+    vlen = 64;
   }
-  Value resultPtr, resultMemRef;
-  {
-    MemRefType resultMemRefTy =
-        MemRefType::get(resultTy.getShape(), resultTy.getElementType());
-    resultMemRef = rewriter.create<memref::AllocaOp>(loc, resultMemRefTy);
-    Value resultPtr_index =
-        rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc,
-                                                                resultMemRef);
-    Value resultPtr_i64 = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI64Type(), resultPtr_index);
-    resultPtr = rewriter.create<LLVM::IntToPtrOp>(
-        loc, LLVM::LLVMPointerType::get(rewriter.getContext()), resultPtr_i64);
+  if (intrinsicSize * indicesTy.getElementTypeBitWidth() > vlen * 8) {
+    LDBG("  RVV intrinsic lowering failed: indices needs more than 8 VREGs.");
+    return failure();
+  }
+  if (intrinsicSize * resultTy.getElementTypeBitWidth() > vlen * 8) {
+    LDBG("  RVV intrinsic lowering failed: result needs more than 8 VREGs.");
+    return failure();
   }
 
-  /// Create loops to iterate over table chunk and indices chunk.
-  // Currently, we only supprt M1 vrgather.
-  int64_t baseVlmax = rvv::getBaseVlmax(tableTy.getElementType());
-  Value vlmax = rewriter.createOrFold<arith::MulIOp>(
-      loc, rewriter.create<arith::ConstantIndexOp>(loc, baseVlmax),
-      rvv::getVscale(loc, rewriter));
-  Value vlmax_i64 =
-      rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), vlmax);
-  Value tableNumElements =
-      rewriter.create<arith::ConstantIndexOp>(loc, tableTy.getNumElements());
-  if (tableTy.isScalable()) {
-    tableNumElements = rewriter.createOrFold<arith::MulIOp>(
-        loc, tableNumElements, rvv::getVscale(loc, rewriter));
-  }
-  Value indicesNumElements =
-      rewriter.create<arith::ConstantIndexOp>(loc, indicesTy.getNumElements());
-  if (indicesTy.isScalable()) {
-    indicesNumElements = rewriter.createOrFold<arith::MulIOp>(
-        loc, indicesNumElements, rvv::getVscale(loc, rewriter));
-  }
-  VectorType subTableTy =
-      VectorType::get({baseVlmax}, tableTy.getElementType(), {true});
-  VectorType subIndicesTy =
-      VectorType::get({baseVlmax}, indicesTy.getElementType(), {true});
-  VectorType subResultTy =
-      VectorType::get({baseVlmax}, resultTy.getElementType(), {true});
-  auto forIndicesOp = rewriter.create<scf::ForOp>(
-      loc, rewriter.create<arith::ConstantIndexOp>(loc, 0), indicesNumElements,
-      vlmax);
-  {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(forIndicesOp.getBody());
-    Value indicesOffset = forIndicesOp.getInductionVar();
-    Value indicesOffset_i64 = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI64Type(), indicesOffset);
-    Value indicesLeft = rewriter.createOrFold<arith::SubIOp>(
-        loc, indicesNumElements, indicesOffset);
-    Value indicesVl =
-        rewriter.createOrFold<arith::MinUIOp>(loc, vlmax, indicesLeft);
-    Value indicesVl_i64 = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI64Type(), indicesVl);
+  /// Prepare arguments for intrinsic
+  // Extend vectors to intrinsic size
+  table = extendVector(loc, rewriter, table, intrinsicSize);
+  indices = extendVector(loc, rewriter, indices, intrinsicSize);
+  // 'vl' limits the number of indices to be queried
+  Value vl = rewriter.create<arith::ConstantIntOp>(loc, indicesSize,
+                                                   rewriter.getI64Type());
 
-    Value subIndicesPtr = rewriter.createOrFold<LLVM::GEPOp>(
-        loc, LLVM::LLVMPointerType::get(rewriter.getContext()),
-        subIndicesTy.getElementType(), indicesPtr, indicesOffset_i64);
-    Value subIndices = rvv::intrinsic::createLoad(loc, rewriter, subIndicesTy,
-                                                  subIndicesPtr, indicesVl_i64);
-    Value vlmax_v = createBroadcast(
-        loc, rewriter, subIndicesTy,
-        createExtuiOrTrunc(loc, rewriter, subIndicesTy.getElementType(),
-                           vlmax_i64));
-    Value subIndicesGroupId =
-        rewriter.createOrFold<arith::DivUIOp>(loc, subIndices, vlmax_v);
-    Value subIndicesRegId =
-        rewriter.createOrFold<arith::RemUIOp>(loc, subIndices, vlmax_v);
+  /// Create intrinsic
+  VectorType intrinsicResultTy =
+      VectorType::get({intrinsicSize}, resultTy.getElementType(), {false});
+  Value rgatherIntrinsic = rvv::intrinsic::createRgather(
+      loc, rewriter, intrinsicResultTy, table, indices, vl);
+  Value result = truncVector(loc, rewriter, rgatherIntrinsic, indicesSize);
+  rewriter.replaceOp(op, result);
 
-    auto forTableOp = rewriter.create<scf::ForOp>(
-        loc, rewriter.create<arith::ConstantIndexOp>(loc, 0), tableNumElements,
-        vlmax);
-    {
-      OpBuilder::InsertionGuard guard2(rewriter);
-      rewriter.setInsertionPointToStart(forTableOp.getBody());
-      Value tableOffset = forTableOp.getInductionVar();
-      Value tableOffset_i64 = rewriter.create<arith::IndexCastOp>(
-          loc, rewriter.getI64Type(), tableOffset);
-      Value tableLeft = rewriter.createOrFold<arith::SubIOp>(
-          loc, tableNumElements, tableOffset);
-      Value tableVl =
-          rewriter.createOrFold<arith::MinUIOp>(loc, vlmax, tableLeft);
-      Value tableVl_i64 = rewriter.create<arith::IndexCastOp>(
-          loc, rewriter.getI64Type(), tableVl);
-
-      Value tableGroupId =
-          rewriter.createOrFold<arith::DivUIOp>(loc, tableOffset, vlmax);
-      Value tableGroupId_i64 = rewriter.create<arith::IndexCastOp>(
-          loc, rewriter.getI64Type(), tableGroupId);
-      Value mask = rewriter.createOrFold<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::eq, subIndicesGroupId,
-          createBroadcast(loc, rewriter, subIndicesTy,
-                          createExtuiOrTrunc(loc, rewriter,
-                                             subIndicesTy.getElementType(),
-                                             tableGroupId_i64)));
-
-      Value subTablePtr = rewriter.createOrFold<LLVM::GEPOp>(
-          loc, LLVM::LLVMPointerType::get(rewriter.getContext()),
-          subTableTy.getElementType(), tablePtr, tableOffset_i64);
-      Value subTable = rvv::intrinsic::createLoad(loc, rewriter, subTableTy,
-                                                  subTablePtr, tableVl_i64);
-
-      Value subResult = rvv::intrinsic::createRgather(
-          loc, rewriter, subResultTy, subTable, subIndicesRegId, indicesVl_i64);
-      Value subResultPtr = rewriter.createOrFold<LLVM::GEPOp>(
-          loc, LLVM::LLVMPointerType::get(rewriter.getContext()),
-          subResultTy.getElementType(), resultPtr, indicesOffset_i64);
-      rvv::intrinsic::createStoreMasked(loc, rewriter, subResult, subResultPtr,
-                                        mask, indicesVl_i64);
-    }
-  }
-
-  /// Load result from memory
-  Value finalResult = rewriter.create<vector::TransferReadOp>(
-      loc, resultTy, resultMemRef,
-      SmallVector<Value>(resultTy.getRank(),
-                         rewriter.create<arith::ConstantIndexOp>(loc, 0)));
-  rewriter.replaceOp(op, finalResult);
-
+  LDBG("  RVV intrinsic lowering succeed.");
   return success();
 }
 
