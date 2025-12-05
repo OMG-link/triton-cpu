@@ -9,9 +9,9 @@ i8_i8_gemm 性能测试驱动程序
 5. 支持生成性能对比图
 
 运行示例:
-  export RVV_VLEN="dynamic" 
-  TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python i8_i8_gemm_driver.py --sweep --num-threads 1 --n-kernel-repeat 10 --vlen 256 --freq 1.6
 
+  export RVV_VLEN="dynamic" 
+  TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python i8_i8_gemm_driver_mr4.py --sweep --num-threads 1 --n-kernel-repeat 10 --vlen 256 --freq 1.6
 注意:
   - 形状约束: M % 12 == 0, N % 32 == 0, K % 32 == 0
 """
@@ -34,7 +34,7 @@ CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
 
-from i8_i8_gemm import i8_i8_gemm_kernel
+from i8_i8_gemm_mr4 import i8_i8_gemm_kernel
 
 # ============================================================================
 # 配置区域
@@ -55,6 +55,7 @@ k_n_pairs = [
     # (896, 896),
     # (896, 4864),
     # (4864, 896),
+
     # (768, 64),
     # (768, 768),
     # (768, 4864),
@@ -68,6 +69,7 @@ k_n_pairs = [
     # (11008, 2048),
     # (6144, 128),
     # (2048, 6144),
+
 	# gemma-3-1b-it
     # (1152, 256),
     # (1024, 1152),
@@ -81,7 +83,7 @@ k_n_pairs = [
 ]
 
 # M 的取值集合
-m_values = [480, 192, 144, 96, 72, 48, 24, 12]
+m_values = [480, 192, 48]
 
 # 根据 k_n_pairs 和 m_values 构造默认测试形状 (M, N, K)
 # 对于每个 (K, N) 对，使用所有 M 值构造 (M, N, K) 测试形状
@@ -91,7 +93,7 @@ for k, n in k_n_pairs:
         DEFAULT_SHAPES.append((m, n, k))
 
 # 形状约束
-MR = 12
+MR = 4
 NR = 32
 QK_8_0 = 32
 
@@ -255,6 +257,10 @@ def benchmark_single_shape(
     gops_median = total_ops / (median_ms * 1e6)  # GOPS
     gops_min = total_ops / (max_ms * 1e6)  # 最大时间对应最小GOPS
     gops_max = total_ops / (min_ms * 1e6)  # 最小时间对应最大GOPS
+
+    median_ms /= n_kernel_repeat
+    min_ms /= n_kernel_repeat
+    max_ms /= n_kernel_repeat
     
     # 计算效率（如果提供了峰值GOPS）
     efficiency_median = (gops_median / peak_gops * 100.0) if peak_gops else None
@@ -353,7 +359,7 @@ def benchmark_shapes(
             continue
         
         try:
-            result = benchmark_single_shape(M, N, K, warmup_ms, rep_ms, num_threads, peak_gops)
+            result = benchmark_single_shape(M, N, K, warmup_ms, rep_ms, num_threads, peak_gops, n_kernel_repeat=n_kernel_repeat)
             result['threads_used'] = num_threads
             results.append(result)
             perf_str = f"{result['gops_median']:.2f} GOPS"
