@@ -11,7 +11,7 @@ LLVM_BUILD_DIR=/opt/llvm/llvm21 \
 LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
 LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
 LLVM_SYSPATH=$LLVM_BUILD_DIR \
-MAX_JOBS=1 \
+MAX_JOBS=6 \
 SETUPTOOLS_ENABLE_FEATURES="legacy-editable" \
 pip install -e python --no-build-isolation -vvv 
 ```

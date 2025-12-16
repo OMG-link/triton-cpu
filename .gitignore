@@ -106,3 +106,11 @@ python/tutorials/ir_dump/**
 test_performance/kernel_triton/ir-dump/**
 
 test_performance/kernel_triton/perf_result/**
+
+**.csv
+**.png
+**.asm
+**.llir
+**.ttir
+**.ttcir
+**.tttcir
