@@ -4,12 +4,9 @@
 #include "perf.h"
 #include "timer.hpp"
 
+
 const int VL = 32;
 
-using InBlock = block_q8_0x12;
-using KerBlock = block_q4_0x32;
-
-// 分块参数由命令行决定 
 
 int main(int argc, char **argv) {
 
@@ -25,60 +22,56 @@ int main(int argc, char **argv) {
     const int n = atoi(argv[2]);
     const int k = atoi(argv[3]);
 
-    
-    const size_t bs = n;
-
-    assert(k % QK4_0 == 0);
-    assert(m % 12 == 0);
-    assert(n % VL == 0);
-
     const int nb = k / QK4_0;
-    const int nTile = n / VL;
-    const int mTile = m / 12; 
 
     // 1) output
-    float *s = static_cast<float *>(calloc(m * bs, sizeof(float)));
+    float *s = static_cast<float *>(calloc(m * n, sizeof(float)));
 
     // 2) Q4 weights
-    size_t n_blocks_vx = nb * nTile; // 
-    KerBlock *vx = static_cast<KerBlock *>(calloc(n_blocks_vx, sizeof(block_q4_0x32)));
+    block_q4_0 *vx = static_cast<block_q4_0 *>(calloc(n * nb, sizeof(block_q4_0)));
 
     // 3) Q8 activations
-    size_t n_blocks_vy = nb * mTile;
-    InBlock *vy = static_cast<InBlock *>(calloc(n_blocks_vy, sizeof(block_q8_0x12)));
+    block_q8_0 *vy = static_cast<block_q8_0 *>(calloc(m * nb, sizeof(block_q8_0)));
 
     // times test should be repeated:
     int T = 50;
 
     // Warmup
-    ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
+    // ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
 
     // Perf-setup
     int fd_cycles = perf_event_cycles();
     int fd_l1da = perf_event_l1d_access();
     int fd_l1dm = perf_event_l1d_miss();
+    
     perf_reset(fd_cycles);
     perf_reset(fd_l1da);
     perf_reset(fd_l1dm);
 
     // Main test
-    for (int t = 0; t < T; t++) {
-        ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
+    for(size_t i = 0; i < m; i++) { // M vy 激活
+        for(size_t j = 0; j < n; j++) { // N vx 
+                float result = 0;
+                ggml_vec_dot_q4_0_q8_0(k, &result, n, vx + j * nb, 1, vy + i * nb, 1, 1);
+                *(s + i * n + j) = result;
+        }
     }
 
     // Perf-cleanup
     perf_disable(fd_cycles);
     perf_disable(fd_l1da);
     perf_disable(fd_l1dm);
+
     auto cycles = perf_read(fd_cycles);
     auto l1d_access = perf_read(fd_l1da);
     auto l1d_miss = perf_read(fd_l1dm);
+
     printf("cycle = %lu \t l1d_access = %lu \t l1d_miss = %lu \t miss_rate = %.2f%%\n", cycles, l1d_access, l1d_miss, (double)l1d_miss / l1d_access * 100);
 
     int64_t cycle_total = cycles;
     int64_t cycle_per_test = cycle_total / T;
 
-    int64_t n_fma = static_cast<int64_t>(k) * mTile * nTile * 12 * VL; // 考虑实际形状，为了避免 padding，这里用的整数倍的寄存器分块大小 
+    int64_t n_fma = static_cast<int64_t>(k) * m * n; // 考虑实际形状，为了避免 padding，这里用的整数倍的寄存器分块大小 
     int64_t fma_per_cycle;
 
 #ifdef SPACEMIT_X60

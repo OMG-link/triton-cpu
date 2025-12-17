@@ -6,8 +6,22 @@
 
 const int VL = 32;
 
-using InBlock = block_q8_0x12;
-using KerBlock = block_q4_0x32;
+// VL * QK
+template <int VL> struct block_iq4_Kx { 
+	ggml_half d[VL];                           // super-block scale for quantized scales
+	uint16_t extra[VL];                        // extra information
+	uint8_t scales[VL * (QK_K / QK_SB_K) * 2]; // scales and mins, quantized with 6 bits, but stored with 8 bits
+	uint8_t qs[VL * QK_K / 2];                 // 4--bit quants
+};
+
+// template <int VL> struct block_q8_Kx { 
+// 	float d[VL];                         // delta
+// 	uint8_t qs[VL * QK_K];               // quants
+// 	uint16_t bsums[VL * QK_K / QK_SB_K]; // sum of quants in groups of 32
+// };
+
+using InBlock = block_q8_Kx<12>;
+using KerBlock = block_iq4_Kx<VL>;
 
 // 分块参数由命令行决定 
 
@@ -28,11 +42,11 @@ int main(int argc, char **argv) {
     
     const size_t bs = n;
 
-    assert(k % QK4_0 == 0);
+    assert(k % QK_K == 0);
     assert(m % 12 == 0);
     assert(n % VL == 0);
 
-    const int nb = k / QK4_0;
+    const int nb = k / QK_K;
     const int nTile = n / VL;
     const int mTile = m / 12; 
 
@@ -41,17 +55,17 @@ int main(int argc, char **argv) {
 
     // 2) Q4 weights
     size_t n_blocks_vx = nb * nTile; // 
-    KerBlock *vx = static_cast<KerBlock *>(calloc(n_blocks_vx, sizeof(block_q4_0x32)));
+    KerBlock *vx = static_cast<KerBlock *>(calloc(n_blocks_vx, sizeof(KerBlock)));
 
     // 3) Q8 activations
     size_t n_blocks_vy = nb * mTile;
-    InBlock *vy = static_cast<InBlock *>(calloc(n_blocks_vy, sizeof(block_q8_0x12)));
+    InBlock *vy = static_cast<InBlock *>(calloc(n_blocks_vy, sizeof(InBlock)));
 
     // times test should be repeated:
     int T = 50;
 
     // Warmup
-    ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
+    ggml_gemm_iq4_K_12x32_q8_K(k, s, bs, vx, vy, m, n);
 
     // Perf-setup
     int fd_cycles = perf_event_cycles();
@@ -63,7 +77,7 @@ int main(int argc, char **argv) {
 
     // Main test
     for (int t = 0; t < T; t++) {
-        ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
+        ggml_gemm_iq4_K_12x32_q8_K(k, s, bs, vx, vy, m, n);
     }
 
     // Perf-cleanup

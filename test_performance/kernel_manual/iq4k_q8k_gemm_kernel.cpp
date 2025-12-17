@@ -119,8 +119,8 @@ void ggml_gemm_iq4_K_12x32_q8_K(int k, float *GGML_RESTRICT s, size_t bs, const 
 									ASSERT_MSG(i_mr < m && i_mr + mr <= m,
 															"i_mr out of bounds: i_mr=%d, m=%d, mr=%d",
 															i_mr, m, mr);
-									auto iq4k_ptr = iq4k_ptr_start + (i_mr * k) / (mr * QK_K); 
-									auto q8k_ptr = q8k_ptr_start + (i_nr * k) / (nr * QK_K); 
+									auto iq4k_ptr = iq4k_ptr_start + (i_nr * k) / (nr * QK_K); 
+									auto q8k_ptr = q8k_ptr_start + (i_mr * k) / (mr * QK_K); // 激活
 
 									float sum_row[mr * nr] = {0.0};
 									

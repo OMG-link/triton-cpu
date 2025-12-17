@@ -13,10 +13,10 @@
 6. 扩展: 通过在 kernel_specs 中新增条目即可加入新的 kernel; 通过 --shapes-override JSON 可一次性覆盖 shape 列表
 
 使用示例:
-	python perf_report.py --kernels all --rebuild
+	python perf_report.py --kernels all --rebuild --output results
 	python perf_report.py --kernels q4k_q8 --output results --csv perf_custom.csv
 	python perf_report.py --plot-only --csv perf_data.csv
-	python perf_report.py --shapes-override '{"q4k_q8": [{"M":12,"N":128,"K":1536}]}'
+	python perf_report.py --kernels all --shapes-override '{"q4k_q8": [{"M":12,"N":128,"K":1536}]}'
 
 注意:
  - 期望内核的可执行程序通过命令行参数: <M> <N> <K>
@@ -76,45 +76,46 @@ class KernelSpec:
 # 原始 (K, N)  权重矩阵 shape 组合
 k_n_pairs = [
     (2048, 64),
-    (2048, 2048),
-    (2048, 8192),
-    (8192, 2048),
-    (3072, 128),
-    (3072, 3072),
-    (3072, 8192),
-    (8192, 3072),
+    # (2048, 2048),
+    # (2048, 8192),
+    # (8192, 2048),
+    # (3072, 128),
+    # (3072, 3072),
+    # (3072, 8192),
+    # (8192, 3072),
 	# qwen2.5-0.5b 869 不是 256 倍数 
     # (896, 64),
     # (896, 896),
     # (896, 4864),
     # (4864, 896),
-    (768, 64),
-    (768, 768),
-    (768, 4864),
-    (4864, 768),
-    (1536, 128),
-    (1536, 1536),
-    (1536, 8960),
-    (8960, 1536),
-    (2048, 128),
-    (2048, 11008),
-    (11008, 2048),
-    (6144, 128),
-    (2048, 6144),
+    # (768, 64),
+    # (768, 768),
+    # (768, 4864),
+    # (4864, 768),
+    # (1536, 128),
+    # (1536, 1536),
+    # (1536, 8960),
+    # (8960, 1536),
+    # (2048, 128),
+    # (2048, 11008),
+    # (11008, 2048),
+    # (6144, 128),
+    # (2048, 6144),
 	# gemma-3-1b-it
     # (1152, 256),
     # (1024, 1152),
     # (1152, 6912),
     # (6912, 1152),
 
-    (1024, 256),
-    (1024, 1024),
-    (1024, 6912),
-    (6912, 1024),
+    # (1024, 256),
+    # (1024, 1024),
+    # (1024, 6912),
+    # (6912, 1024),
 ]
 
 # M 的取值集合
-m_values = [480, 192, 144, 96, 72, 48, 24, 12]
+# m_values = [480, 192, 48]
+m_values = [192]
 
 # 若要用于 perf_report.py (脚本里使用键名 M/N/K)
 shapes_for_perf_report = []
@@ -126,13 +127,36 @@ for K, N in k_n_pairs:
 # 在此添加需要测试的 kernel 规格
 kernel_specs: List[KernelSpec] = [
 	KernelSpec(
-		name="q4k_q8",
-		sources=["q4k_q8_main_driver.cpp", "q4k_q8_kernel.cpp"],
-		binary="q4k_q8_kernel",
+		name="q4k_q8k_kernel",
+		sources=["q4k_q8k_gemm_main_driver.cpp", "q4k_q8k_gemm_kernel.cpp"],
+		binary="q4k_q8k",
 		shapes=shapes_for_perf_report,
 	),
 	# 可继续添加其它 kernel
-	# KernelSpec(name="gemm_q6_k", sources=["gemm_q6_k_3.cpp"], binary="gemm_q6_k", shapes=[{"M":256,"N":256,"K":1536}]),
+	KernelSpec(
+		name="q40_q80_kernel",
+		sources=["q40_q80_gemm_main_driver.cpp", "q40_q80_gemm_kernel.cpp"],
+		binary="q40_q80",
+		shapes=shapes_for_perf_report,
+	),
+	KernelSpec(
+		name="iq4k_q8k_kernel",
+		sources=["iq4k_q8k_gemm_main_driver.cpp", "iq4k_q8k_gemm_kernel.cpp"],
+		binary="iq4k_q8k",
+		shapes=shapes_for_perf_report,
+	),
+	KernelSpec(
+		name="inner_q40_q80_kernel",
+		sources=["inner_q40_q80_gemm_kernel_main_driver.cpp", "inner_q40_q80_gemm_kernel.cpp"],
+		binary="inner_q40_q80",
+		shapes=shapes_for_perf_report,
+	),
+	KernelSpec(
+		name="inner_q4k_q8k_kernel",
+		sources=["inner_q4k_q8k_gemm_kernel_main_driver.cpp", "inner_q4k_q8k_gemm_kernel.cpp"],
+		binary="inner_q4k_q8k",
+		shapes=shapes_for_perf_report,
+	),
 ]
 
 
