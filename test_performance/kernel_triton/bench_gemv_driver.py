@@ -1,24 +1,6 @@
 '''
-# 测试所有 kernel 在所有预定义形状上的性能
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --rounds 3
-
-# 只测试特定 kernel
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel q40_q80 --rounds 3
-
-# 测试多个 kernel（逗号分隔会被解释为单一字符串，需通过修改代码支持或多次运行）
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel q40_q80 --rounds 3
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel q4k_q8k --rounds 3
-
-# 指定机器的理论峰值带宽（用于计算利用率）
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --peak-bw 10.0
-
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --csv my_results.csv
-
-# 自动生成时间戳命名的图片
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --plot
-
-# 指定图片文件名
-TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python test_performance/kernel_triton/gemv_driver.py --sweep --kernel all --plot bandwidth_comparison.png
+# 测试 某个 kernel 的性能
+TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python bench_gemv_driver.py --n 2048 --k 2048 --kernel all --target-gb 2 --num_threads 4
 
 # 同时指定 CSV 和图片，以及峰值带宽 (推荐)
 TRITON_ALWAYS_COMPILE=1  TRITON_CPU_BACKEND=1  python ./gemv_driver.py --sweep --kernel all --num_threads=8 --csv bandwidth_comparison.csv --plot bandwidth_comparison.png --rounds 3 --target-gb 1.5 --peak-bw 5.83
@@ -46,7 +28,9 @@ if CURRENT_DIR not in sys.path:
 
 from q40_q80_gemv import q40_q80_gemv_kernel  # type: ignore
 from q4k_q8k_gemv import q4k_q8k_gemv_kernel  # type: ignore
-from iq4k_q8k_gemv import iq4k_q8k_gemv_kernel  # type: ignore
+from iq4k_q8k_gemv import iq4k_q8k_gemv_kernel as iq4k_q8k_gemv_kernel_gather # type: ignore
+from iq4k_q8k_gemv_without_gather import iq4k_q8k_gemv_kernel as iq4k_q8k_gemv_kernel_without_gather
+from iq4k_q8k_gemv_stlb import iq4k_q8k_gemv_kernel as iq4k_q8k_gemv_stlb_kernel
 
 try:
     from dataclasses import dataclass
@@ -76,45 +60,42 @@ def register_kernel(spec: KernelSpec):
 
 # 原始 (K, N)  权重矩阵 shape 组合
 k_n_pairs = [
-    (2048, 64),
+    # (2048, 64),
     (2048, 2048),
-    (2048, 8192),
-    (8192, 2048),
-    (3072, 128),
-    (3072, 3072),
-    (3072, 8192),
-    (8192, 3072),
+    # (2048, 8192),
+    # (8192, 2048),
+    # (3072, 128),
+    # (3072, 3072),
+    # (3072, 8192),
+    # (8192, 3072),
 	# qwen2.5-0.5b 869 不是 256 倍数 
     # (896, 64),
     # (896, 896),
     # (896, 4864),
     # (4864, 896),
-    (768, 64),
-    (768, 768),
-    (768, 4864),
-    (4864, 768),
-    (1536, 128),
-    (1536, 1536),
-    (1536, 8960),
-    (8960, 1536),
-    (2048, 128),
-    (2048, 11008),
-    (11008, 2048),
-    (6144, 128),
-    (2048, 6144),
+    # (768, 64),
+    # (768, 768),
+    # (768, 4864),
+    # (4864, 768),
+    # (1536, 128),
+    # (1536, 1536),
+    # (1536, 8960),
+    # (8960, 1536),
+    # (2048, 128),
+    # (2048, 11008),
+    # (11008, 2048),
+    # (6144, 128),
+    # (2048, 6144),
 	# gemma-3-1b-it
     # (1152, 256),
     # (1024, 1152),
     # (1152, 6912),
     # (6912, 1152),
-    (1024, 256),
-    (1024, 1024),
-    (1024, 6912),
-    (6912, 1024),
+    # (1024, 256),
+    # (1024, 1024),
+    # (1024, 6912),
+    # (6912, 1024),
 ]
-
-# M 的取值集合
-# m_values = [480, 192, 144, 96, 72, 48, 24, 12]
 
 # 根据 k_n_pairs 和 m_values 构造默认测试形状 (M, N, K)
 # 对于每个 (K, N) 对，使用所有 M 值构造 (M, N, K) 测试形状
@@ -383,7 +364,27 @@ register_kernel(KernelSpec(
 
 register_kernel(KernelSpec(
     name='iq4k_q8k',
-    fn=iq4k_q8k_gemv_kernel,
+    fn=iq4k_q8k_gemv_kernel_gather,
+    constraint=_iq4k_constraint,
+    gen_dataset=_iq4k_gen_dataset,
+    estimate_bytes=_iq4k_estimate_bytes,
+    grid_fn=_iq4k_grid,
+    param_builder=_iq4k_params,
+))
+
+register_kernel(KernelSpec(
+    name='iq4k_q8k_without_gather',
+    fn=iq4k_q8k_gemv_kernel_without_gather,
+    constraint=_iq4k_constraint,
+    gen_dataset=_iq4k_gen_dataset,
+    estimate_bytes=_iq4k_estimate_bytes,
+    grid_fn=_iq4k_grid,
+    param_builder=_iq4k_params,
+))
+
+register_kernel(KernelSpec(
+    name='iq4k_q8k_stlb',
+    fn=iq4k_q8k_gemv_stlb_kernel,
     constraint=_iq4k_constraint,
     gen_dataset=_iq4k_gen_dataset,
     estimate_bytes=_iq4k_estimate_bytes,
@@ -401,7 +402,7 @@ def calculate_num_batches(spec: KernelSpec, N, K, target_gb):
 
 
 
-def run_bandwidth(kernel_name: str, N: int, K: int, rounds: int = 5, warmup: int = 3, target_gb: float = 2.0, threads: int = 4, peak_bw: float = DEFAULT_PEAK_BW, verbose: bool = True, batch: int = None):
+def run_bandwidth(kernel_name: str, N: int, K: int, rounds: int = 100, warmup: int = 10, target_gb: float = 2.0, threads: int = 4, peak_bw: float = DEFAULT_PEAK_BW, verbose: bool = True, batch: int = None):
     assert kernel_name in REGISTRY, f"未注册 kernel: {kernel_name}"
     spec = REGISTRY[kernel_name]
     spec.constraint(N, K)
@@ -487,7 +488,7 @@ def run_bandwidth(kernel_name: str, N: int, K: int, rounds: int = 5, warmup: int
     }
 
 
-def run_all(N, K, rounds=5, warmup=3, target_gb=2.0, threads=4, peak_bw=DEFAULT_PEAK_BW):
+def run_all(N, K, rounds=100, warmup=10, target_gb=2.0, threads=4, peak_bw=DEFAULT_PEAK_BW):
     results = {}
     for name in REGISTRY.keys():
         print("\n\n" + "#"*70)
@@ -497,14 +498,14 @@ def run_all(N, K, rounds=5, warmup=3, target_gb=2.0, threads=4, peak_bw=DEFAULT_
     return results
 
 
-def run_sweep(kernel_names, shapes=None, rounds=5, warmup=3, target_gb=2.0, threads=4, peak_bw=DEFAULT_PEAK_BW, csv_path=None):
+def run_sweep(kernel_names, shapes=None, rounds=100, warmup=10, target_gb=2.0, threads=4, peak_bw=DEFAULT_PEAK_BW, csv_path=None):
     """对指定 kernel 在多个 shape 上进行测试
     
     Args:
         kernel_names: 要测试的 kernel 列表，如 ['q40_q80', 'q4k_q8k'] 或 'all'
         shapes: 测试形状列表 [(N1,K1), (N2,K2), ...]，默认使用 SHAPE_CONFIGS
         peak_bw: 理论峰值带宽 (GB/s)
-        csv_path: CSV 输出路径，若为 None 则自动生成
+        csv_path: CSV 输出路径，若为 None 则自动生成 
     
     Returns:
         results: {kernel_name: [result_dict1, result_dict2, ...]}
@@ -757,11 +758,11 @@ def plot_bandwidth_comparison(results, output_path=None, title='GEMV Bandwidth C
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='统一 GEMV kernel 驱动带宽测试')
-    parser.add_argument('--kernel', type=str, default='all', help='选择 kernel: all|q40_q80|q4k_q8k|iq4k_q8k')
+    parser.add_argument('--kernels', type=str, default='all', help='选择 kernel: all|q40_q80|q4k_q8k|iq4k_q8k|iq4k_q8k_without_gather')
     parser.add_argument('--n', type=int, default=512)
     parser.add_argument('--k', type=int, default=1024)
-    parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--warmup', type=int, default=3)
+    parser.add_argument('--rounds', type=int, default=100)
+    parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--target-gb', type=float, default=2.0)
     parser.add_argument('--num_threads', type=int, default=4)
     parser.add_argument('--peak-bw', type=float, default=DEFAULT_PEAK_BW, help=f'理论峰值带宽 (GB/s)，默认: {DEFAULT_PEAK_BW}')
@@ -769,11 +770,15 @@ if __name__ == '__main__':
     parser.add_argument('--csv', type=str, default=None, help='CSV 输出路径（仅在 --sweep 模式有效）')
     parser.add_argument('--plot', type=str, default=None, help='图表输出路径（仅在 --sweep 模式有效）')
     args = parser.parse_args()
+    
+    selected_kernels = None
+    if args.kernels:
+        selected_kernels = [k.strip() for k in args.kernels.split(',') if k.strip()]
 
     if args.sweep:
         # 批量测试模式
         results = run_sweep(
-            kernel_names=args.kernel,
+            kernel_names=selected_kernels,
             shapes=None,  # 使用默认 SHAPE_CONFIGS
             rounds=args.rounds,
             warmup=args.warmup,
@@ -786,7 +791,7 @@ if __name__ == '__main__':
         plot_bandwidth_comparison(results, output_path=args.plot)
     else:
         # 单一 shape 测试
-        if args.kernel == 'all':
+        if args.kernels == 'all':
             run_all(args.n, args.k, args.rounds, args.warmup, args.target_gb, args.num_threads, args.peak_bw)
         else:
-            run_bandwidth(args.kernel, args.n, args.k, args.rounds, args.warmup, args.target_gb, args.num_threads, args.peak_bw)
+            run_bandwidth(selected_kernels, args.n, args.k, args.rounds, args.warmup, args.target_gb, args.num_threads, args.peak_bw)

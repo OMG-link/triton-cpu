@@ -56,8 +56,8 @@ def iq4k_q8k_matmul_kernel(
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    value_table1 = tl.arange(0, 16).cast(tl.int8).reshape(16,1).broadcast_to((16,NR))
-    value_table2 = tl.arange(0, 16).cast(tl.int8).reshape(16,1).broadcast_to((16,NR))
+    value_table1 = tl.arange(0, 16).cast(tl.int8).reshape(1, 16).broadcast_to((NR, 16))
+    value_table2 = tl.arange(0, 16).cast(tl.int8).reshape(1, 16).broadcast_to((NR, 16))
 
 
     # Q8K 数据布局: [M//MR, K//QK_K, NUM_SUB_BLOCKS, SUB_BLOCK_SIZE, MR]
@@ -175,12 +175,12 @@ def iq4k_q8k_matmul_kernel(
             tlb_start_idx_2 = (tlb_start_idx & 0x02)  # [NR] 
 
             # tlb_start_idx_1 / tlb_start_idx_2 是 (NR,) -> (1,NR) 以便广播到 (16,NR) 
-            mask1 = tl.reshape(tlb_start_idx_1, (1, NR)).broadcast_to((QK_4_K_SUB_BLOCK_DATA_SIZE, NR)).cast(tl.int1)  # (16,NR) 
-            mask2 = tl.reshape(tlb_start_idx_2, (1, NR)).broadcast_to((QK_4_K_SUB_BLOCK_DATA_SIZE, NR)).cast(tl.int1)  # (16,NR) 
+            mask1 = tl.reshape(tlb_start_idx_1, (NR, 1)).broadcast_to((NR, QK_4_K_SUB_BLOCK_DATA_SIZE)).cast(tl.int1)  # (NR, 16) 
+            mask2 = tl.reshape(tlb_start_idx_2, (NR, 1)).broadcast_to((NR, QK_4_K_SUB_BLOCK_DATA_SIZE)).cast(tl.int1)  # (NR, 16) 
 
             # 按列选择对应表 (16,NR)
-            value_tlb1 = tl.where(mask1, value_table1, value_table2)  # (16, NR)
-            value_tlb2 = tl.where(mask2, value_table1, value_table2)  # (16, NR)
+            value_tlb1 = tl.where(mask1, value_table1, value_table2)  # (NR, 16)
+            value_tlb2 = tl.where(mask2, value_table1, value_table2)  # (NR, 16)
 
             # 加载并解包 iq4k 数据
             iq4k_data_ptr = tl.advance(iq4k_block_ptr, offsets=(0, k_block, sub_block, 0, 0))
@@ -190,8 +190,11 @@ def iq4k_q8k_matmul_kernel(
             iq4k_data_2 = (iq4k_data_packed >> 4).reshape(16, NR)  # uint4, [16, NR] 
 
             # 按行维度 (axis=1) gather：iq4k_data_1 / iq4k_data_2 的取值范围 0..15 
-            iq4k_data_k0_15_dequant_data = tl.gather(src=value_tlb1, index=iq4k_data_1, axis=1)  # (16, NR) 
-            iq4k_data_k16_31_dequant_data = tl.gather(src=value_tlb2, index=iq4k_data_2, axis=1)  # (16, NR) 
+            # 支持 axis = 1， index 索引不连续，表的数据 load 也不连续，内存离散 load 操作，这里表的内容其实完全可以消掉 
+            # 好处：iq4k data 不需要转置。输入 K 在高维的外积布局下，先是得转置查表，查完表后再次转置适合外积计算布局 
+            # ？ 转置开销大 还是 非连续内存地址 load 开销大  
+            iq4k_data_k0_15_dequant_data = (tl.gather(src=value_tlb1, index=iq4k_data_1.T, axis=1)).trans()  # (16, NR) 
+            iq4k_data_k16_31_dequant_data = tl.gather(src=value_tlb2, index=iq4k_data_2.T, axis=1).trans()  # (16, NR) 
 
             iq4k_scale_1 = iq4k_scale_1.reshape((1, NR)).broadcast_to((MR, NR))
             # （16， NR) (16, MR)

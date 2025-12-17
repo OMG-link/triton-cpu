@@ -12,17 +12,17 @@ TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_driver.py --metric gfl
 
 @triton.jit
 def q40_q80_gemm_kernel(
-    q4_0_matrix_ptr,         # q4_0 矩阵指针, two int packed in uint8
-    q4_0_scale_ptr,          # q4_0 量化比例指针, uint16
-    q8_0_matrix_ptr,         # q8_0 矩阵指, int8
-    q8_0_scale_ptr,          # q8_0 量化比例指针, uint16
-    output_ptr,              # 输出指针，float
-    M,                       # 矩阵行数
-    N,                       # 矩阵列数
-    K,                       # 矩阵公共维度，这里表示元素数量而不是字节数
+    q4_0_matrix_ptr,         # q4_0 矩阵指针, two int packed in uint8 
+    q4_0_scale_ptr,          # q4_0 量化比例指针, uint16 
+    q8_0_matrix_ptr,         # q8_0 矩阵指, int8 
+    q8_0_scale_ptr,          # q8_0 量化比例指针, uint16 
+    output_ptr,              # 输出指针，float 
+    M,                       # 矩阵行数 
+    N,                       # 矩阵列数 
+    K,                       # 矩阵公共维度，这里表示元素数量而不是字节数 
 ):
     QK_8_0 : tl.constexpr = 32
-    QK_4_0_DATA_SIZE : tl.constexpr = QK_8_0 // 2  # 每个 uint8 包含两个 q4_0 元素
+    QK_4_0_DATA_SIZE : tl.constexpr = QK_8_0 // 2  # 每个 uint8 包含两个 q4_0 元素 
     MR : tl.constexpr = 12
     NR : tl.constexpr = 32
     N_block : tl.constexpr = K // QK_8_0
@@ -79,8 +79,6 @@ def q40_q80_gemm_kernel(
     acc = tl.zeros((MR, NR), dtype=tl.float32)
 
     for k_block in range(N_block):
-        sum_block = tl.zeros((MR, NR), dtype=tl.int32)
-        
         # 加载 q4 数据和 scale
         q4_data_ptr = tl.advance(q4_0_block_ptr, offsets = (0, k_block, 0, 0))
         q4_data = tl.load(q4_data_ptr)  # [1, 1, QK_4_0_DATA_SIZE, NR]
@@ -88,29 +86,25 @@ def q40_q80_gemm_kernel(
         
         q8_scale_ptr = tl.advance(q8_0_scale_block_ptr, offsets = (0, k_block, 0))
         q8_scale = tl.load(q8_scale_ptr)  # [1, 1, MR]
-        q8_scale = q8_scale.reshape(MR)  # [12]
         
         q4_scale_ptr = tl.advance(q4_0_scale_block_ptr, offsets = (0, k_block, 0))
         q4_scale = tl.load(q4_scale_ptr)  # [1, 1, NR]
-        q4_scale = q4_scale.reshape(NR)  # [32]
 
         # 解包 q4 数据
-        q4_low_4bit = (q4_data & 0xf).cast(tl.int16)  # [16, 32]
-        q4_high_4bit = (q4_data >> 4).cast(tl.int16)  # [16, 32]
+        q4_low_4bit = (q4_data & 0xf).cast(tl.int8)  # [16, 32]
+        q4_high_4bit = (q4_data >> 4).cast(tl.int8)  # [16, 32]
         
         # 加载 q8 数据的低 16 位并计算
         q8_data_ptr_low = tl.advance(q8_0_block_ptr, offsets = (0, k_block, 0, 0, 0))
         q8_data_low = tl.load(q8_data_ptr_low)  # [1, 1, 1, 16, 12]
-        q8_data_low = q8_data_low.reshape(16, MR).cast(tl.int16)  # [16, 12]
-        tmp_int16 = tl.dot(q8_data_low.T, q4_low_4bit, out_dtype=tl.int16)  # [12, 32]
-        sum_block += tmp_int16.cast(tl.int32)
+        q8_data_low = q8_data_low.reshape(16, MR)  # [16, 12]
+        sum_block = tl.dot(q8_data_low.T, q4_low_4bit, out_dtype=tl.int16)  # [12, 32]
 
         # 加载 q8 数据的高 16 位并计算
         q8_data_ptr_high = tl.advance(q8_0_block_ptr, offsets = (0, k_block, 1, 0, 0))
         q8_data_high = tl.load(q8_data_ptr_high)  # [1, 1, 1, 16, 12]
-        q8_data_high = q8_data_high.reshape(16, MR).cast(tl.int16)  # [16, 12]
-        tmp_int16 = tl.dot(q8_data_high.T, q4_high_4bit, out_dtype=tl.int16)  # [12, 32]
-        sum_block += tmp_int16.cast(tl.int32)
+        q8_data_high = q8_data_high.reshape(16, MR)  # [16, 12]
+        sum_block += tl.dot(q8_data_high.T, q4_high_4bit, out_dtype=tl.int16)  # [12, 32]
 
         # 量化比例应用
         q8_scale_reshaped = tl.reshape(q8_scale, (MR, 1))  # [12, 1]
@@ -118,7 +112,6 @@ def q40_q80_gemm_kernel(
         scale = tl.dot(q8_scale_reshaped, q4_scale_reshaped, out_dtype=tl.float32)  # [12, 32]
 
         acc += sum_block.cast(tl.float32) * scale
-
     # 写回结果 - reshape to match block_shape
     acc_reshaped = acc.reshape(1, 1, MR, NR)
     output_ptr = tl.advance(output_block_ptr, offsets=(0, 0, 0, 0))
@@ -142,11 +135,11 @@ def prepare_random_q40_q80_inputs(M, K, N):
 
     device = 'cpu'
 
-    # q8_0_matrix: shape (Mb, Kblocks, 2, QK_8_0//2, MR)
+    # q8_0_matrix: shape (Mb, Kblocks, 2, QK_8_0//2, MR) 
     q8_0_matrix = torch.randint(-128, 127, (Mb, Kblocks, 2, QK_8_0//2, MR), dtype=torch.int8, device=device)
     q8_0_scale = torch.rand((Mb, Kblocks, MR), dtype=torch.float32, device=device)
 
-    # q4_0 packed: (Nb, Kblocks, QK_4_0_DATA_SIZE, NR) with uint8 storing two int4
+    # q4_0 packed: (Nb, Kblocks, QK_4_0_DATA_SIZE, NR) with uint8 storing two int4 
     q4_0_matrix = torch.randint(0, 255, (Nb, Kblocks, QK_4_0_DATA_SIZE, NR), dtype=torch.uint8, device=device)
     q4_0_scale = torch.rand((Nb, Kblocks, NR), dtype=torch.float32, device=device)
 

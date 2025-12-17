@@ -8,19 +8,14 @@
 5. 生成性能折线图 (x: shape, y: GFLOPS 或利用率)
 
 运行示例:
-# 测试所有 kernel（需要在 triton 环境中）
-conda activate triton
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --metric gflops --csv-out bench.csv --png-out bench.png
 
-# 仅测试指定的 kernel，指定核心数
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k --metric gflops --num-threads 8
+# 测试所有 kernel 是否可以正常运行 
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py  --shapes 192x2048x2048 --kernels q40_q80,q4k_q8k,iq4k_q8k,iq4k_q8k_stlb,iq4k_q8k_stlb_wogather --metric gflops --num-threads 8 --warmup 10 --rounds 100 --freq 1.6 --vlen 256 
 
-# 使用 n_kernel_repeat 减少启动开销影响（适合小规模 kernel 的精确测量）
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k,iq4k_q8k --warmup 3 --rounds 3 --metric gflops --num-threads 1 --n-kernel-repeat 20
+# 测试所有 kernel 在所有默认shape 下性能，不指定默认全部 
+TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q40_q80,q4k_q8k,iq4k_q8k,iq4k_q8k_stlb,iq4k_q8k_stlb_wogather --metric gflops --csv-out bench.csv --png-out bench.png --num-threads 1 --warmup 10 --rounds 100 --freq 1.6 --vlen 256 
 
-# 对比不同 n_kernel_repeat 值的影响
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --shapes 12x256x32 --kernels q40_q80 --n-kernel-repeat 1
-TRITON_ALWAYS_COMPILE=1 TRITON_CPU_BACKEND=1 python bench_gemm_driver.py --kernels q4k_q8k --n-kernel-repeat 20  --num-threads 1 
+
 
 注意:
   - 可用的 kernel: q40_q80, q4k_q8k, iq4k_q8k
@@ -57,6 +52,8 @@ if CUR_DIR not in sys.path:
 from q4k_q8k_gemm import q4k_q8k_matmul_kernel  # noqa: E402
 from iq4k_q8k_gemm import iq4k_q8k_matmul_kernel  # noqa: E402
 from q40_q80_gemm import q40_q80_gemm_kernel  # noqa: E402
+from iq4k_q8k_gemm_stlb import iq4k_q8k_matmul_kernel as iq4k_q8k_matmul_kernel_stlb
+from iq4k_q8k_gemm_stlb_without_gather import iq4k_q8k_matmul_kernel as iq4k_q8k_matmul_kernel_stlb_wogather
 
 try:
     from dataclasses import dataclass
@@ -265,7 +262,29 @@ KERNEL_SPECS = [
         constraints={'M': 12, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
-    )
+    ),
+    KernelSpec(
+        name='iq4k_q8k_stlb',
+        kernel_fn=iq4k_q8k_matmul_kernel_stlb,
+        gen_dataset=iq4k_gen_dataset,
+        estimate_ops=iq4k_estimate_ops,
+        grid_fn=iq4k_grid,
+        param_builder=iq4k_param_builder,
+        constraints={'M': 12, 'N': 32, 'K': 256},
+        compute_dtype='int16',
+        dtype_width=16
+    ),
+    KernelSpec(
+        name='iq4k_q8k_stlb_wogather',
+        kernel_fn=iq4k_q8k_matmul_kernel_stlb_wogather,
+        gen_dataset=iq4k_gen_dataset,
+        estimate_ops=iq4k_estimate_ops,
+        grid_fn=iq4k_grid,
+        param_builder=iq4k_param_builder,
+        constraints={'M': 12, 'N': 32, 'K': 256},
+        compute_dtype='int16',
+        dtype_width=16
+    ),
 ]# -----------------------
 
 # 性能计算工具函数
@@ -304,41 +323,41 @@ k_n_pairs = [
     (2048, 2048),
     (2048, 8192),
     (8192, 2048),
-    (3072, 128),
-    (3072, 3072),
-    (3072, 8192),
-    (8192, 3072),
+    # (3072, 128),
+    # (3072, 3072),
+    # (3072, 8192),
+    # (8192, 3072),
 	# qwen2.5-0.5b 869 不是 256 倍数 
     # (896, 64),
     # (896, 896),
     # (896, 4864),
     # (4864, 896),
-    (768, 64),
-    (768, 768),
-    (768, 4864),
-    (4864, 768),
-    (1536, 128),
-    (1536, 1536),
-    (1536, 8960),
-    (8960, 1536),
-    (2048, 128),
-    (2048, 11008),
-    (11008, 2048),
-    (6144, 128),
-    (2048, 6144),
+    # (768, 64),
+    # (768, 768),
+    # (768, 4864),
+    # (4864, 768),
+    # (1536, 128),
+    # (1536, 1536),
+    # (1536, 8960),
+    # (8960, 1536),
+    # (2048, 128),
+    # (2048, 11008),
+    # (11008, 2048),
+    # (6144, 128),
+    # (2048, 6144),
 	# gemma-3-1b-it
     # (1152, 256),
     # (1024, 1152),
     # (1152, 6912),
     # (6912, 1152),
-    (1024, 256),
-    (1024, 1024),
-    (1024, 6912),
-    (6912, 1024),
+    # (1024, 256),
+    # (1024, 1024),
+    # (1024, 6912),
+    # (6912, 1024),
 ]
 
 # M 的取值集合
-m_values = [480, 192, 144, 96, 72, 48, 24, 12]
+m_values = [480, 192, 48]
 
 DEFAULT_SHAPES: List[Tuple[int,int,int]] = [
 ]
@@ -642,7 +661,7 @@ def main():
     parser = argparse.ArgumentParser(description='统一 GEMM Kernel 性能测试驱动')
     parser.add_argument('--shapes', type=str, default='', help='逗号分隔形状列表，例如 48x512x32,96x512x32')
     parser.add_argument('--kernels', type=str, default='', help='逗号分隔的 kernel 名称列表，例如 q40_q80,q4k_q8k。留空表示测试所有 kernel')
-    parser.add_argument('--warmup', type=int, default=25, help='预热时间 ms')
+    parser.add_argument('--warmup', type=int, default=10, help='预热时间 ms')
     parser.add_argument('--rounds', type=int, default=100, help='测试时间 ms')
     parser.add_argument('--num-threads', type=int, default=8, help='CPU核心/线程数，用于多核理论峰值计算和 torch 线程设置')
     parser.add_argument('--n-kernel-repeat', type=int, default=1, help='单次 kernel 调用中的重复执行次数，用于减少启动开销影响 (默认 1)')

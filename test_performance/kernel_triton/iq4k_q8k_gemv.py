@@ -27,13 +27,13 @@ def iq4k_q8k_gemv_kernel(
     N,
     batch: tl.constexpr = 1,
 ):
-    pid_b = tl.program_id(axis=0)  # batch id
-    pid_n = tl.program_id(axis=1)  # N id
-    QK_K : tl.constexpr = 256
-    QK_4_K_DATA_SIZE : tl.constexpr = QK_K // 2  # 每个 uint8 包含两个 iq4k 元素
+    pid_b = tl.program_id(axis=0)  # batch id 
+    pid_n = tl.program_id(axis=1)  # N id 
+    QK_K : tl.constexpr = 256 
+    QK_4_K_DATA_SIZE : tl.constexpr = QK_K // 2  # 每个 uint8 包含两个 iq4k 元素 
     QK_K_SUB_BLOCK_SIZE : tl.constexpr = 32
-    QK_4_K_SUB_BLOCK_DATA_SIZE : tl.constexpr = QK_K_SUB_BLOCK_SIZE // 2
-    NUM_SUB_BLOCKS : tl.constexpr = QK_K // 32  # 每个块有8个子块
+    QK_4_K_SUB_BLOCK_DATA_SIZE : tl.constexpr = QK_K_SUB_BLOCK_SIZE // 2 
+    NUM_SUB_BLOCKS : tl.constexpr = QK_K // 32  # 每个块有8个子块 
     NR : tl.constexpr = 32
 
 
@@ -152,8 +152,8 @@ def iq4k_q8k_gemv_kernel(
             iq4k_data_block_ptr = tl.advance(iq4k_block_ptr, offsets=(0, 0, k_block, k_sub_block, 0, 0))
             iq4k_data_packed = tl.load(iq4k_data_block_ptr)  # uint8 * NR, 每个 uint8 包含两个 iq4k 数据 [16, NR]@uint8 => [32, NR]@uint4
 
-            iq4k_data_1 = (iq4k_data_packed & 0x0F).reshape(16, NR).permute(1, 0)  # uint4, [16, NR] 
-            iq4k_data_2 = (iq4k_data_packed >> 4).reshape(16, NR).permute(1, 0)  # uint4, [16, NR] 
+            iq4k_data_1 = (iq4k_data_packed & 0x0F).reshape(16, NR).permute(1, 0)  # uint4, [NR, 16] 
+            iq4k_data_2 = (iq4k_data_packed >> 4).reshape(16, NR).permute(1, 0)    # uint4, [NR, 16] 
 
             # dequant by lookup table
             tlb_start_idx = (iq4k_extra_data >> (2 * k_sub_block))   # [NR] 
@@ -168,7 +168,7 @@ def iq4k_q8k_gemv_kernel(
             # value_table_lo = tl.reshape(tl.constexpr(value_table[:16]), (16, 1))  # (16,1) 
             # value_table_hi = tl.reshape(tl.constexpr(value_table[16:]), (16, 1))  # (16,1) 
 
-            # tlb_start_idx_1 / tlb_start_idx_2 是 (NR,) -> (1,NR) 以便广播到 (16,NR) 
+            # tlb_start_idx_1 / tlb_start_idx_2 是 (NR,) -> (NR, 1) 以便广播到 (NR. 16) 
             mask1 = tlb_start_idx_1.broadcast_to((NR, QK_4_K_SUB_BLOCK_DATA_SIZE)).cast(tl.int1)  # (NR,16) 
             mask2 = tlb_start_idx_2.broadcast_to((NR, QK_4_K_SUB_BLOCK_DATA_SIZE)).cast(tl.int1)  # (NR,16) 
 
@@ -188,16 +188,16 @@ def iq4k_q8k_gemv_kernel(
                 k_idx = tl.full((NR,), k, dtype=tl.int32).reshape((NR,1))
                 
                 # 从 [16,NR] 矩阵中提取第 k 行 -> [NR]
-                iq4k_data_lo = tl.reshape(tl.gather(src=iq4k_data_k0_15_dequant_data, index=k_idx, axis=1), (NR,)) # [NR] vector
+                iq4k_data_lo = tl.reshape(tl.gather(src=iq4k_data_k0_15_dequant_data, index=k_idx, axis=1), (NR,))  # [NR] vector
                 iq4k_data_hi = tl.reshape(tl.gather(src=iq4k_data_k16_31_dequant_data, index=k_idx, axis=1), (NR,)) # [NR] vector
 
                 q8k_data_ptr = tl.advance(q8k_block_ptr, offsets=(0, k_block, k_sub_block, k, 0))
 
-                q8k_data = tl.reshape(tl.load(q8k_data_ptr), (1,)) # [1]@int8，标量会自动广播
-                sum1 += q8k_data.cast(tl.int16) * iq4k_data_lo.cast(tl.int16) 
+                q8k_data = tl.reshape(tl.load(q8k_data_ptr), (1,)) # [1]@int8，标量会自动广播 
+                sum1 += q8k_data.cast(tl.int16) * iq4k_data_lo.cast(tl.int16)  
 
-                # 修复: 访问第二组数据时，offset 应该是 k + QK_4_K_SUB_BLOCK_DATA_SIZE (16)，而不是 k + QK_4_K_DATA_SIZE (128)
-                q8k_data_ptr = tl.advance(q8k_block_ptr, offsets=(0, k_block, k_sub_block, k + QK_4_K_SUB_BLOCK_DATA_SIZE, 0))
+                # 修复: 访问第二组数据时，offset 应该是 k + QK_4_K_SUB_BLOCK_DATA_SIZE (16)，而不是 k + QK_4_K_DATA_SIZE (128) 
+                q8k_data_ptr = tl.advance(q8k_block_ptr, offsets=(0, k_block, k_sub_block, k + QK_4_K_SUB_BLOCK_DATA_SIZE, 0)) 
                 q8k_data = tl.reshape(tl.load(q8k_data_ptr), (1,)) # [1]@int8，标量会自动广播 
                 sum2 += q8k_data.cast(tl.int16) * iq4k_data_hi.cast(tl.int16) 
 
@@ -226,9 +226,9 @@ if __name__ == "__main__":
     parser.add_argument('--n', type=int, default=512, help='输出维度(32 的倍数)')
     parser.add_argument('--k', type=int, default=256*4, help='输入维度(256 的倍数)')
     parser.add_argument('--batch', type=int, default=1, help='batch 维度')
-    parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--warmup', type=int, default=3)
-    parser.add_argument('--target-gb', type=float, default=1.0)
+    parser.add_argument('--rounds', type=int, default=100)
+    parser.add_argument('--warmup', type=int, default=10)
+    parser.add_argument('--target-gb', type=float, default=0.5)
     parser.add_argument('--num_threads', type=int, default=4)
     parser.add_argument('--simple-test', action='store_true', help='运行简单功能测试')
     args = parser.parse_args()
