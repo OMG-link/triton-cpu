@@ -1,11 +1,116 @@
 #include "Utils.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "llvm/TargetParser/Host.h"
 
 namespace mlir::triton::cpu {
 
+static inline bool is1DScalableVectorType(VectorType type) {
+  return type.getRank() == 1 && type.isScalable();
+}
+
+static inline bool is1DScalableVectorType(Type type) {
+  if (auto vecTy = dyn_cast<VectorType>(type)) {
+    return is1DScalableVectorType(vecTy);
+  } else {
+    return false;
+  }
+}
+
+static inline bool is1DFixedVectorType(VectorType type) {
+  return type.getRank() == 1 && !type.isScalable();
+}
+
+static inline bool is1DFixedVectorType(Type type) {
+  if (auto vecTy = dyn_cast<VectorType>(type)) {
+    return is1DFixedVectorType(vecTy);
+  } else {
+    return false;
+  }
+}
+
+static inline int64_t nextPowerOf2(int64_t x) {
+  if (x <= 1)
+    return 1;
+  return 1ll << (64 - __builtin_clzll(x - 1));
+}
+
 namespace rvv {
+
+FailureOr<VectorType> getSmallestScalableTypeThatHolds(VectorType vecTy) {
+  assert(is1DFixedVectorType(vecTy));
+  Type elemTy = vecTy.getElementType();
+  int64_t elemNum = vecTy.getNumElements();
+  int64_t elemBitWidth = vecTy.getElementTypeBitWidth();
+  int64_t vlen = getMinimumVlen();
+  if (elemNum * elemBitWidth > 8 * vlen) {
+    // Cannot find suitable scalable type
+    return failure();
+  }
+  int64_t regBits = nextPowerOf2(elemNum * elemBitWidth);
+  int64_t baseRegBits = regBits * 64 / vlen;
+  int64_t baseRegElemNum = baseRegBits / elemBitWidth;
+  return VectorType::get({baseRegElemNum}, elemTy, {true});
+}
+
 namespace intrinsic {
+
+Type getRvvTupleType(PatternRewriter &rewriter, Type vecTy, unsigned int size) {
+  assert(is1DScalableVectorType(vecTy));
+  if (size == 1) {
+    return vecTy;
+  } else {
+    assert(2 <= size && size <= 8);
+    return rewriter.getType<LLVM::LLVMTargetExtType>(
+        "riscv.vector.tuple", ArrayRef{vecTy}, ArrayRef{size});
+  }
+}
+
+Value insertToRvvTuple(Location loc, PatternRewriter &rewriter, Value tuple,
+                       Value vec, int64_t index) {
+  if (auto tupleTy = dyn_cast<LLVM::LLVMTargetExtType>(tuple.getType())) {
+    VectorType vecTy = cast<VectorType>(tupleTy.getTypeParams()[0]);
+    assert(is1DScalableVectorType(vec.getType()));
+    assert(is1DScalableVectorType(vecTy));
+    assert(vec.getType() == vecTy);
+    StringAttr intrinsicName =
+        rewriter.getStringAttr("llvm.riscv.tuple.insert");
+    Value index_value = rewriter.create<arith::ConstantIntOp>(
+        loc, index, rewriter.getI32Type());
+    SmallVector<Value> args = {tuple, vec, index_value};
+    auto rvvIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+        loc, tuple.getType(), intrinsicName, args);
+    return rvvIntrinsicOp.getResult(0);
+  } else if (auto vecTy = cast<VectorType>(tuple.getType())) {
+    // When num_fields = 1, it is a vector type
+    assert(index == 0);
+    return vec;
+  }
+  llvm_unreachable("invalid tuple type");
+}
+
+Value extractFromRvvTuple(Location loc, PatternRewriter &rewriter, Value tuple,
+                          int64_t index) {
+  if (auto tupleTy = dyn_cast<LLVM::LLVMTargetExtType>(tuple.getType())) {
+    VectorType vecTy = cast<VectorType>(tupleTy.getTypeParams()[0]);
+    assert(is1DScalableVectorType(vecTy));
+    StringAttr intrinsicName =
+        rewriter.getStringAttr("llvm.riscv.tuple.extract");
+    Value index_value = rewriter.create<arith::ConstantIntOp>(
+        loc, index, rewriter.getI32Type());
+    SmallVector<Value> args = {tuple, index_value};
+    auto rvvIntrinsicOp =
+        rewriter.create<LLVM::CallIntrinsicOp>(loc, vecTy, intrinsicName, args);
+    return rvvIntrinsicOp.getResult(0);
+  } else if (auto vecTy = cast<VectorType>(tuple.getType())) {
+    // When num_fields = 1, it is a vector type
+    assert(index == 0);
+    return tuple;
+  }
+  llvm_unreachable("invalid tuple type");
+}
 
 Value createLoad(Location loc, PatternRewriter &rewriter, VectorType resTy,
                  Value basePtr, Value vl) {
@@ -57,8 +162,86 @@ Value createRgather(Location loc, PatternRewriter &rewriter, VectorType resTy,
   }
 }
 
+Value createLoadStridedSegment(Location loc, PatternRewriter &rewriter,
+                               int64_t numFields, VectorType vecTy, Value base,
+                               Value stride, Value vl) {
+  assert(is1DScalableVectorType(vecTy));
+  assert(numFields * vecTy.getDimSize(0) * vecTy.getElementTypeBitWidth() <=
+         8 * getMinimumVlen());
+  if (numFields == 1) {
+    StringAttr intrinsicName = rewriter.getStringAttr("llvm.riscv.vlse");
+    Type intrinsicRetTy = vecTy;
+    Value poison = rewriter.create<ub::PoisonOp>(loc, vecTy);
+    SmallVector<Value> args = {poison, base, stride, vl};
+    auto rvvIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+        loc, intrinsicRetTy, intrinsicName, args);
+    return rvvIntrinsicOp.getResult(0);
+  } else {
+    assert(2 <= numFields && numFields <= 8);
+    Type groupType = getRvvTupleType(rewriter, vecTy, (unsigned int)numFields);
+    Type intrinsicRetTy = groupType;
+    StringAttr intrinsicName = rewriter.getStringAttr(
+        std::string("llvm.riscv.vlsseg") + std::to_string(numFields));
+    Value poison = rewriter.create<ub::PoisonOp>(loc, groupType);
+    Value tama =
+        rewriter.create<arith::ConstantIntOp>(loc, 3, rewriter.getI64Type());
+    SmallVector<Value> args = {poison, base, stride, vl, tama};
+    auto rvvIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+        loc, intrinsicRetTy, intrinsicName, args);
+    return rvvIntrinsicOp.getResult(0);
+  }
+}
+
+void createStoreStridedSegment(Location loc, PatternRewriter &rewriter,
+                               Value valueToStore, Value base, Value stride,
+                               Value vl) {
+  if (auto vecTy = dyn_cast<VectorType>(valueToStore.getType())) {
+    StringAttr intrinsicName = rewriter.getStringAttr("llvm.riscv.vsse");
+    Type intrinsicRetTy = rewriter.getType<LLVM::LLVMVoidType>();
+    SmallVector<Value> args = {valueToStore, base, stride, vl};
+    auto rvvIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+        loc, intrinsicRetTy, intrinsicName, args);
+  } else {
+    auto groupType = cast<LLVM::LLVMTargetExtType>(valueToStore.getType());
+    vecTy = cast<VectorType>(groupType.getTypeParams()[0]);
+    int64_t numFields = groupType.getIntParams()[0];
+    assert(is1DScalableVectorType(vecTy));
+    assert(numFields * vecTy.getDimSize(0) * vecTy.getElementTypeBitWidth() <=
+           8 * getMinimumVlen());
+    StringAttr intrinsicName = rewriter.getStringAttr(
+        std::string("llvm.riscv.vssseg") + std::to_string(numFields));
+    Type intrinsicRetTy = rewriter.getType<LLVM::LLVMVoidType>();
+    Value tama =
+        rewriter.create<arith::ConstantIntOp>(loc, 3, rewriter.getI64Type());
+    SmallVector<Value> args = {valueToStore, base, stride, vl, tama};
+    auto rvvIntrinsicOp = rewriter.create<LLVM::CallIntrinsicOp>(
+        loc, intrinsicRetTy, intrinsicName, args);
+  }
+  return;
+}
+
 } // namespace intrinsic
 } // namespace rvv
+
+std::string getCpuArch() {
+  std::string triple = llvm::sys::getProcessTriple();
+  std::size_t pos = triple.find('-');
+  if (pos == std::string::npos) {
+    return "unknown";
+  }
+  std::string arch = triple.substr(0, pos);
+  return arch;
+}
+
+std::set<std::string> getCpuFeatures() {
+  auto features = llvm::sys::getHostCPUFeatures();
+  std::set<std::string> res;
+  for (auto &f : features) {
+    if (f.second)
+      res.insert(f.first().str());
+  }
+  return res;
+}
 
 Value createBroadcast(Location loc, PatternRewriter &rewriter,
                       VectorType vectorTy, Value scalar) {
@@ -90,6 +273,45 @@ Value createExtuiOrTrunc(Location loc, PatternRewriter &rewriter, Type targetTy,
       return rewriter.createOrFold<arith::TruncIOp>(loc, targetTy, val);
     }
   }
+}
+
+Value createMemRefToRawPtr(Location loc, PatternRewriter &rewriter,
+                           Value memref) {
+  MLIRContext *context = rewriter.getContext();
+  Value ptr_index =
+      rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, memref);
+  Value ptr_i64 = rewriter.create<arith::IndexCastOp>(
+      loc, rewriter.getI64Type(), ptr_index);
+  Value ptr = rewriter.create<LLVM::IntToPtrOp>(
+      loc, LLVM::LLVMPointerType::get(context), ptr_i64);
+  return ptr;
+}
+
+Value convertToScalableVector(Location loc, PatternRewriter &rewriter,
+                              Value fixedVector, VectorType scalableVecTy) {
+  assert(is1DFixedVectorType(fixedVector.getType()));
+  assert(is1DScalableVectorType(scalableVecTy));
+  Value poison = rewriter.create<ub::PoisonOp>(loc, scalableVecTy);
+  return rewriter.create<LLVM::vector_insert>(loc, poison, fixedVector, 0);
+}
+
+Value convertToFixedVector(Location loc, PatternRewriter &rewriter,
+                           Value scalableVector, VectorType fixedVecTy) {
+  assert(is1DFixedVectorType(fixedVecTy));
+  assert(is1DScalableVectorType(scalableVector.getType()));
+  return rewriter.create<LLVM::vector_extract>(loc, fixedVecTy, scalableVector,
+                                               0);
+}
+
+Value createI64(Location loc, PatternRewriter &rewriter, int64_t val) {
+  return rewriter.create<arith::ConstantIntOp>(loc, val, rewriter.getI64Type());
+}
+
+Value createGep(Location loc, PatternRewriter &rewriter, Value ptr, Type elemTy,
+                Value index) {
+  return rewriter.create<LLVM::GEPOp>(loc,
+                                      rewriter.getType<LLVM::LLVMPointerType>(),
+                                      elemTy, ptr, ValueRange{index}, true);
 }
 
 } // namespace mlir::triton::cpu

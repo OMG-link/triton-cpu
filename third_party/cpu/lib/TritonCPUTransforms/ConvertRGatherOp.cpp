@@ -6,7 +6,6 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/TargetParser/Host.h"
 
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
 
@@ -171,25 +170,6 @@ LogicalResult convertToRvvIntrinsic(RGatherOp op, PatternRewriter &rewriter) {
 // Prefer backend-specific intrinsics if available; otherwise use the generic
 // 'vector.gather' lowering.
 LogicalResult convertRGather(RGatherOp op, PatternRewriter &rewriter) {
-  auto getCpuArch = []() -> std::string {
-    std::string triple = llvm::sys::getProcessTriple();
-    std::size_t pos = triple.find('-');
-    if (pos == std::string::npos) {
-      return "unknown";
-    }
-    std::string arch = triple.substr(0, pos);
-    return arch;
-  };
-  auto getCpuFeatures = []() -> std::set<std::string> {
-    auto features = llvm::sys::getHostCPUFeatures();
-    std::set<std::string> res;
-    for (auto &f : features) {
-      if (f.second)
-        res.insert(f.first().str());
-    }
-    return res;
-  };
-
   auto arch = getCpuArch();
   auto cpuFeatures = getCpuFeatures();
 

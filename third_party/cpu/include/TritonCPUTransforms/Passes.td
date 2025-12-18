@@ -163,6 +163,19 @@ def ConvertRGatherOp : Pass<"triton-cpu-convert-rgather-op", "mlir::ModuleOp"> {
                              "mlir::ub::UBDialect"];
 }
 
+def ConvertTransposeOp : Pass<"triton-cpu-convert-transpose-op", "mlir::ModuleOp"> {
+    let summary = "Lower vector.transpose op for specific backends.";
+    let description = [{
+        Lower vector.transpose if a high-performance transpose implementation for the
+        target backend exists.
+    }];
+
+    let constructor = "mlir::triton::cpu::createConvertTransposeOp()";
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::vector::VectorDialect",
+                             "mlir::triton::cpu::TritonCPUDialect"];
+}
+
 def ConvertDotOpToUkernelOps : Pass<"triton-cpu-convert-dot-to-ukernels", "mlir::ModuleOp"> {
     let summary = "Convert dot product op to ukernel ops.";
     let description = [{

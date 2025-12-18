@@ -68,6 +68,13 @@ static inline int64_t getVlen() {
   return -1;
 }
 
+static inline int64_t getMinimumVlen() {
+  int64_t vlen = getVlen();
+  if (vlen < 0)
+    vlen = 64;
+  return vlen;
+}
+
 // Returns: VSCALE of type 'index'
 static inline Value getVscale(Location loc, PatternRewriter &rewriter) {
   int vlen = getVlen();
@@ -94,7 +101,15 @@ static inline Value getVlmax(Location loc, PatternRewriter &rewriter,
   return vlmax;
 }
 
+FailureOr<VectorType> getSmallestScalableTypeThatHolds(VectorType vecTy);
+
 namespace intrinsic {
+
+Type getRvvTupleType(PatternRewriter &rewriter, Type vecTy, unsigned int size);
+Value insertToRvvTuple(Location loc, PatternRewriter &rewriter, Value tuple,
+                       Value vec, int64_t index);
+Value extractFromRvvTuple(Location loc, PatternRewriter &rewriter, Value tuple,
+                          int64_t index);
 
 Value createLoad(Location loc, PatternRewriter &rewriter, VectorType resTy,
                  Value basePtr, Value vl);
@@ -102,15 +117,37 @@ void createStoreMasked(Location loc, PatternRewriter &rewriter, Value basePtr,
                        Value val, Value mask, Value vl);
 Value createRgather(Location loc, PatternRewriter &rewriter, VectorType resTy,
                     Value table, Value indices, Value vl);
+Value createLoadStridedSegment(Location loc, PatternRewriter &rewriter,
+                               int64_t numFields, VectorType vecTy, Value base,
+                               Value stride, Value vl);
+void createStoreStridedSegment(Location loc, PatternRewriter &rewriter,
+                               Value valueToStore, Value base, Value stride,
+                               Value vl);
 
 } // namespace intrinsic
 
 } // namespace rvv
+
+std::string getCpuArch();
+std::set<std::string> getCpuFeatures();
 
 Value createBroadcast(Location loc, PatternRewriter &rewriter,
                       VectorType vectorTy, Value scalar);
 
 Value createExtuiOrTrunc(Location loc, PatternRewriter &rewriter, Type targetTy,
                          Value val);
+
+Value createMemRefToRawPtr(Location loc, PatternRewriter &rewriter,
+                           Value memref);
+
+Value convertToScalableVector(Location loc, PatternRewriter &rewriter,
+                              Value fixedVector, VectorType scalableVecTy);
+Value convertToFixedVector(Location loc, PatternRewriter &rewriter,
+                           Value scalableVector, VectorType fixedVecTy);
+
+Value createI64(Location loc, PatternRewriter &rewriter, int64_t val);
+
+Value createGep(Location loc, PatternRewriter &rewriter, Value ptr, Type elemTy,
+                Value index);
 
 } // namespace mlir::triton::cpu

@@ -202,6 +202,7 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
         cpu.passes.ttcpuir.add_optimize_masks(pm)
         passes.common.add_canonicalizer(pm)
+        cpu.passes.ttcpuir.add_convert_transpose_op(pm)
         if (ukernels := opt.get_ukernels()):
             # For further analysis simplification
             cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)
@@ -260,6 +261,11 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_ukernels_to_xsmm_llvmir(pm)
         cpu.passes.ttcpuir.add_lower_vector_multi_dim(pm)
         cpu.passes.ttcpuir.add_expand_strided_metadata(pm)
+
+        # Some backends have efficient transposed transfer_* impl
+        cpu.passes.ttcpuir.add_vector_to_scf(pm, True, 2, False)
+        cpu.passes.ttcpuir.add_lower_transposed_transfer(pm)
+
         cpu.passes.ttcpuir.add_vector_to_scf(pm, True, 1, False)
         cpu.passes.ttcpuir.add_lower_affine(pm)
         passes.convert.add_scf_to_cf(pm)
@@ -279,7 +285,9 @@ class CPUBackend(BaseBackend):
 
         passes.convert.add_math_to_llvmir(pm)
         cpu.passes.ttcpuir.add_math_to_libm(pm)
-        cpu.passes.ttcpuir.add_vector_to_llvmir(pm, options.enable_fast_math)
+        # available options of transpose policy:
+        #   eltwise, flat_transpose, shuffle_1d, shuffle_16x16
+        cpu.passes.ttcpuir.add_vector_to_llvmir(pm, options.enable_fast_math, "eltwise")
         cpu.passes.ttcpuir.add_memref_to_llvmir(pm)
         passes.convert.add_reconcile_unrealized(pm)
         passes.convert.add_arith_to_llvmir(pm)

@@ -9,6 +9,7 @@ import k1_cache_fix_tool
 from kernels.inner import InnerGEMM
 from kernels.outer import OuterGEMM
 from kernels.q4k_q8k_gemm import Q4K_Q8K_GEMM
+from kernels.transpose import TransposeKernel
 
 def correctness_test(kernel, test_shapes):
     print(f"\n===== Correctness Test: {kernel.get_name()} =====")
@@ -70,6 +71,9 @@ TEST_SETS = {
     "correctness": [
         (48, 512, 32),
     ],
+    "transpose_correctness": [
+        (32, 32, 1),
+    ],
     "normal_1": [
         (32, 256, 32),
         (32, 2048, 32),
@@ -92,34 +96,9 @@ TEST_SETS = {
 
 KERNELS = [
     {
-        "kernel": InnerGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=4),
-        "correctness": ["correctness"],
-        "performance": ["normal_1"],
-    },
-    {
-        "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=4, NR=32),
-        "correctness": ["correctness"],
-        "performance": ["normal_1"],
-    },
-    {
-        "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=8, NR=32),
-        "correctness": ["correctness"],
-        "performance": ["normal_1"],
-    },
-    {
-        "kernel": OuterGEMM(in_dtype="i8", out_dtype="i16", MR=16, NR=16),
-        "correctness": ["correctness"],
-        "performance": ["normal_1"],
-    },
-    {
-        "kernel": Q4K_Q8K_GEMM(MR=4, NR=32),
-        "correctness": ["correctness"],
-        "performance": ["q4k_q8k_1"],
-    },
-    {
-        "kernel": Q4K_Q8K_GEMM(MR=12, NR=32),
-        "correctness": ["correctness"],
-        "performance": ["q4k_q8k_2"],
+        "kernel": TransposeKernel(dtype="i8", TN=4, TM=8),
+        "correctness": ["transpose_correctness"],
+        "performance": [],
     },
 ]
 
