@@ -1,5 +1,3 @@
-#include "triton/Tools/Sys/GetEnv.hpp"
-
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -37,36 +35,7 @@ static inline int64_t tryReadVlenb() {
 #endif
 }
 
-static inline int64_t getVlen() {
-  std::string RVV_VLEN = mlir::triton::tools::getStrEnv("RVV_VLEN");
-  // if RVV_VLEN is defined
-  if (!RVV_VLEN.empty()) {
-    if (RVV_VLEN == "dynamic") {
-      return -1;
-    } else if (RVV_VLEN == "local") {
-      int vlenb = tryReadVlenb();
-      if (vlenb > 0) {
-        return vlenb * 8;
-      } else {
-        return -1;
-      }
-    } else {
-      char *end;
-      long vlen = strtol(RVV_VLEN.c_str(), &end, 10);
-      if (*end == '\0') {
-        if (vlen >= 64 && (vlen & (vlen - 1)) == 0) {
-          return vlen;
-        }
-      }
-    }
-  }
-  // fallback
-  int vlenb = tryReadVlenb();
-  if (vlenb > 0) {
-    return vlenb * 8;
-  }
-  return -1;
-}
+int64_t getVlen();
 
 static inline int64_t getMinimumVlen() {
   int64_t vlen = getVlen();

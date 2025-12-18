@@ -3,6 +3,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/TargetParser/Host.h"
 
 namespace mlir::triton::cpu {
@@ -38,6 +39,37 @@ static inline int64_t nextPowerOf2(int64_t x) {
 }
 
 namespace rvv {
+
+int64_t getVlen() {
+  std::string RVV_VLEN = mlir::triton::tools::getStrEnv("RVV_VLEN");
+  // if RVV_VLEN is defined
+  if (!RVV_VLEN.empty()) {
+    if (RVV_VLEN == "dynamic") {
+      return -1;
+    } else if (RVV_VLEN == "local") {
+      int vlenb = tryReadVlenb();
+      if (vlenb > 0) {
+        return vlenb * 8;
+      } else {
+        return -1;
+      }
+    } else {
+      char *end;
+      long vlen = strtol(RVV_VLEN.c_str(), &end, 10);
+      if (*end == '\0') {
+        if (vlen >= 64 && (vlen & (vlen - 1)) == 0) {
+          return vlen;
+        }
+      }
+    }
+  }
+  // fallback
+  int vlenb = tryReadVlenb();
+  if (vlenb > 0) {
+    return vlenb * 8;
+  }
+  return -1;
+}
 
 FailureOr<VectorType> getSmallestScalableTypeThatHolds(VectorType vecTy) {
   assert(is1DFixedVectorType(vecTy));
