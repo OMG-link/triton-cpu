@@ -115,8 +115,8 @@ Value createLoad(Location loc, PatternRewriter &rewriter, VectorType resTy,
                  Value basePtr, Value vl);
 void createStoreMasked(Location loc, PatternRewriter &rewriter, Value basePtr,
                        Value val, Value mask, Value vl);
-Value createRgather(Location loc, PatternRewriter &rewriter, VectorType resTy,
-                    Value table, Value indices, Value vl);
+Value createRgather(Location loc, PatternRewriter &rewriter, Value table,
+                    Value indices, Value vl);
 Value createLoadStridedSegment(Location loc, PatternRewriter &rewriter,
                                int64_t numFields, VectorType vecTy, Value base,
                                Value stride, Value vl);

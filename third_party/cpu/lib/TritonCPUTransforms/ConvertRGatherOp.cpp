@@ -72,95 +72,71 @@ static inline int64_t nextPowerOf2(int64_t x) {
   return 1ll << (64 - __builtin_clzll(x - 1));
 }
 
-static inline Value extendVector(Location loc, PatternRewriter &rewriter,
-                                 Value src, int64_t dstSize) {
-  VectorType srcTy = cast<VectorType>(src.getType());
-  assert(srcTy.getRank() == 1 && srcTy.isScalable() == false);
-  int64_t srcSize = srcTy.getDimSize(0);
-  assert(srcSize <= dstSize);
-  if (srcSize == dstSize)
-    return src;
-  VectorType dstTy =
-      VectorType::get({dstSize}, srcTy.getElementType(), {false});
-  Value background = rewriter.create<ub::PoisonOp>(loc, dstTy);
-  return rewriter.create<vector::InsertStridedSliceOp>(
-      loc, src, background, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
-}
-
-static inline Value truncVector(Location loc, PatternRewriter &rewriter,
-                                Value src, int64_t dstSize) {
-  VectorType srcTy = cast<VectorType>(src.getType());
-  assert(srcTy.getRank() == 1 && srcTy.isScalable() == false);
-  int64_t srcSize = srcTy.getDimSize(0);
-  assert(srcSize >= dstSize);
-  if (srcSize == dstSize)
-    return src;
-  VectorType dstTy =
-      VectorType::get({dstSize}, srcTy.getElementType(), {false});
-  return rewriter.create<vector::ExtractStridedSliceOp>(
-      loc, src, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{dstSize},
-      ArrayRef<int64_t>{1});
-}
-
 LogicalResult convertToRvvIntrinsic(RGatherOp op, PatternRewriter &rewriter) {
   LDBG("Attempt to lower with RVV intrinsic: " << op);
 
   Location loc = op.getLoc();
-  Value table = op.getSrc();
-  Value indices = op.getIndices();
+  Value table_fixed = op.getSrc();
+  Value indices_fixed = op.getIndices();
 
-  VectorType tableTy = cast<VectorType>(table.getType());
-  VectorType indicesTy = cast<VectorType>(indices.getType());
-  VectorType resultTy = cast<VectorType>(op.getResult().getType());
+  VectorType tableTy_fixed = cast<VectorType>(table_fixed.getType());
+  VectorType indicesTy_fixed = cast<VectorType>(indices_fixed.getType());
+  VectorType resultTy_fixed = cast<VectorType>(op.getResult().getType());
 
-  int64_t indicesSize = indicesTy.getDimSize(0);
-  int64_t tableSize = tableTy.getDimSize(0);
   // LLVM IR intrinsic requires indicesSize and tableSize to be the same
-  int64_t intrinsicSize = nextPowerOf2(std::max(indicesSize, tableSize));
+  int64_t intrinsicSize = nextPowerOf2(
+      std::max(indicesTy_fixed.getDimSize(0), tableTy_fixed.getDimSize(0)));
 
   /// Pre-check
   // By definition of vrgather, tableTy must be 1-D vector.
   // We only need to check indices type.
-  if (indicesTy.getRank() != 1) {
+  if (indicesTy_fixed.getRank() != 1) {
     LDBG("  RVV intrinsic lowering failed: indices must be 1-D vector.");
     return failure();
   }
   // Triton frontend will not produce scalable inputs.
   // Bail out when seeing scalable vectors for simplicity.
-  if (tableTy.isScalable() || indicesTy.isScalable() || resultTy.isScalable()) {
+  if (tableTy_fixed.isScalable() || indicesTy_fixed.isScalable() ||
+      resultTy_fixed.isScalable()) {
     LDBG(
         "  RVV intrinsic lowering failed: scalable vectors are not supported.");
     return failure();
   }
   // If the indices or result cannot be held with 8 VREGs, bail out.
-  int64_t vlen = rvv::getVlen();
-  if (vlen < 0) {
-    vlen = 64;
-  }
-  if (intrinsicSize * indicesTy.getElementTypeBitWidth() > vlen * 8) {
+  int64_t vlen = rvv::getMinimumVlen();
+  if (intrinsicSize * indicesTy_fixed.getElementTypeBitWidth() > vlen * 8) {
     LDBG("  RVV intrinsic lowering failed: indices needs more than 8 VREGs.");
     return failure();
   }
-  if (intrinsicSize * resultTy.getElementTypeBitWidth() > vlen * 8) {
+  if (intrinsicSize * resultTy_fixed.getElementTypeBitWidth() > vlen * 8) {
     LDBG("  RVV intrinsic lowering failed: result needs more than 8 VREGs.");
     return failure();
   }
 
   /// Prepare arguments for intrinsic
   // Extend vectors to intrinsic size
-  table = extendVector(loc, rewriter, table, intrinsicSize);
-  indices = extendVector(loc, rewriter, indices, intrinsicSize);
+  VectorType resultTy_scalable =
+      rvv::getSmallestScalableTypeThatHolds(
+          VectorType::get({intrinsicSize}, resultTy_fixed.getElementType()))
+          .value();
+  VectorType tableTy_scalable =
+      resultTy_scalable.cloneWith(std::nullopt, tableTy_fixed.getElementType());
+  VectorType indicesTy_scalable = resultTy_scalable.cloneWith(
+      std::nullopt, indicesTy_fixed.getElementType());
+  Value table_scalable =
+      convertToScalableVector(loc, rewriter, table_fixed, tableTy_scalable);
+  Value indices_scalable =
+      convertToScalableVector(loc, rewriter, indices_fixed, indicesTy_scalable);
+
   // 'vl' limits the number of indices to be queried
-  Value vl = rewriter.create<arith::ConstantIntOp>(loc, indicesSize,
-                                                   rewriter.getI64Type());
+  Value vl = createI64(loc, rewriter, indicesTy_fixed.getDimSize(0));
 
   /// Create intrinsic
-  VectorType intrinsicResultTy =
-      VectorType::get({intrinsicSize}, resultTy.getElementType(), {false});
-  Value rgatherIntrinsic = rvv::intrinsic::createRgather(
-      loc, rewriter, intrinsicResultTy, table, indices, vl);
-  Value result = truncVector(loc, rewriter, rgatherIntrinsic, indicesSize);
-  rewriter.replaceOp(op, result);
+  Value result_scalable = rvv::intrinsic::createRgather(
+      loc, rewriter, table_scalable, indices_scalable, vl);
+  Value result_fixed =
+      convertToFixedVector(loc, rewriter, result_scalable, resultTy_fixed);
+  rewriter.replaceOp(op, result_fixed);
 
   LDBG("  RVV intrinsic lowering succeed.");
   return success();

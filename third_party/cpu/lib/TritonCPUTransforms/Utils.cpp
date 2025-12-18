@@ -114,6 +114,7 @@ Value extractFromRvvTuple(Location loc, PatternRewriter &rewriter, Value tuple,
 
 Value createLoad(Location loc, PatternRewriter &rewriter, VectorType resTy,
                  Value basePtr, Value vl) {
+  assert(is1DScalableVectorType(resTy));
   StringAttr intrinsicName = rewriter.getStringAttr("llvm.riscv.vle");
   Value poison = rewriter.create<LLVM::PoisonOp>(loc, resTy);
   SmallVector<Value> args = {poison, basePtr, vl};
@@ -124,6 +125,7 @@ Value createLoad(Location loc, PatternRewriter &rewriter, VectorType resTy,
 
 void createStoreMasked(Location loc, PatternRewriter &rewriter, Value val,
                        Value basePtr, Value mask, Value vl) {
+  assert(is1DScalableVectorType(val.getType()));
   StringAttr intrinsicName = rewriter.getStringAttr("llvm.riscv.vse.mask");
   SmallVector<Value> args = {val, basePtr, mask, vl};
   auto rvvStoreOp =
@@ -131,15 +133,17 @@ void createStoreMasked(Location loc, PatternRewriter &rewriter, Value val,
   return;
 }
 
-Value createRgather(Location loc, PatternRewriter &rewriter, VectorType resTy,
-                    Value table, Value indices, Value vl) {
+Value createRgather(Location loc, PatternRewriter &rewriter, Value table,
+                    Value indices, Value vl) {
   VectorType tableTy = cast<VectorType>(table.getType());
   VectorType indicesTy = cast<VectorType>(indices.getType());
+  assert(is1DScalableVectorType(tableTy));
+  assert(is1DScalableVectorType(indicesTy));
+  VectorType resTy =
+      indicesTy.cloneWith(std::nullopt, tableTy.getElementType());
   // LLVM IR intrinsic requires all operands has the same number of elements.
-  assert(resTy.getNumElements() == tableTy.getNumElements() &&
-         resTy.getNumElements() == indicesTy.getNumElements());
-  if (tableTy.getElementTypeBitWidth() == indicesTy.getElementTypeBitWidth() &&
-      tableTy.getNumElements() == indicesTy.getNumElements()) {
+  assert(tableTy.getNumElements() == indicesTy.getNumElements());
+  if (tableTy.getElementTypeBitWidth() == indicesTy.getElementTypeBitWidth()) {
     StringAttr intrinsicName = rewriter.getStringAttr("llvm.riscv.vrgather.vv");
     Value poison = rewriter.create<LLVM::PoisonOp>(loc, resTy);
     SmallVector<Value> args = {poison, table, indices, vl};
