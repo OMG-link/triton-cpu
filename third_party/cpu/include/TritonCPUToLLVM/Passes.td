@@ -115,18 +115,4 @@ def MathToVecLib : Pass<"triton-cpu-math-to-vec-lib", "mlir::ModuleOp"> {
                              "mlir::LLVM::LLVMDialect"];
 }
 
-def LowerTransposedTransferOp : Pass<"triton-cpu-lower-transposed-transfer-op", "mlir::ModuleOp"> {
-    let summary = "Lower transposed transfer if efficient implement is avaliable.";
-    let description = [{
-        If the target backend has efficient implement of transposed transfer_read/transfer_write, lower it.
-    }];
-
-    let constructor = "mlir::triton::cpu::createLowerTransposedTransferOp()";
-    let dependentDialects = ["mlir::arith::ArithDialect",
-                             "mlir::LLVM::LLVMDialect",
-                             "mlir::vector::VectorDialect",
-                             "mlir::triton::cpu::TritonCPUDialect",
-                             "mlir::ub::UBDialect"];
-}
-
 #endif

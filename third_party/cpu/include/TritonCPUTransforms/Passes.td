@@ -173,7 +173,8 @@ def ConvertTransposeOp : Pass<"triton-cpu-convert-transpose-op", "mlir::ModuleOp
     let constructor = "mlir::triton::cpu::createConvertTransposeOp()";
     let dependentDialects = ["mlir::arith::ArithDialect",
                              "mlir::vector::VectorDialect",
-                             "mlir::triton::cpu::TritonCPUDialect"];
+                             "mlir::triton::cpu::TritonCPUDialect",
+                             "mlir::ub::UBDialect"];
 }
 
 def ConvertDotOpToUkernelOps : Pass<"triton-cpu-convert-dot-to-ukernels", "mlir::ModuleOp"> {

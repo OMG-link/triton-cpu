@@ -29,7 +29,6 @@ std::unique_ptr<OperationPass<ModuleOp>> createFuncOpToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createMemoryOpToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createGetProgramIdOpToLLVMPass();
 std::unique_ptr<OperationPass<triton::FuncOp>> createLowerMultiReductionPass();
-std::unique_ptr<OperationPass<ModuleOp>> createLowerTransposedTransferOp();
 std::unique_ptr<OperationPass<ModuleOp>> createAtomicOpsToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDebugOpsToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createUkernelOpsToOneDNNLLVMPass();

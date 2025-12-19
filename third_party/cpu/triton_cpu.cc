@@ -140,9 +140,6 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_convert_transpose_op", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createConvertTransposeOp());
   });
-  m.def("add_lower_transposed_transfer", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::cpu::createLowerTransposedTransferOp());
-  });
   m.def("add_convert_unsupported_ops",
         [](mlir::PassManager &pm, bool promote_bf16_to_fp32,
            bool convert_mixed_precision_matmul, bool promote_lib_math_to_fp32) {

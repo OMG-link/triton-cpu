@@ -261,11 +261,6 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_ukernels_to_xsmm_llvmir(pm)
         cpu.passes.ttcpuir.add_lower_vector_multi_dim(pm)
         cpu.passes.ttcpuir.add_expand_strided_metadata(pm)
-
-        # Some backends have efficient transposed transfer_* impl
-        cpu.passes.ttcpuir.add_vector_to_scf(pm, True, 2, False)
-        cpu.passes.ttcpuir.add_lower_transposed_transfer(pm)
-
         cpu.passes.ttcpuir.add_vector_to_scf(pm, True, 1, False)
         cpu.passes.ttcpuir.add_lower_affine(pm)
         passes.convert.add_scf_to_cf(pm)
