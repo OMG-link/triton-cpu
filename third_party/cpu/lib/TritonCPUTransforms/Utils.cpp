@@ -81,9 +81,8 @@ FailureOr<VectorType> getSmallestScalableTypeThatHolds(VectorType vecTy) {
     // Cannot find suitable scalable type
     return failure();
   }
-  int64_t regBits = nextPowerOf2(elemNum * elemBitWidth);
-  int64_t baseRegBits = regBits * 64 / vlen;
-  int64_t baseRegElemNum = baseRegBits / elemBitWidth;
+  int64_t baseRegElemNum =
+      std::max(nextPowerOf2(elemNum) * 64 / vlen, int64_t(1));
   return VectorType::get({baseRegElemNum}, elemTy, {true});
 }
 
