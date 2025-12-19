@@ -462,11 +462,14 @@ def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int,
             # 根据测试数据大小动态选择 n_kernel_repeat
             # 根据 峰值 GOPS 计算需要考虑重复次数，使得每launch 一次 kernel 最少能跑 10s
             ops_per_call = 2 * M * N * K
-            n_kernel_repeat = max(n_kernel_repeat, int(peak_gops * 1e9 / ops_per_call))
+            print(peak_gops * 1e9)
+            print(ops_per_call)
+            kernel_repeat = max(n_kernel_repeat, int((peak_gops * 1e9) // ops_per_call))
             
             # 调用 benchmark 函数
+            print(f"  [{idx:3d}/{len(valid_shapes)}] M={M:4d} K={K:5d} N={N:5d} n_kernel_repeat={kernel_repeat} | ", end='', flush=True)
             median_ms, min_ms, max_ms = run_single_benchmark(
-                spec, M, K, N, warmup, rounds, num_threads, n_kernel_repeat
+                spec, M, K, N, warmup, rounds, num_threads, kernel_repeat
             )
             
             # 计算性能指标
@@ -479,8 +482,7 @@ def run_bench(shapes: List[Tuple[int,int,int]], warmup: int, rounds: int,
             util_max = (gops_max / peak_gops * 100.0) if peak_gops > 0 else 0.0
             
             # 实时输出进度
-            print(f"  [{idx:3d}/{len(valid_shapes)}] M={M:4d} K={K:5d} N={N:5d} n_kernel_repeat={n_kernel_repeat} | "
-                  f"时间: {median_ms:7.3f}ms | "
+            print(f"时间: {median_ms:7.3f}ms | "
                   f"性能: {gops_med:6.2f} GOPS@{compute_dtype} ({util_med:5.1f}%)")
             
             # 保存结果

@@ -187,22 +187,22 @@ def iq4k_q8k_matmul_kernel(
             iq4k_data_k16_31_dequant_data = tl.gather(src=value_table, index=iq4k_data_2, axis=1)  # (16, NR) 
 
             iq4k_scale_1 = iq4k_scale_1.reshape((1, NR)).broadcast_to((MR, NR)) 
-            sum1 = tl.zeros((MR, NR), dtype=tl.int16)
+            # sum1 = tl.zeros((MR, NR), dtype=tl.int16)
             sum1 = tl.dot(q8k_data_k0_15.T, iq4k_data_k0_15_dequant_data, out_dtype = tl.int16)  # int16, shape (12, 32)
             sum += sum1 * iq4k_scale_1  # int32, shape (MR, NR)
 
             iq4k_scale_2 = iq4k_scale_2.reshape(1,NR).broadcast_to((MR, NR))
-            sum2 = tl.zeros((MR, NR), dtype=tl.int16)
+            # sum2 = tl.zeros((MR, NR), dtype=tl.int16)
             sum2 = tl.dot(q8k_data_k16_31.T, iq4k_data_k16_31_dequant_data, out_dtype = tl.int16)  # int16, shape (MR, NR)
             sum += sum2 * iq4k_scale_2  # int32, shape (MR, NR)
         # 量化比例
         q8k_d_data_ptr = tl.advance(q8k_d_block_ptr, offsets=(0, k_block, 0)) 
         q8k_d_data = tl.load(q8k_d_data_ptr)  # float, shape (MR)
-        q8k_d_data_reshaped = tl.reshape(q8k_d_data, (MR, 1))
+        q8k_d_data_reshaped = tl.reshape(q8k_d_data, (1, MR))
         iq4_d_data_ptr = tl.advance(iq4k_d_block_ptr, offsets=(0, k_block, 0)) 
         iq4_d_data = tl.load(iq4_d_data_ptr)  # float, shape (NR)
-        iq4_d_data_reshaped = tl.reshape(iq4_d_data, (NR, 1))
-        scale_matrix  = tl.dot(q8k_d_data_reshaped, iq4_d_data_reshaped.T, out_dtype=tl.float32)  # float, shape (MR, NR)
+        iq4_d_data_reshaped = tl.reshape(iq4_d_data, (1, NR))
+        scale_matrix  = tl.dot(q8k_d_data_reshaped.T, iq4_d_data_reshaped, out_dtype=tl.float32)  # float, shape (MR, NR)
         acc += sum.cast(tl.float32) * scale_matrix
 
     # 写回结果

@@ -7,6 +7,10 @@
 
 const int VL = 32;
 
+#define FREQ 1.6
+#define VLEN 256
+#define ELEM_WID 16
+
 
 int main(int argc, char **argv) {
 
@@ -34,7 +38,8 @@ int main(int argc, char **argv) {
     block_q8_0 *vy = static_cast<block_q8_0 *>(calloc(m * nb, sizeof(block_q8_0)));
 
     // times test should be repeated:
-    int T = 50;
+    int peak_fops = FREQ * VLEN / ELEM_WID;
+    int T = 3 > ((1e9 * peak_fops) / (m * n * k)) ? 3 : ((1e9 * peak_fops) / (m * n * k)) ;
 
     // Warmup
     // ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
@@ -49,11 +54,13 @@ int main(int argc, char **argv) {
     perf_reset(fd_l1dm);
 
     // Main test
-    for(size_t i = 0; i < m; i++) { // M vy 激活
-        for(size_t j = 0; j < n; j++) { // N vx 
-                float result = 0;
-                ggml_vec_dot_q4_0_q8_0(k, &result, n, vx + j * nb, 1, vy + i * nb, 1, 1);
-                *(s + i * n + j) = result;
+    for(size_t iter = 0; iter < T; iter++){
+        for(size_t i = 0; i < m; i++) { // M vy 激活
+            for(size_t j = 0; j < n; j++) { // N vx 
+                    float result = 0;
+                    ggml_vec_dot_q4_0_q8_0(k, &result, n, vx + j * nb, 1, vy + i * nb, 1, 1);
+                    *(s + i * n + j) = result;
+            }
         }
     }
 
@@ -70,6 +77,8 @@ int main(int argc, char **argv) {
 
     int64_t cycle_total = cycles;
     int64_t cycle_per_test = cycle_total / T;
+    printf("cycle_per_test: %ld, cycle_total: %ld, T: %d\n", cycle_per_test, cycle_total, T);
+
 
     int64_t n_fma = static_cast<int64_t>(k) * m * n; // 考虑实际形状，为了避免 padding，这里用的整数倍的寄存器分块大小 
     int64_t fma_per_cycle;

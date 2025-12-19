@@ -6,6 +6,10 @@
 
 const int VL = 32;
 
+#define FREQ 1.6
+#define VLEN 256
+#define ELEM_WID 16
+
 // VL * QK
 template <int VL> struct block_iq4_Kx { 
 	ggml_half d[VL];                           // super-block scale for quantized scales
@@ -62,7 +66,8 @@ int main(int argc, char **argv) {
     InBlock *vy = static_cast<InBlock *>(calloc(n_blocks_vy, sizeof(InBlock)));
 
     // times test should be repeated:
-    int T = 50;
+    int peak_fops = FREQ * VLEN / ELEM_WID;
+    int T = 3 > ((1e9 * peak_fops) / (m * n * k)) ? 3 : ((1e9 * peak_fops) / (m * n * k)) ;
 
     // Warmup
     ggml_gemm_iq4_K_12x32_q8_K(k, s, bs, vx, vy, m, n);
@@ -91,6 +96,7 @@ int main(int argc, char **argv) {
 
     int64_t cycle_total = cycles;
     int64_t cycle_per_test = cycle_total / T;
+    printf("cycle_per_test: %ld, cycle_total: %ld, T: %d\n", cycle_per_test, cycle_total, T);
 
     int64_t n_fma = static_cast<int64_t>(k) * mTile * nTile * 12 * VL; // 考虑实际形状，为了避免 padding，这里用的整数倍的寄存器分块大小 
     int64_t fma_per_cycle;

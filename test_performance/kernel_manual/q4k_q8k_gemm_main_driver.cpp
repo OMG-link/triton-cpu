@@ -4,6 +4,10 @@
 #include "perf.h"
 #include "timer.hpp"
 
+#define FREQ 1.6
+#define VLEN 256
+#define ELEM_WID 16
+
 const int VL = 32;
 
 using InBlock = block_q8_Kx<12>;
@@ -115,7 +119,9 @@ int main(int argc, char **argv) {
     InBlock *vy = static_cast<InBlock *>(calloc(n_blocks_vy, sizeof(*vy)));
 
     // times test should be repeated:
-    int T = 50;
+    int peak_fops = FREQ * VLEN / ELEM_WID;
+    int T = 3 > ((1e9 * peak_fops) / (m * n * k)) ? 3 : ((1e9 * peak_fops) / (m * n * k)) ;
+
 
     // Warmup
     ggml_gemm_q4_K_8x32_q8_K(k, s, bs, vx, vy, m, n);
