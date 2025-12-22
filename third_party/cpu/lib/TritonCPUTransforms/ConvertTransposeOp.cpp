@@ -42,50 +42,33 @@ struct MergeTransposeIntoTransfer
     auto writeOp = cast<vector::TransferWriteOp>(*output.user_begin());
     LDBG("  Merging transpose into: " << writeOp);
 
-    // Get MemRef
-    auto memRef = writeOp.getSource();
-    auto memRefTy = dyn_cast<MemRefType>(memRef.getType());
-    if (!memRefTy) {
-      LDBG("  Failed: transfer_write did not write into a memref");
-      return failure();
-    }
-
     // Make sure transfer_write has no complex attributes
-    if (!writeOp.getPermutationMapAttr().isIdentity()) {
-      LDBG("  Failed: transfer_write contains complex permutation_map");
-      return failure();
-    }
     if (writeOp.isMasked()) {
       LDBG("  Failed: transfer_write is masked");
       return failure();
     }
     if (writeOp.hasOutOfBoundsDim()) {
+      // FIXME: we actually can process this
       LDBG("  Failed: transfer_write has out of bounds dims");
       return failure();
     }
 
-    // Convert DenseI64MapAttr to AffineMapAttr for memref::TransposeOp
-    auto perm_I64Array = transposeOp.getPermutation();
-    auto perm_AffineMap =
-        AffineMap::getPermutationMap(perm_I64Array, rewriter.getContext());
-    auto perm_AffineMapAttr = AffineMapAttr::get(perm_AffineMap);
+    int64_t rank = writeOp.getVectorType().getRank();
+    auto perm = transposeOp.getPermutation();
+    assert(rank == perm.size());
 
-    // Apply transpose to indices
-    auto indices_old = writeOp.getIndices();
-    SmallVector<Value> indices_new(indices_old.size());
-    for (int64_t i = 0; i < perm_I64Array.size(); i++) {
-      indices_new[perm_I64Array[i]] = indices_old[i];
+    // Permute transfer_write.affine_map
+    auto oldAffineMap = writeOp.getPermutationMap();
+    assert(rank == oldAffineMap.getNumResults());
+    SmallVector<AffineExpr> newAffineMapExprs(rank);
+    for (int64_t i = 0; i < rank; i++) {
+      newAffineMapExprs[i] = oldAffineMap.getResult(perm[i]);
     }
+    auto newAffineMap =
+        AffineMap::get(rank, 0, newAffineMapExprs, rewriter.getContext());
 
-    // Transpose memref
-    rewriter.setInsertionPointAfterValue(memRef);
-    auto transposedMemRef = rewriter.create<memref::TransposeOp>(
-        transposeOp.getLoc(), memRef, perm_AffineMapAttr);
     writeOp.getVectorMutable().set(input);
-    writeOp.getSourceMutable().set(transposedMemRef);
-    for (int64_t i = 0; i < indices_new.size(); i++) {
-      writeOp.getIndicesMutable()[i].set(indices_new[i]);
-    }
+    writeOp.setPermutationMap(newAffineMap);
 
     LDBG("  Success, new transfer_write: " << writeOp);
     return success();
@@ -97,55 +80,39 @@ struct MergeTransposeIntoTransfer
 
     Value input = transposeOp.getOperand();
     Value output = transposeOp.getResult();
-    int64_t rank = transposeOp.getResultVectorType().getRank();
     auto oldReadOp = cast<vector::TransferReadOp>(input.getDefiningOp());
     LDBG("  Merging transpose into: " << oldReadOp);
 
-    // Get MemRef
-    auto memRef = oldReadOp.getSource();
-    auto memRefTy = dyn_cast<MemRefType>(memRef.getType());
-    if (!memRefTy) {
-      LDBG("  Failed: transfer_read did not read from a memref");
-      return failure();
-    }
-
     // Make sure transfer_read has no complex attributes
-    if (!oldReadOp.getPermutationMapAttr().isIdentity()) {
-      LDBG("  Failed: transfer_read contains complex permutation_map");
-      return failure();
-    }
     if (oldReadOp.isMasked()) {
       LDBG("  Failed: transfer_read is masked");
       return failure();
     }
     if (oldReadOp.hasOutOfBoundsDim()) {
+      // FIXME: we actually can process this
       LDBG("  Failed: transfer_read has out of bounds dims");
       return failure();
     }
 
-    // Convert DenseI64MapAttr to AffineMapAttr for memref::TransposeOp
-    auto perm_I64Array = transposeOp.getPermutation();
-    auto perm_AffineMap =
-        AffineMap::getPermutationMap(perm_I64Array, rewriter.getContext());
-    auto perm_AffineMapAttr = AffineMapAttr::get(perm_AffineMap);
+    int64_t rank = oldReadOp.getResult().getType().getRank();
+    auto perm = transposeOp.getPermutation();
+    assert(rank == perm.size());
 
-    // Apply transpose to indices
-    auto indices_old = oldReadOp.getIndices();
-    SmallVector<Value> indices_new(indices_old.size());
+    // Permute transfer_read.affine_map
+    auto oldAffineMap = oldReadOp.getPermutationMap();
+    assert(rank == oldAffineMap.getNumResults());
+    SmallVector<AffineExpr> newAffineMapExprs(rank);
     for (int64_t i = 0; i < rank; i++) {
-      indices_new[perm_I64Array[i]] = indices_old[i];
+      newAffineMapExprs[perm[i]] = oldAffineMap.getResult(i);
     }
-
-    // Transpose memref
-    rewriter.setInsertionPointAfter(oldReadOp);
-    auto transposedMemRef = rewriter.create<memref::TransposeOp>(
-        transposeOp.getLoc(), memRef, perm_AffineMapAttr);
+    auto newAffineMap = AffineMap::get(
+        oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
 
     // Create new transfer_read
     auto newReadOp = rewriter.create<vector::TransferReadOp>(
-        oldReadOp.getLoc(), cast<VectorType>(output.getType()),
-        transposedMemRef, indices_new, oldReadOp.getPadding(),
-        SmallVector<bool>(rank, true));
+        oldReadOp.getLoc(), output.getType(), oldReadOp.getSource(),
+        oldReadOp.getIndices(), newAffineMap, oldReadOp.getPadding(),
+        oldReadOp.getMask(), oldReadOp.getInBounds());
     rewriter.replaceOp(transposeOp, newReadOp);
 
     LDBG("  Success, new transfer_read: " << newReadOp);
@@ -208,14 +175,18 @@ struct MergeTransposeIntoTransfer
   }
 };
 
-template <typename TransferOp> bool isTransposedTransfer(TransferOp op) {
+bool isTransposedTransfer(VectorTransferOpInterface op) {
   bool isOutOfBounds = op.hasOutOfBoundsDim();
   bool isMasked = bool(op.getMask());
-  bool isPermuted = !op.getPermutationMap().isIdentity();
-  if (isOutOfBounds || isMasked || isPermuted) {
-    // In fact, we can handle permuted cases.
+  if (isOutOfBounds || isMasked) {
+    // In fact, we can handle such cases.
     // But skip it for simplicity for now.
-    LDBG("  Skipped: 'isOutOfBounds || isMasked || isPermuted'");
+    LDBG("  Skipped: 'isOutOfBounds || isMasked'");
+    return false;
+  }
+  int64_t rank = op.getVectorType().getRank();
+  if (rank != 2) {
+    LDBG("  Skipped: 'rank != 2'");
     return false;
   }
   auto memRefTy = dyn_cast<MemRefType>(op.getSource().getType());
@@ -224,27 +195,39 @@ template <typename TransferOp> bool isTransposedTransfer(TransferOp op) {
     return false;
   }
   auto strides = memRefTy.getStridesAndOffset().first;
-  int64_t rank = strides.size();
-  if (rank != 2) {
-    LDBG("  Skipped: 'rank != 2'");
+  auto affineMap = op.getPermutationMap();
+  int64_t dim0, dim1;
+  if (auto affineDimExpr = dyn_cast<AffineDimExpr>(affineMap.getResult(0))) {
+    dim0 = affineDimExpr.getPosition();
+  } else {
+    LDBG("  Skipped: unknown/invalid type of affine map");
     return false;
   }
-  bool isTransposed = (strides[rank - 2] == 1 && strides[rank - 1] != 1);
-  if (isTransposed) {
-    LDBG("  Pre-check passed");
-    return true;
+  if (auto affineDimExpr = dyn_cast<AffineDimExpr>(affineMap.getResult(1))) {
+    dim1 = affineDimExpr.getPosition();
   } else {
+    LDBG("  Skipped: unknown/invalid type of affine map");
+    return false;
+  }
+  bool isTransposed = (strides[dim0] == 1 && strides[dim1] != 1);
+  if (!isTransposed) {
     LDBG("  Skipped: not transposed");
     return false;
   }
+  LDBG("  Pre-check passed");
+  return true;
 }
 
-static Value getLastDimStride(Value memRef, Location loc,
-                              PatternRewriter &rewriter) {
+static Value getLastDimStride(Location loc, PatternRewriter &rewriter,
+                              VectorTransferOpInterface op) {
+  auto memRef = op.getSource();
   auto memRefTy = cast<MemRefType>(memRef.getType());
   auto memRefMetadata =
       rewriter.create<memref::ExtractStridedMetadataOp>(loc, memRef);
-  return memRefMetadata.getStrides().back();
+  auto affineMap = op.getPermutationMap();
+  assert(affineMap.getNumResults() == 2);
+  auto lastDim = cast<AffineDimExpr>(affineMap.getResult(1)).getPosition();
+  return memRefMetadata.getStrides()[lastDim];
 }
 
 struct LowerTransposedTransferReadOpToRvv
@@ -254,28 +237,29 @@ struct LowerTransposedTransferReadOpToRvv
   LogicalResult matchAndRewrite(vector::TransferReadOp op,
                                 PatternRewriter &rewriter) const override {
     LDBG("Lowering to RVV intrinsic: " << op);
-    if (!isTransposedTransfer<vector::TransferReadOp>(op))
+    if (!isTransposedTransfer(op))
       return failure();
     Location loc = op.getLoc();
     VectorType matTy = op.getResult().getType();
+    Type matElemTy = matTy.getElementType();
     int64_t m = matTy.getDimSize(0);
     int64_t k = matTy.getDimSize(1);
     Value memRef = op.getSource();
-    Value stride_index = getLastDimStride(memRef, loc, rewriter);
+    auto indices = op.getIndices();
     int64_t vlen = rvv::getMinimumVlen();
 
     if (matTy.isScalable()) {
       LDBG("  Failed: scalable dim are not allowed");
       return failure();
     }
-    if (std::min(m, int64_t(4)) * k * matTy.getElementTypeBitWidth() >
+    if (std::min(m, int64_t(4)) * k * matElemTy.getIntOrFloatBitWidth() >
         8 * vlen) {
       // FIXME: we can work around by spliting vectors
       LDBG("  Failed: row too long");
       return failure();
     }
 
-    VectorType rowType_fixed = VectorType::get({k}, matTy.getElementType());
+    VectorType rowType_fixed = VectorType::get({k}, matElemTy);
     VectorType rowType_scalable;
     if (auto r = rvv::getSmallestScalableTypeThatHolds(rowType_fixed);
         failed(r)) {
@@ -285,15 +269,30 @@ struct LowerTransposedTransferReadOpToRvv
       rowType_scalable = *r;
     }
     Value result = rewriter.create<ub::PoisonOp>(loc, matTy);
+
     Value vl =
         rewriter.create<arith::ConstantIntOp>(loc, k, rewriter.getI64Type());
-    Value rawPtr = createMemRefToRawPtr(loc, rewriter, memRef);
+    Value stride_index = getLastDimStride(loc, rewriter, op);
     Value stride_i64 = rewriter.create<arith::IndexCastOp>(
         loc, rewriter.getI64Type(), stride_index);
 
+    // Calculate the starting point of matrix
+    Value basePtr = createMemRefToRawPtr(loc, rewriter, memRef);
+    auto strides =
+        rewriter.create<memref::ExtractStridedMetadataOp>(loc, memRef)
+            .getStrides();
+    Value offset = createI64(loc, rewriter, 0);
+    for (int64_t i = 0; i < strides.size(); i++) {
+      auto thisOffset = rewriter.create<arith::IndexCastOp>(
+          loc, rewriter.getI64Type(),
+          rewriter.create<arith::MulIOp>(loc, indices[i], strides[i]));
+      offset = rewriter.createOrFold<arith::AddIOp>(loc, offset, thisOffset);
+    }
+    basePtr = createGep(loc, rewriter, basePtr, matElemTy, offset);
+
     for (int64_t i_m = 0; i_m < m; i_m += 4) {
       int64_t mr = std::min(m - i_m, int64_t(4));
-      Value ptr = createGep(loc, rewriter, rawPtr, matTy.getElementType(),
+      Value ptr = createGep(loc, rewriter, basePtr, matElemTy,
                             createI64(loc, rewriter, i_m));
       Value mrTuple = rvv::intrinsic::createLoadStridedSegment(
           loc, rewriter, mr, rowType_scalable, ptr, stride_i64, vl);
@@ -320,7 +319,7 @@ struct LowerTransposedTransferWriteOpToRvv
   LogicalResult matchAndRewrite(vector::TransferWriteOp op,
                                 PatternRewriter &rewriter) const override {
     LDBG("Lowering to RVV intrinsic: " << op);
-    if (!isTransposedTransfer<vector::TransferWriteOp>(op))
+    if (!isTransposedTransfer(op))
       return failure();
     Location loc = op.getLoc();
     Value mat = op.getVector();
@@ -329,7 +328,7 @@ struct LowerTransposedTransferWriteOpToRvv
     int64_t m = matTy.getDimSize(0);
     int64_t k = matTy.getDimSize(1);
     Value memRef = op.getSource();
-    Value stride_index = getLastDimStride(memRef, loc, rewriter);
+    auto indices = op.getIndices();
     int64_t vlen = rvv::getMinimumVlen();
 
     if (matTy.isScalable()) {
@@ -352,19 +351,25 @@ struct LowerTransposedTransferWriteOpToRvv
     } else {
       rowType_scalable = *r;
     }
+
     Value vl =
         rewriter.create<arith::ConstantIntOp>(loc, k, rewriter.getI64Type());
+    Value stride_index = getLastDimStride(loc, rewriter, op);
     Value stride_i64 = rewriter.create<arith::IndexCastOp>(
         loc, rewriter.getI64Type(), stride_index);
 
     // Calculate the starting point of matrix
-    auto indices = op.getIndices();
     Value basePtr = createMemRefToRawPtr(loc, rewriter, memRef);
-    Value offset = rewriter.create<arith::AddIOp>(
-        loc, indices[0],
-        rewriter.create<arith::MulIOp>(loc, indices[1], stride_index));
-    offset =
-        rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), offset);
+    auto strides =
+        rewriter.create<memref::ExtractStridedMetadataOp>(loc, memRef)
+            .getStrides();
+    Value offset = createI64(loc, rewriter, 0);
+    for (int64_t i = 0; i < strides.size(); i++) {
+      auto thisOffset = rewriter.create<arith::IndexCastOp>(
+          loc, rewriter.getI64Type(),
+          rewriter.create<arith::MulIOp>(loc, indices[i], strides[i]));
+      offset = rewriter.createOrFold<arith::AddIOp>(loc, offset, thisOffset);
+    }
     basePtr = createGep(loc, rewriter, basePtr, matElemTy, offset);
 
     for (int64_t i_m = 0; i_m < m; i_m += 4) {

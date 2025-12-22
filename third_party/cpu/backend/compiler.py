@@ -202,7 +202,6 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
         cpu.passes.ttcpuir.add_optimize_masks(pm)
         passes.common.add_canonicalizer(pm)
-        cpu.passes.ttcpuir.add_convert_transpose_op(pm)
         if (ukernels := opt.get_ukernels()):
             # For further analysis simplification
             cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)
@@ -236,6 +235,7 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_convert_unsupported_ops(pm, promote_bf16_to_fp32, convert_mixed_precision_matmul,
                                                        promote_lib_math_to_fp32)
         cpu.passes.ttcpuir.add_convert_rgather_op(pm)
+        cpu.passes.ttcpuir.add_convert_transpose_op(pm)
         decompose_bf16_conv = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
         decompose_fp8_conv = True
         cpu.passes.ttcpuir.add_decompose_fp_conversions(pm, decompose_bf16_conv, decompose_fp8_conv)
