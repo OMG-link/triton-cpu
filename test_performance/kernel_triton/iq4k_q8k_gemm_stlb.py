@@ -177,9 +177,9 @@ def iq4k_q8k_matmul_kernel(
             iq4k_data_packed = tl.load(iq4k_data_ptr)  # uint8, shape (16, NR), 每个 uint8 包含两个 iq4k 数据
             
             iq4k_data_1 = (iq4k_data_packed & 0x0F).cast(tl.int8)  # uint4, [16, NR] 
-            iq4k_data_1 = (iq4k_data_1 & (tlb_start_idx_1 << 4)).reshape(16, NR)
+            iq4k_data_1 = (iq4k_data_1 | (tlb_start_idx_1 << 4)).reshape(16, NR)
             iq4k_data_2 = (iq4k_data_packed >> 4).cast(tl.int8)  # uint4, [16, NR] 
-            iq4k_data_2 = (iq4k_data_2 & (tlb_start_idx_2 << 4)).reshape(16, NR)
+            iq4k_data_2 = (iq4k_data_2 | (tlb_start_idx_2 << 4)).reshape(16, NR)
 
             # 按行维度 (axis=1) gather：iq4k_data_1 / iq4k_data_2 的取值范围 0..15 
 
