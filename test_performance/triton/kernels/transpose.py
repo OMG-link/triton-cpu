@@ -15,42 +15,44 @@ def cdiv(a, b):
 def transpose_kernel(
     in_ptr_raw, out_ptr_raw,
     M, N,
-    TM: tl.constexpr, TN: tl.constexpr,
+    MR: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr,
     dtype: tl.constexpr
 ):
     pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
 
-    i_tm = pid_m * TM
-    i_tn = pid_n * TN
+    i_mr = pid_m
 
-    in_ptr = tl.make_block_ptr(
+    in_ptr_base = tl.make_block_ptr(
         base=in_ptr_raw,
-        shape=(M, N),
-        strides=(N, 1),
-        offsets=(i_tm, i_tn),
-        block_shape=(TM, TN),
-        order=(1, 0),
+        shape=(M // MR, MR, N),
+        strides=(MR*N, N, 1),
+        offsets=(i_mr, 0, 0),
+        block_shape=(1, TM, TN),
+        order=(2, 1, 0),
     )
 
-    out_ptr = tl.make_block_ptr(
+    out_ptr_base = tl.make_block_ptr(
         base=out_ptr_raw,
-        shape=(N, M),
-        strides=(M, 1),
-        offsets=(i_tn, i_tm),
-        block_shape=(TN, TM),
-        order=(1, 0),
+        shape=(M // MR, N, MR),
+        strides=(N*MR, MR, 1),
+        offsets=(i_mr, 0, 0),
+        block_shape=(1, TN, TM),
+        order=(2, 1, 0),
     )
 
-    a = tl.load(in_ptr)
-    tl.store(out_ptr, a.T)
+    for i_tn in range(0, N // TN):
+        for i_tm in range(0, MR // TM):
+            in_ptr = in_ptr_base.advance((0, i_tm*TM, i_tn*TN))
+            out_ptr = out_ptr_base.advance((0, i_tn*TN, i_tm*TM))
+            tl.store(out_ptr, tl.load(in_ptr).reshape(TM, TN).T.reshape(1, TN, TM))
 
 
 class TransposeKernel(GEMMKernelBase):
-    def __init__(self, dtype: str, TM: int, TN: int, device: str = "cpu"):
+    def __init__(self, dtype: str, MR: int, TM: int, TN: int, device: str = "cpu"):
         assert dtype in GEMMKernelBase.DTYPE_CONFIG
         self.dtype_name = dtype
         self.device = device
+        self.MR = MR
         self.TM = TM
         self.TN = TN
 
@@ -60,24 +62,25 @@ class TransposeKernel(GEMMKernelBase):
         assert n == 1, "Argument 'n' is fixed to 1 in this kernel."
 
         M, N = m, k
-        TM, TN = self.TM, self.TN
+        MR, TM, TN = self.MR, self.TM, self.TN
 
-        assert M % TM == 0, f"M ({M}) must be divisible by TM ({TM})"
+        assert M % MR == 0, f"M ({M}) must be divisible by MR ({MR})"
+        assert MR % TM == 0, f"MR ({MR}) must be divisible by TM ({TM})"
         assert N % TN == 0, f"N ({N}) must be divisible by TN ({TN})"
 
         if should_gen_data:
             torch.manual_seed(0)
             inp = torch.randint(0, 128, (M, N), device=self.device).to(TORCH_DTYPE).contiguous()
         else:
-            inp = torch.empty((M, N), device=self.device, dtype=TORCH_DTYPE).contiguous()
+            inp = torch.empty((M ), device=self.device, dtype=TORCH_DTYPE).contiguous()
 
-        out = torch.empty((N, M), device=self.device, dtype=TORCH_DTYPE)
+        out = torch.empty((M // MR, N, MR), device=self.device, dtype=TORCH_DTYPE)
 
         return {
             'in': inp,
             'out': out,
             'M': M, 'N': N,
-            'TM': TM, 'TN': TN,
+            'MR': MR, 'TM': TM, 'TN': TN,
             'torch_dtype': TORCH_DTYPE,
             'tl_dtype': TL_DTYPE,
         }
@@ -89,15 +92,15 @@ class TransposeKernel(GEMMKernelBase):
         out = params['out']
 
         M, N = params['M'], params['N']
-        TM, TN = params['TM'], params['TN']
+        MR, TM, TN = params['MR'], params['TM'], params['TN']
 
-        grid = (cdiv(M, TM), cdiv(N, TN))
+        grid = (cdiv(M, MR), )
 
         t0 = time.perf_counter()
         transpose_kernel[grid](
             inp, out,
             M, N,
-            TM=TM, TN=TN,
+            MR=MR, TM=TM, TN=TN,
             dtype=TL_DTYPE,
             n_kernel_repeat=repeats,
         )
@@ -108,7 +111,10 @@ class TransposeKernel(GEMMKernelBase):
         inp = params['in']
         out = params['out']
 
-        ref = inp.t().contiguous()
+        M, N = params['M'], params['N']
+        MR = params['MR']
+
+        ref = inp.reshape(M // MR, MR, N).permute(0, 2, 1).contiguous()
         return bool(torch.equal(out, ref))
 
     def get_name(self) -> str:

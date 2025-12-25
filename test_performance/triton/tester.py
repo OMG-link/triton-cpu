@@ -126,7 +126,7 @@ KERNELS = [
         "performance": ["q4k_q8k_2"],
     },
     {
-        "kernel": TransposeKernel(dtype="i8", TN=4, TM=8),
+        "kernel": TransposeKernel(dtype="i8", MR=16, TM=4, TN=32),
         "correctness": ["transpose_correctness"],
         "performance": [],
     },
