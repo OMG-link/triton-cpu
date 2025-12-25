@@ -64,8 +64,8 @@ struct MergeTransposeIntoTransfer
     for (int64_t i = 0; i < rank; i++) {
       newAffineMapExprs[i] = oldAffineMap.getResult(perm[i]);
     }
-    auto newAffineMap =
-        AffineMap::get(rank, 0, newAffineMapExprs, rewriter.getContext());
+    auto newAffineMap = AffineMap::get(
+        oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
 
     writeOp.getVectorMutable().set(input);
     writeOp.setPermutationMap(newAffineMap);
