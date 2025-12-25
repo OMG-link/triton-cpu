@@ -24,57 +24,67 @@ using namespace mlir::triton::cpu;
 
 namespace {
 
-// Fold transfer read and the following shape cast that removes heading
+// Suppose srcTy matches the output of oldAffineMap, and will be reshaped to
+// dstTy. This function returns a new affine map that produces dstTy directly.
+static FailureOr<AffineMap> getAffineMapAfterReshape(MLIRContext *C,
+                                                     AffineMap oldAffineMap,
+                                                     VectorType srcTy,
+                                                     VectorType dstTy) {
+  SmallVector<AffineExpr> newAffineMapExprs(dstTy.getRank(),
+                                            getAffineConstantExpr(0, C));
+  int64_t i_srcTy = 0;
+  int64_t i_dstTy = 0;
+  for (; i_srcTy < srcTy.getRank(); i_srcTy++) {
+    if (srcTy.getDimSize(i_srcTy) != 1) {
+      while (true) {
+        if (i_dstTy >= dstTy.getRank())
+          return failure();
+        if (dstTy.getDimSize(i_dstTy) != 1)
+          break;
+        i_dstTy++;
+      }
+      if (srcTy.getDimSize(i_srcTy) != dstTy.getDimSize(i_dstTy))
+        return failure();
+      newAffineMapExprs[i_dstTy] = oldAffineMap.getResult(i_srcTy);
+      i_dstTy++;
+    }
+  }
+  return AffineMap::get(oldAffineMap.getNumDims(), 0, newAffineMapExprs, C);
+}
+
+// Fold transfer write and the input shape cast that removes/inserts
 // dimensions with size 1.
 struct FoldReadShapeCast : public OpRewritePattern<vector::TransferReadOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(vector::TransferReadOp op,
                                 PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
     if (!op->hasOneUse())
       return failure();
 
-    auto permMap = op.getPermutationMap();
-    if (!permMap.isMinorIdentity())
+    if (op.isMasked())
+      return failure();
+
+    if (op.hasOutOfBoundsDim())
       return failure();
 
     auto reshape = dyn_cast<vector::ShapeCastOp>(*op->user_begin());
     if (!reshape)
       return failure();
 
-    VectorType ty = cast<VectorType>(op.getType());
-    VectorType dstTy = cast<VectorType>(reshape.getType());
-    if (ty.getRank() <= dstTy.getRank())
-      return failure();
+    VectorType srcTy = reshape.getSourceVectorType();
+    VectorType dstTy = reshape.getResultVectorType();
+    auto oldPermMap = op.getPermutationMap();
+    auto newAffineMap = getAffineMapAfterReshape(rewriter.getContext(),
+                                                 oldPermMap, srcTy, dstTy);
+    if (failed(newAffineMap))
+      return LogicalResult(newAffineMap);
 
-    // Check all removed dimensions have size 1.
-    if (!all_of(drop_end(ty.getShape(), dstTy.getRank()),
-                [](int64_t val) { return val == 1; }))
-      return failure();
-
-    // Check shape prefix matches the resulting type.
-    if (!equal(drop_begin(ty.getShape(), ty.getRank() - dstTy.getRank()),
-               dstTy.getShape()))
-      return failure();
-
-    auto inBounds = op.getInBounds();
-    if (std::any_of(inBounds.begin(), inBounds.end() - dstTy.getRank(),
-                    [](Attribute attr) {
-                      return !cast<mlir::BoolAttr>(attr).getValue();
-                    }))
-      return failure();
-
-    // Fold read and shape cast into a single read.
-    auto newPermMap = permMap.getMinorIdentityMap(
-        permMap.getNumDims(), dstTy.getRank(), getContext());
-    auto newInBounds = rewriter.getArrayAttr(SmallVector<Attribute>(drop_begin(
-        op.getInBounds().getValue(), ty.getRank() - dstTy.getRank())));
-    auto newRead = vector::TransferReadOp::create(
-        rewriter, loc, dstTy, op.getBase(), op.getIndices(), newPermMap,
-        op.getPadding(), op.getMask(), newInBounds);
-    rewriter.replaceOp(reshape, newRead);
-    rewriter.eraseOp(op);
+    auto newReadOp = rewriter.create<vector::TransferReadOp>(
+        op.getLoc(), reshape.getType(), op.getSource(), op.getIndices(),
+        *newAffineMap, op.getPadding(), op.getMask(),
+        rewriter.getBoolArrayAttr(SmallVector(dstTy.getRank(), true)));
+    rewriter.replaceOp(op, newReadOp);
 
     return success();
   }
