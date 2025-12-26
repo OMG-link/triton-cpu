@@ -280,9 +280,7 @@ class CPUBackend(BaseBackend):
 
         passes.convert.add_math_to_llvmir(pm)
         cpu.passes.ttcpuir.add_math_to_libm(pm)
-        # available options of transpose policy:
-        #   eltwise, flat_transpose, shuffle_1d, shuffle_16x16
-        cpu.passes.ttcpuir.add_vector_to_llvmir(pm, options.enable_fast_math, "eltwise")
+        cpu.passes.ttcpuir.add_vector_to_llvmir(pm, options.enable_fast_math)
         cpu.passes.ttcpuir.add_memref_to_llvmir(pm)
         passes.convert.add_reconcile_unrealized(pm)
         passes.convert.add_arith_to_llvmir(pm)

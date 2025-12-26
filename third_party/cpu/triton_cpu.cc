@@ -190,8 +190,7 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
     pm.addPass(mlir::memref::createExpandStridedMetadataPass());
   });
   m.def("add_vector_to_llvmir",
-        [](mlir::PassManager &pm, bool reassoc_fp_reduction,
-           std::string trasepose_policy) {
+        [](mlir::PassManager &pm, bool reassoc_fp_reduction) {
           mlir::ConvertVectorToLLVMPassOptions opts;
           opts.reassociateFPReductions = reassoc_fp_reduction;
           // opts.force32BitVectorIndices = true;
@@ -216,9 +215,6 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
           // widely used path for this lowering in CPU case.
           opts.vectorContractLowering =
               mlir::vector::VectorContractLowering::OuterProduct;
-          opts.vectorTransposeLowering =
-              mlir::vector::symbolizeVectorTransposeLowering(trasepose_policy)
-                  .value();
           pm.addPass(mlir::createConvertVectorToLLVMPass(opts));
         });
   m.def("add_lower_affine", [](mlir::PassManager &pm) {
