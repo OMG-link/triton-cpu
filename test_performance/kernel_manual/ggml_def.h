@@ -122,13 +122,14 @@ template <int K, int N> struct alignas(8)  block {
 
 using block_q4_0x32 = block<4, 32>;
 using block_q8_0x12 = block<8, 12>;
+using block_q8_0x8 = block<8, 8>;
 using block_q8_0x4  = block<8, 4>;
 
 #define GGML_UNUSED(x) (void)(x)
 
 void ggml_gemm_q4_K_8x32_q8_K(int n, float *GGML_RESTRICT s, size_t bs, const void *GGML_RESTRICT vx, const void *GGML_RESTRICT vy, int nr, int nc);
 
-void ggml_gemm_q4_0_12x32_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_q4_0_8x32_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 
 void ggml_gemm_iq4_K_12x32_q8_K(int k, float *GGML_RESTRICT s, size_t bs, const void *GGML_RESTRICT iq4k, const void *GGML_RESTRICT q8k, int m, int n);
 

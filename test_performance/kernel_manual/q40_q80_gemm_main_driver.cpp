@@ -10,7 +10,7 @@ const int VL = 32;
 #define VLEN 256
 #define ELEM_WID 16
 
-using InBlock = block_q8_0x12;
+using InBlock = block_q8_0x8;
 using KerBlock = block_q4_0x32;
 
 // 分块参数由命令行决定 
@@ -33,12 +33,12 @@ int main(int argc, char **argv) {
     const size_t bs = n;
 
     assert(k % QK4_0 == 0);
-    assert(m % 12 == 0);
+    assert(m % 8 == 0);
     assert(n % VL == 0);
 
     const int nb = k / QK4_0;
     const int nTile = n / VL;
-    const int mTile = m / 12; 
+    const int mTile = m / 8; 
 
     // 1) output
     float *s = static_cast<float *>(calloc(m * bs, sizeof(float)));
@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
 
     // 3) Q8 activations
     size_t n_blocks_vy = nb * mTile;
-    InBlock *vy = static_cast<InBlock *>(calloc(n_blocks_vy, sizeof(block_q8_0x12)));
+    InBlock *vy = static_cast<InBlock *>(calloc(n_blocks_vy, sizeof(block_q8_0x8)));
 
     // times test should be repeated:
     int peak_fops = FREQ * VLEN / ELEM_WID;
@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
 
 
     // Warmup
-    ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
+    ggml_gemm_q4_0_8x32_q8_0(k, s, bs, vx, vy, m, n);
 
     // Perf-setup
     int fd_cycles = perf_event_cycles();
@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
 
     // Main test
     for (int t = 0; t < T; t++) {
-        ggml_gemm_q4_0_12x32_q8_0(k, s, bs, vx, vy, m, n);
+        ggml_gemm_q4_0_8x32_q8_0(k, s, bs, vx, vy, m, n);
     }
 
     // Perf-cleanup
@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     int64_t cycle_per_test = cycle_total / T;
     printf("cycle_per_test: %ld, cycle_total: %ld, T: %d\n", cycle_per_test, cycle_total, T);
 
-    int64_t n_fma = static_cast<int64_t>(k) * mTile * nTile * 12 * VL; // 考虑实际形状，为了避免 padding，这里用的整数倍的寄存器分块大小 
+    int64_t n_fma = static_cast<int64_t>(k) * mTile * nTile * 8 * VL; // 考虑实际形状，为了避免 padding，这里用的整数倍的寄存器分块大小 
     int64_t fma_per_cycle;
 
 #ifdef SPACEMIT_X60
