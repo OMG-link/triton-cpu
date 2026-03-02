@@ -92,14 +92,14 @@ def q40_q80_gemm_kernel(
 
         # 解包 q4 数据
         q4_low_4bit = (q4_data & 0xf).cast(tl.int8)  # [16, 32]
-        q4_high_4bit = (q4_data >> 4).cast(tl.int8)  # [16, 32]
-        
         # 加载 q8 数据的低 16 位并计算
         q8_data_ptr_low = tl.advance(q8_0_block_ptr, offsets = (0, k_block, 0, 0, 0))
         q8_data_low = tl.load(q8_data_ptr_low)  # [1, 1, 1, 16, 12]
         q8_data_low = q8_data_low.reshape(16, MR)  # [16, 12]
         sum_block = tl.dot(q8_data_low.T, q4_low_4bit, out_dtype=tl.int16)  # [12, 32]
 
+
+        q4_high_4bit = (q4_data >> 4).cast(tl.int8)  # [16, 32]
         # 加载 q8 数据的高 16 位并计算
         q8_data_ptr_high = tl.advance(q8_0_block_ptr, offsets = (0, k_block, 1, 0, 0))
         q8_data_high = tl.load(q8_data_ptr_high)  # [1, 1, 1, 16, 12]
