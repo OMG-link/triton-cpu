@@ -92,7 +92,7 @@ def quantize_q4_K(b: torch.Tensor):
     """
     非对称 q4_K 实现（解码为:  orig ≈ d * (s_q * q) - dmin * m_q）
     b: (K, N)
-    returns: b_q (Nb, Ksup, Ksub, QK_SB_K, NR) int8 [0..15]
+    returns: b_q (Nb, Ksup, Ksub, QK_SB_K//2, NR) uint8 (两个int4打包)
              b_scales (Nb, Ksup, Ksub, NR)   int8  (signed, -32..31)
              b_mins (Nb, Ksup, Ksub, NR)     int16 (signed, we store -m_q)
              b_d (Nb, Ksup, NR)              float16
@@ -110,8 +110,8 @@ def quantize_q4_K(b: torch.Tensor):
     b_pad = torch.zeros((K_p, N_p), dtype=b.dtype, device=device)
     b_pad[:K, :N] = b
 
-    # outputs
-    b_q = torch.zeros((Nb, Ksup, Ksub, QK_SB_K, NR), dtype=torch.int8, device='cpu')   # 0..15
+    # outputs - b_q 现在是打包格式，每个 uint8 存两个 4bit
+    b_q = torch.zeros((Nb, Ksup, Ksub, QK_SB_K//2, NR), dtype=torch.uint8, device='cpu')   # packed int4x2
     b_scales = torch.zeros((Nb, Ksup, Ksub, NR), dtype=torch.int8, device='cpu')      # signed 6-bit stored in int8
     b_mins = torch.zeros((Nb, Ksup, ksub := Ksub, NR), dtype=torch.int16, device='cpu')  # store -m_q (int16)
     b_d = torch.zeros((Nb, Ksup, NR), dtype=torch.float16, device='cpu')
@@ -170,6 +170,7 @@ def quantize_q4_K(b: torch.Tensor):
                 b_mins[nb, ksup, s, :] = (-m_q).to(torch.int16)
 
             # now quantize per element inside each subblock using the real subblock scale/min
+            # 并打包两个 4bit 到一个 uint8
             for s in range(Ksub):
                 s0 = s * QK_SB_K
                 sub = seg[s0:s0 + QK_SB_K, :]  # (QK_SB_K, NR)
@@ -182,9 +183,16 @@ def quantize_q4_K(b: torch.Tensor):
                 nonzero_mask = ~zero_mask
                 if nonzero_mask.any():
                     q_real = torch.round((sub - m_real) / torch.where(s_real != 0, s_real, torch.ones_like(s_real)))
-                    q_sub = q_real.clamp(0, 15).to(torch.int8)
+                    q_sub = q_real.clamp(0, 15).to(torch.uint8)
 
-                b_q[nb, ksup, s, :, :] = q_sub.to(torch.int8).contiguous()
+                # 打包两个 4bit 到一个 uint8: low 4bit = q[0..15], high 4bit = q[16..31]
+                q_packed = torch.zeros((QK_SB_K//2, NR), dtype=torch.uint8, device=device)
+                for i in range(QK_SB_K // 2):
+                    q_low = q_sub[i, :] & 0x0F                 # 低 4 bit (k0..k15)
+                    q_high = q_sub[i + QK_SB_K//2, :] & 0x0F   # 高 4 bit (k16..k31)
+                    q_packed[i, :] = q_low | (q_high << 4)     # 打包
+
+                b_q[nb, ksup, s, :, :] = q_packed.contiguous()
 
     return b_q, b_scales, b_mins, b_d, b_dmin
 
@@ -194,11 +202,11 @@ def quantize_q4_K(b: torch.Tensor):
 @triton.jit
 def q4k_q8k_matmul_kernel(
     # q8k 输入
-    q8k_matrix_ptr,              # int8     A        (M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR)
+    q8k_matrix_ptr,         # int8     A        (M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR)
     q8k_bsums_ptr,          # int16    a_bsums  (M//MR, K//QK_K, QK_K//QK_SB_K, MR)
     q8k_d_ptr,              # float32  a_d      (M//MR, K//QK_K, MR)
     
-    q4k_matrix_ptr,              # int8     Bpacked  (N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR)
+    q4k_matrix_ptr,         # int8     Bpacked  (N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR)
     q4k_scale_ptr,         # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
     q4k_mins_ptr,           # int8     b_scales (N//NR, K//QK_K, QK_K//QK_SB_K, NR)
     q4k_d_ptr,              # float16  b_d      (N//NR, K//QK_K, NR)
@@ -206,19 +214,19 @@ def q4k_q8k_matmul_kernel(
     output_ptr,                # float32  C        (M, N)
     M, N, K,
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
+    pid_m = tl.program_id(axis=0) 
+    pid_n = tl.program_id(axis=1) 
 
-    i_mr = pid_m * MR
-    i_nr = pid_n * NR
+    i_mr = pid_m * MR 
+    i_nr = pid_n * NR 
 
     a_q_ptr_start = tl.make_block_ptr(
         base=q8k_matrix_ptr,
-        shape=(M//MR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, MR),
-        strides=(K*MR, QK_K*MR, QK_SB_K*MR, MR, 1),
+        shape=(M//MR, K//QK_K, QK_K//QK_SB_K, 2, QK_SB_K//2, MR),
+        strides=(K*MR, QK_K*MR, QK_SB_K*MR, QK_SB_K*MR // 2, MR, 1),
         offsets=(i_mr//MR, 0, 0, 0, 0),
-        block_shape=(1, 1, 1, QK_SB_K, MR),
-        order=(4, 3, 2, 1, 0), # CPU上这个参数并不重要，这是为warp并行而设计的参数
+        block_shape=(1, 1, 1, 1, QK_SB_K//2, MR),
+        order=(5, 4, 3, 2, 1, 0), # CPU上这个参数并不重要，这是为 warp 并行而设计的参数 
     )
 
     a_bsums_ptr_start = tl.make_block_ptr(
@@ -241,10 +249,10 @@ def q4k_q8k_matmul_kernel(
 
     b_q_ptr_start = tl.make_block_ptr(
         base=q4k_matrix_ptr,
-        shape=(N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K, NR),
-        strides=(K*NR, QK_K*NR, QK_SB_K*NR, NR, 1),
+        shape=(N//NR, K//QK_K, QK_K//QK_SB_K, QK_SB_K//2, NR),
+        strides=(K//2*NR, QK_K//2*NR, QK_SB_K//2*NR, NR, 1),
         offsets=(i_nr//NR, 0, 0, 0, 0),
-        block_shape=(1, 1, 1, QK_SB_K, NR),
+        block_shape=(1, 1, 1, QK_SB_K//2, NR),
         order=(4, 3, 2, 1, 0),
     )
 
@@ -302,44 +310,60 @@ def q4k_q8k_matmul_kernel(
         a_q_ptr = tl.advance(a_q_ptr_start, (0, i_supb, 0, 0, 0))
         b_q_ptr = tl.advance(b_q_ptr_start, (0, i_supb, 0, 0, 0))
         b_scales_ptr = tl.advance(b_scales_ptr_start, (0, i_supb, 0, 0))
+        
         for i_subb in range(0, tl.cdiv(QK_K, QK_SB_K)):
-            a_q = tl.load(a_q_ptr).reshape((QK_SB_K, MR))
-            b_q = tl.load(b_q_ptr).reshape((QK_SB_K, NR))
-            suml = tl.dot(a_q.T, b_q, out_dtype=tl.int16)
+            # 加载 packed int4 数据 (16, NR)，每个 uint8 包含两个 int4
+            b_q_packed = tl.load(b_q_ptr).reshape((QK_SB_K//2, NR))
+            # 解压两个 int4: 低4位和高4位
+            b_q_low = tl.cast(b_q_packed & 0x0F, tl.int8)   # (16, NR) 对应 k=0..15
+            b_q_high = tl.cast((b_q_packed >> 4) & 0x0F, tl.int8)  # (16, NR) 对应 k=16..31
+            # 加载 a_q 的低半部分 (第3维=0) 与高4位做 dot
+            a_q_low_ptr = tl.advance(a_q_ptr, (0, 0, 0, 0, 0))
+            a_q_low = tl.load(a_q_low_ptr).reshape((QK_SB_K//2, MR))
+            suml = tl.dot(a_q_low.T, b_q_low, out_dtype=tl.int16)
+            # 加载 a_q 的高半部分 (第3维=1) 与低4位做 dot
+            a_q_high_ptr = tl.advance(a_q_ptr, (0, 0, 0, 1, 0, 0))
+            a_q_high = tl.load(a_q_high_ptr).reshape((QK_SB_K//2, MR))
+            suml += tl.dot(a_q_high.T, b_q_high, out_dtype=tl.int16)
             b_scales = tl.load(b_scales_ptr).reshape((1, NR))
             sum_block += tl.cast(suml, tl.int32) * tl.cast(b_scales, tl.int32)
-            # i_subb++
-            a_q_ptr = tl.advance(a_q_ptr, (0, 0, 1, 0, 0)) 
-            b_q_ptr = tl.advance(b_q_ptr, (0, 0, 1, 0, 0)) 
+            # i_subb++: 在 subblock 维度 (第2维) 上前进，同时重置第3维
+            a_q_ptr = tl.advance(a_q_ptr, (0, 0, 1, 0, 0, 0))
+            b_q_ptr = tl.advance(b_q_ptr, (0, 0, 1, 0, 0))
             b_scales_ptr = tl.advance(b_scales_ptr, (0, 0, 1, 0))
-
-        a_d = tl.load(a_d_ptr).reshape((1, MR))
-        b_d = tl.cast(tl.load(b_d_ptr).reshape((1, NR)), tl.float32)
-        sum_row += tl.cast(sum_block, tl.float32) * tl.dot(a_d.T, b_d, out_dtype=tl.float32)
+            b_q_ptr = tl.advance(b_q_ptr, (0, 0, 1, 0, 0))
+            b_scales_ptr = tl.advance(b_scales_ptr, (0, 0, 1, 0)) 
+               
+        a_d = tl.load(a_d_ptr).reshape((1, MR)) 
+        b_d = tl.cast(tl.load(b_d_ptr).reshape((1, NR)), tl.float32) 
+        # 超块边界
+        sum_row += tl.cast(sum_block, tl.float32) * tl.dot(a_d.T, b_d, out_dtype=tl.float32) # 12 * 32 @ float32 
         # i_supb++
         a_d_ptr = tl.advance(a_d_ptr, (0, 1, 0)) 
-        b_d_ptr = tl.advance(b_d_ptr, (0, 1, 0))
+        b_d_ptr = tl.advance(b_d_ptr, (0, 1, 0)) 
+    
     # sum_min_row
-    sum_min_row = tl.zeros((MR, NR), dtype=tl.float32)
-    a_bsums_ptr = a_bsums_ptr_start
+    sum_min_row = tl.zeros((MR, NR), dtype=tl.float32) 
+    a_bsums_ptr = a_bsums_ptr_start 
     b_mins_ptr  = b_mins_ptr_start 
-    a_d_ptr     = a_d_ptr_start    
-    b_dmin_ptr  = b_dmin_ptr_start  
-    for i_supb in range(0, tl.cdiv(K, QK_K)):
-        a_bsums = tl.load(a_bsums_ptr).reshape((QK_K//QK_SB_K, MR))
-        b_mins = tl.cast(tl.load(b_mins_ptr).reshape((QK_K//QK_SB_K, NR)), tl.int16)
-        a_d = tl.load(a_d_ptr).reshape((1, MR))
-        b_dmin = tl.cast(tl.load(b_dmin_ptr).reshape((1, NR)), tl.float32)
-        sum_min_row += tl.dot(a_d.T, b_dmin, out_dtype=tl.float32) * tl.cast(tl.dot(a_bsums.T, b_mins, out_dtype=tl.int32), tl.float32)
-        # i_supb++
-        a_bsums_ptr = tl.advance(a_bsums_ptr, (0, 1, 0, 0))
-        b_mins_ptr = tl.advance(b_mins_ptr, (0, 1, 0, 0))
+    a_d_ptr     = a_d_ptr_start 
+    b_dmin_ptr  = b_dmin_ptr_start 
+    for i_supb in range(0, tl.cdiv(K, QK_K)): # 超块 
+        a_bsums = tl.load(a_bsums_ptr).reshape((QK_K//QK_SB_K, MR)) #[8, 12] 
+        b_mins = tl.cast(tl.load(b_mins_ptr).reshape((QK_K//QK_SB_K, NR)), tl.int16) #[8, 32] 
+        a_d = tl.load(a_d_ptr).reshape((1, MR)) 
+        b_dmin = tl.cast(tl.load(b_dmin_ptr).reshape((1, NR)), tl.float32) 
+        # submin = tl.cast(tl.dot(a_bsums.T, b_mins, out_dtype=tl.int32) ，超块边界 
+        sum_min_row += tl.dot(a_d.T, b_dmin, out_dtype=tl.float32) * tl.cast(tl.dot(a_bsums.T, b_mins, out_dtype=tl.int32), tl.float32) 
+        # i_supb++ 
+        a_bsums_ptr = tl.advance(a_bsums_ptr, (0, 1, 0, 0)) 
+        b_mins_ptr = tl.advance(b_mins_ptr, (0, 1, 0, 0)) 
         a_d_ptr = tl.advance(a_d_ptr, (0, 1, 0)) 
-        b_dmin_ptr = tl.advance(b_dmin_ptr, (0, 1, 0))
+        b_dmin_ptr = tl.advance(b_dmin_ptr, (0, 1, 0)) 
     # compute final result
-    c_ptr = c_ptr_start
-    tl.store(c_ptr, sum_row-sum_min_row)
-
+    c_ptr = c_ptr_start 
+    tl.store(c_ptr, sum_row - sum_min_row) 
+ 
 def gflo_ps_from_ms(ms, M, N, K):
     # total flops assumed 2*M*N*K
     return 2.0 * M * N * K * 1e-9 / (ms * 1e-3)
