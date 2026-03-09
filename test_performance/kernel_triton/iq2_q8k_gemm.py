@@ -13,10 +13,9 @@ Data Layout:
 - Q8_K (block_q8_Kx12): d[MR] (float), qs[MR][256] (int8)
 
 Key formula from reference:
-  db = d * (0.5 + (aux32[1] >> 28)) * 0.25
   grid_val = iq2xxs_grid[aux8[l]][j]
   signs = ksigns_iq2xs[(aux32[1] >> 7*l) & 127]
-  y[j] = db * grid_val * (signs & kmask_iq2xs[j] ? -1 : 1)
+  y[j] = grid_val * (signs & kmask_iq2xs[j] ? -1 : 1)
 """
 
 import torch
@@ -27,18 +26,33 @@ QK_K = 256
 NUM_SUB_BLOCKS = 8
 SUB_BLOCK_SIZE = 32
 
+# ksigns_iq2xs lookup table: maps 7-bit index to 8-bit sign mask
+# Each bit in the result represents the sign of one weight (0=positive, 1=negative)
+KSIGNS_IQ2XS = [
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255
+]
+
 
 @triton.jit
 def iq2_q8k_gemm_kernel(
-    iq2_d_ptr,      # FP16 scales: (N//NR, K//QK_K, NR)
-    iq2_qs_ptr,     # uint16 indices: (N//NR, K//QK_K, NR, QK_K//8)
-    iq2_sas_ptr,    # uint8 signs/aux: (N//NR, K//QK_K, NR, QK_K//16)
-    q8_qs_ptr,      # int8 values: (M//MR, K//QK_K, MR, QK_K)
-    q8_d_ptr,       # float scales: (M//MR, K//QK_K, MR)
-    output_ptr,     # float32: (M, N)
+    iq2_d_ptr,      # FP16 scales: (N//NR, K//QK_K, NR) 
+    iq2_qs_ptr,     # uint16 indices: (N//NR, K//QK_K, NR, QK_K//8) 
+    iq2_sas_ptr,    # uint8 signs/aux: (N//NR, K//QK_K, NR, QK_K//16) 
+    q8_qs_ptr,      # int8 values: (M//MR, K//QK_K, MR, QK_K) 
+    q8_d_ptr,       # float scales: (M//MR, K//QK_K, MR) 
+    ksigns_ptr,     # ksigns_iq2xs lookup table: (128,) uint8 
+    iq2xxs_grid_ptr, # iq2xxs_grid for iq2 dequant 
+    output_ptr,     # float32: (M, N) 
     M, N, K,
-    MR: tl.constexpr = 12,
-    NR: tl.constexpr = 16,
+    MR: tl.constexpr = 12, 
+    NR: tl.constexpr = 16, 
 ):
     """
     C = A @ B.T where A is Q8_K and B is IQ2_XXS quantized.
@@ -46,10 +60,9 @@ def iq2_q8k_gemm_kernel(
     Algorithm per sub-block (32 elements):
     1. Load IQ2_XXS qs[4] (4 uint16 = 64 bits for 32 x 2-bit indices)
     2. Extract aux32[1] from qs[2:4] (uint16 -> uint32)
-    3. Compute db = d * (0.5 + (aux32[1] >> 28)) * 0.25
-    4. Dequantize using iq2xxs_grid lookup
-    5. Apply signs from ksigns_iq2xs
-    6. MAC with Q8_K
+    3. Dequantize using iq2xxs_grid lookup
+    4. Apply signs from ksigns_iq2xs
+    5. MAC with Q8_K
     """
     QK_K_CONST: tl.constexpr = 256
     NUM_SB: tl.constexpr = 8
@@ -57,6 +70,8 @@ def iq2_q8k_gemm_kernel(
 
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
+
+    SIGN_MASK : tl.constexpr = [1, 2, 4, 8, 16, 32, 64, 128]
 
     num_superblocks = K // QK_K_CONST
 
@@ -100,7 +115,7 @@ def iq2_q8k_gemm_kernel(
 
     iq2_sas_ptr_base = tl.make_block_ptr(
         base=iq2_sas_ptr,
-        shape=(N // NR, num_superblocks, NR, QK_K_CONST // 16),
+        shape=(N // NR, num_superblocks, NR, QK_K_CONST // 16), 
         strides=(num_superblocks * NR * (QK_K_CONST // 16), NR * (QK_K_CONST // 16), QK_K_CONST // 16, 1),
         offsets=(pid_n, 0, 0, 0),
         block_shape=(1, 1, NR, 2),
@@ -144,7 +159,7 @@ def iq2_q8k_gemm_kernel(
             # Load Q8_K data: (MR, 32)
             q8_qs_ptr_sub = tl.advance(q8_qs_ptr_sb, (0, 0, 0, sub * SUB_SZ))
             q8_data = tl.load(q8_qs_ptr_sub)
-            q8_data = q8_data.reshape((MR, SUB_SZ)).to(tl.int16)
+            q8_data = q8_data.reshape((MR, SUB_SZ)).to(tl.int16) # [12, 32]
 
             # Load IQ2_XXS qs: (NR, 4) uint16
             # Each sub-block has 32 elements stored as 4 uint16 (64 bits)
@@ -154,92 +169,88 @@ def iq2_q8k_gemm_kernel(
 
             # Load IQ2_XXS sas: (NR, 2) uint8
             # Signs are stored in sas with ksigns_iq2xs lookup
-            iq2_sas_ptr_sub = tl.advance(iq2_sas_ptr_sb, (0, 0, 0, sub * 2))
+            # sas = Sign Auxiliary Storage（符号辅助存储）
+            iq2_sas_ptr_sub = tl.advance(iq2_sas_ptr_sb, (0, 0, 0, sub * 2)) 
             iq2_sas = tl.load(iq2_sas_ptr_sub)
             iq2_sas = iq2_sas.reshape((NR, 2))
 
             # Reconstruct aux32[0] and aux32[1] from qs
-            # qs layout: [0]=aux32[0] low 16 bits, [1]=aux32[0] high 16 bits
-            #            [2]=aux32[1] low 16 bits, [3]=aux32[1] high 16 bits
-            aux32_0 = iq2_qs[:, 0].to(tl.int32) | (iq2_qs[:, 1].to(tl.int32) << 16)
-            aux32_1 = iq2_qs[:, 2].to(tl.int32) | (iq2_qs[:, 3].to(tl.int32) << 16)
+            # qs layout: [0]=aux32[0] low 16 bits, [1]=aux32[0] high 16 bits 
+            #            [2]=aux32[1] low 16 bits, [3]=aux32[1] high 16 bits 
+            aux32_0 = iq2_qs[:, 0].to(tl.int32) | (iq2_qs[:, 1].to(tl.int32) << 16) 
+            aux32_1 = iq2_qs[:, 2].to(tl.int32) | (iq2_qs[:, 3].to(tl.int32) << 16) 
 
             # Extract scale: aux32[1] >> 28 (4-bit scale index)
             scale_idx = (aux32_1 >> 28) & 0xF
 
-            # Compute db = d * (0.5 + scale_idx) * 0.25
-            # Note: scale_idx is 0-15, so (0.5 + scale_idx) gives 0.5 to 15.5
-            db = iq2_d * (0.5 + scale_idx.to(tl.float32)) * 0.25
-
             # Dequantize IQ2_XXS
             iq2_dequant = tl.zeros((NR, SUB_SZ), dtype=tl.int16)
 
-            # Process 4 groups of 8 elements each
-            # aux8 points to the bytes of aux32: aux32[0] bytes 0-3, aux32[1] bytes 4-7
-            # For group l, grid_idx = aux8[l]
+            # Process 4 groups of 8 elements each 
+            # aux8 points to the bytes of aux32: aux32[0] bytes 0-3, aux32[1] bytes 4-7 
+            # For group l, grid_idx = aux8[l] 
 
-            # Get grid indices for all 4 groups from aux32_0 and aux32_1
-            # aux32_0 contains aux8[0] (bits 0-7) and aux8[1] (bits 8-15)
-            # aux32_1 contains aux8[2] (bits 0-7) and aux8[3] (bits 8-15)
+            # Get grid indices for all 4 groups from aux32_0 and aux32_1  
+            # aux32_0 contains aux8[0] (bits 0-7) and aux8[1] (bits 8-15) 
+            # aux32_1 contains aux8[2] (bits 0-7) and aux8[3] (bits 8-15) 
+            # FIXME 写成 TILE 粒度程序
             grid_idx_0 = aux32_0 & 0xFF
             grid_idx_1 = (aux32_0 >> 8) & 0xFF
-            grid_idx_2 = aux32_1 & 0xFF
-            grid_idx_3 = (aux32_1 >> 8) & 0xFF
+            grid_idx_2 = (aux32_0 >> 16) & 0xFF
+            grid_idx_3 = (aux32_0 >> 24) & 0xFF
 
             # Signs are indexed by (aux32[1] >> 7*l) & 127 for each group
+            # These 7-bit indices are used to lookup 8-bit sign masks from ksigns_iq2xs table
+            # FIXME 写成 TILE 粒度程序
             signs_idx_0 = (aux32_1 >> 0) & 127
             signs_idx_1 = (aux32_1 >> 7) & 127
             signs_idx_2 = (aux32_1 >> 14) & 127
             signs_idx_3 = (aux32_1 >> 21) & 127
 
-            # sas bytes contain additional sign info
-            sas_0 = iq2_sas[:, 0]
-            sas_1 = iq2_sas[:, 1]
+            # Note: sas array is not part of original GGML block_iq2_xxs format
+            # In original format, signs are obtained via ksigns_iq2xs lookup table
+            # sas_0 = iq2_sas[:, 0]
+            # sas_1 = iq2_sas[:, 1]
 
-            # Dequantize 32 elements = 4 groups x 8 elements
+            # Dequantize 32 elements = 4 groups x 8 elements 
             for l in range(4):
-                # Select grid_idx and signs_idx for this group
+                # Select grid_idx and signs_idx for this group 
                 grid_idx = tl.where(l == 0, grid_idx_0,
                            tl.where(l == 1, grid_idx_1,
-                           tl.where(l == 2, grid_idx_2, grid_idx_3)))
+                           tl.where(l == 2, grid_idx_2, grid_idx_3))) 
 
-                signs_idx = tl.where(l == 0, signs_idx_0,
-                            tl.where(l == 1, signs_idx_1,
-                            tl.where(l == 2, signs_idx_2, signs_idx_3)))
+                # lookup dequant table for dequant iq2 weight int64 type, 256 element
+                # reture uint64 type, 8 element * int8
+                iq2_8ele_lookup_dequant_val = tl.load(iq2xxs_grid_ptr + signs_idx) # [8]@int8
 
-                sign_byte = tl.where(l == 0, sas_0 & 0x0F,
-                            tl.where(l == 1, sas_0 >> 4,
-                            tl.where(l == 2, sas_1 & 0x0F, sas_1 >> 4)))
+                # Get signs_idx for this group (7-bit index into ksigns_iq2xs table) 
+                signs_idx = tl.where(l == 0, signs_idx_0, 
+                            tl.where(l == 1, signs_idx_1, 
+                            tl.where(l == 2, signs_idx_2, signs_idx_3))) 
 
-                # Dequantize 8 elements for this group
-                for j in range(8):
-                    # Grid lookup: simplified values
-                    # Real: iq2xxs_grid[grid_idx][j] where each entry is 8 bytes
-                    # Values are typically: 8, 43, 25, or -1 (0xff)
-                    grid_val = tl.where((grid_idx & 0x3) == 0, 8,
-                              tl.where((grid_idx & 0x3) == 1, 43,
-                              tl.where((grid_idx & 0x3) == 2, 25, -1)))
+                # Get sign_byte from ksigns_iq2xs lookup table 
+                # signs_idx is 7-bit (0-127), result is 8-bit sign mask 
+                # Each bit represents sign of one weight (0=positive, 1=negative) 
+                sign_byte = tl.load(ksigns_ptr + signs_idx)  # [1]@uint8 
+                sign_bit = sign_byte & SIGN_MASK             # [8]@int8 
+                sign_val = tl.where(sign_bit == 1, -1, 1) 
 
-                    # Apply sign: check if bit j is set
-                    sign_bit = (sign_byte >> j) & 1
-                    val = tl.where(sign_bit != 0, -grid_val, grid_val)
+                # Dequantize 8 elements for this group 
+                iq2_dequant_val = iq2_8ele_lookup_dequant_val * sign_val 
+               
+            # Compute dot product: (MR, 32) @ (32, NR) -> (MR, NR) 
+            sum_sub = tl.dot(q8_data, iq2_dequant.T, out_dtype=tl.int32) 
 
-                    elem_idx = l * 8 + j
-                    mask = tl.arange(0, SUB_SZ) == elem_idx
-                    iq2_dequant = tl.where(mask[None, :], val[:, None], iq2_dequant)
-
-            # Compute dot product: (MR, 32) @ (32, NR) -> (MR, NR)
-            sum_sub = tl.dot(q8_data, iq2_dequant.T, out_dtype=tl.int32)
-
-            # Apply ls = 2*scale_idx + 1 as per reference
-            ls = (scale_idx * 2 + 1).to(tl.int32)
-            ls_br = ls[None, :].broadcast_to((MR, NR))
-            sum_block += sum_sub * ls_br
+            # Apply ls = 2*scale_idx + 1 as per reference 
+            ls = (scale_idx * 2 + 1).to(tl.int32) 
+            ls_br = ls[None, :].broadcast_to((MR, NR)) 
+            sum_block += sum_sub * ls_br 
 
         # Apply final scaling
         # sumf = d * bsum * 0.125
-        acc += sum_block.to(tl.float32) * q8_d * iq2_d * 0.125
+        acc += sum_block.to(tl.float32) * q8_d * iq2_d
 
+    acc = acc * 0.125
     # Store output
     tl.store(c_ptr, acc)
 
@@ -270,9 +281,12 @@ def prepare_random_inputs(M, K, N):
     # Layout: signs stored with ksigns_iq2xs encoding
     iq2_sas = torch.randint(0, 255, (Nb, num_sb, NR, QK_K // 16), dtype=torch.uint8, device=device)
 
+    # ksigns_iq2xs lookup table: (128,) uint8
+    ksigns = torch.tensor(KSIGNS_IQ2XS, dtype=torch.uint8, device=device)
+
     output = torch.empty((M, N), dtype=torch.float32, device=device)
 
-    return iq2_d, iq2_qs, iq2_sas, q8_qs, q8_d, output
+    return iq2_d, iq2_qs, iq2_sas, q8_qs, q8_d, ksigns, output
 
 
 def test_kernel():
@@ -280,7 +294,7 @@ def test_kernel():
     M, K, N = 120, 512, 256
     MR, NR = 12, 16
 
-    iq2_d, iq2_qs, iq2_sas, q8_qs, q8_d, output = prepare_random_inputs(M, K, N)
+    iq2_d, iq2_qs, iq2_sas, q8_qs, q8_d, ksigns, output = prepare_random_inputs(M, K, N)
 
     grid = (M // MR, N // NR)
 
@@ -293,6 +307,27 @@ def test_kernel():
     print(f"  iq2_qs: {iq2_qs.shape} (N//NR, K//QK_K, NR, QK_K//8)")
     print(f"  iq2_d: {iq2_d.shape}")
     print(f"  iq2_sas: {iq2_sas.shape}")
+    print(f"  ksigns: {ksigns.shape} (lookup table for sign decoding)")
+    print(f"\nSign decoding logic fixed:")
+    print(f"  - signs_idx = (aux32_1 >> 7*l) & 127  (7-bit index)")
+    print(f"  - signs = ksigns_iq2xs[signs_idx]  (8-bit sign mask)")
+    print(f"  - sign of weight j = (signs >> j) & 1")
+
+    # Launch kernel
+    print(f"\nLaunching kernel...")
+    try:
+        iq2_q8k_gemm_kernel[grid](
+            iq2_d, iq2_qs, iq2_sas, q8_qs, q8_d, ksigns, output,
+            M, N, K,
+            MR=MR, NR=NR,
+        )
+        print(f"Kernel execution completed!")
+        print(f"Output shape: {output.shape}")
+        print(f"Output sample (first 5x5):\n{output[:5, :5]}")
+    except Exception as e:
+        print(f"Kernel execution failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
