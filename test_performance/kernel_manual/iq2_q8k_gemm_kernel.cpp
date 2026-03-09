@@ -35,6 +35,7 @@ void ggml_gemm_iq2_xxs_12x16_q8_K(int n, float * __restrict s, size_t bs, const 
                                 0, 0, 0, 0, -1, -1, -1, -1,  0, 0, 0, 0,  0, 0, 0, 0,
                                 0, 0, 0, 0,  0, 0, 0, 0, -1, -1, -1, -1,  0, 0, 0, 0,
                                 0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0, -1, -1, -1, -1};
+    
 
     vint32m1_t vzero = __riscv_vmv_s_x_i32m1(0, 4);
     
@@ -337,10 +338,12 @@ void ggml_gemm_iq2_xxs_12x16_q8_K(int n, float * __restrict s, size_t bs, const 
                 __riscv_vse32_v_f32m4(&s[(y * 12 + 11) * bs + x * ncols_interleaved], __riscv_vle32_v_f32m4(sum_row + 176, 16), 16);
 
             }
+        
         }
 
     }
 
+    // N 尾块处理，不足 32 大小
     for (int y = anr/4; y < 4; y ++) { 
         const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + (y * nb);
 

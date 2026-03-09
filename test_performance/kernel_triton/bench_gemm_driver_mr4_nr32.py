@@ -49,15 +49,14 @@ if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
 
 # 直接导入 kernel 函数
-from q4k_q8k_gemm import q4k_q8k_matmul_kernel  # noqa: E402
-from q4k_q8k_gemm_fuse import q4k_q8k_matmul_kernel as q4k_q8k_matmul_kernel_fuse1
-from q4k_q8k_gemm_fuse2 import q4k_q8k_matmul_kernel as q4k_q8k_matmul_kernel_fuse2
-from q4k_q8k_gemm_fuse3 import q4k_q8k_matmul_kernel as q4k_q8k_matmul_kernel_fuse3
+from q4k_q8k_gemm_mr4_nr32 import q4k_q8k_matmul_kernel  # noqa: E402
+from q4k_q8k_gemm_fuse_mr4_nr32 import q4k_q8k_matmul_kernel as q4k_q8k_matmul_kernel_fuse1
+from q4k_q8k_gemm_fuse2_mr4_nr32 import q4k_q8k_matmul_kernel as q4k_q8k_matmul_kernel_fuse2
+from q4k_q8k_gemm_fuse3_mr4_nr32 import q4k_q8k_matmul_kernel as q4k_q8k_matmul_kernel_fuse3
 from iq4k_q8k_gemm import iq4k_q8k_matmul_kernel  # noqa: E402
 from q40_q80_gemm import q40_q80_gemm_kernel  # noqa: E402
 from iq4k_q8k_gemm_stlb import iq4k_q8k_matmul_kernel as iq4k_q8k_matmul_kernel_stlb
 from iq4k_q8k_gemm_stlb_without_gather import iq4k_q8k_matmul_kernel as iq4k_q8k_matmul_kernel_stlb_wogather
-from iq2_q8k_gemm_tile import iq2_q8k_gemm_kernel, KSIGNS_IQ2XS
 
 try:
     from dataclasses import dataclass
@@ -67,6 +66,8 @@ except ImportError:
 # -----------------------
 # Kernel 规范定义
 # -----------------------
+
+MR, NR = 4, 32
 
 @dataclass
 class KernelSpec:
@@ -87,7 +88,7 @@ class KernelSpec:
 def q40_gen_dataset(M, K, N, seed=42):
     """生成 q40_q80 测试数据"""
     torch.manual_seed(seed)
-    MR, NR, QK_8_0 = 12, 32, 32
+    QK_8_0 = 32
     Mb, Nb, Kblocks = M // MR, N // NR, K // QK_8_0
     QK_4_0_DATA_SIZE = QK_8_0 // 2
     
@@ -111,7 +112,7 @@ def q40_estimate_ops(M, N, K):
 
 def q40_grid(M, N, K):
     """返回 q40_q80 的 grid 配置"""
-    return (M // 12, N // 32)
+    return (M // MR, N // NR)
 
 def q40_param_builder(data, M, N, K, threads):
     """构建 q40_q80 kernel 参数"""
@@ -132,7 +133,7 @@ def q40_param_builder(data, M, N, K, threads):
 def q4k_gen_dataset(M, K, N, seed=42):
     """生成 q4k_q8k 测试数据"""
     torch.manual_seed(seed)
-    MR, NR, QK_K = 12, 32, 256
+    QK_K = 256
     Mb, Nb, Ksup = M // MR, N // NR, K // QK_K
     NUM_SUB_BLOCKS, SUB_BLOCK_SIZE = 8, 32
     QK_SB_K = 32
@@ -166,7 +167,7 @@ def q4k_estimate_ops(M, N, K):
 
 def q4k_grid(M, N, K):
     """返回 q4k_q8k 的 grid 配置"""
-    return (M // 12, N // 32)
+    return (M // MR, N // NR)
 
 def q4k_param_builder(data, M, N, K, threads):
     """构建 q4k_q8k kernel 参数"""
@@ -191,7 +192,7 @@ def q4k_param_builder(data, M, N, K, threads):
 def iq4k_gen_dataset(M, K, N, seed=42):
     """生成 iq4k_q8k 测试数据"""
     torch.manual_seed(seed)
-    MR, NR, QK_K = 12, 32, 256
+    QK_K = 256
     Mb, Nb, Ksup = M // MR, N // NR, K // QK_K
     NUM_SUB_BLOCKS, SUB_BLOCK_SIZE = 8, 32
     QK_4_K_SUB_BLOCK_DATA_SIZE = 16
@@ -217,7 +218,7 @@ def iq4k_estimate_ops(M, N, K):
 
 def iq4k_grid(M, N, K):
     """返回 iq4k_q8k 的 grid 配置"""
-    return (M // 12, N // 32)
+    return (M // MR, N // NR)
 
 def iq4k_param_builder(data, M, N, K, threads):
     """构建 iq4k_q8k kernel 参数"""
@@ -227,63 +228,6 @@ def iq4k_param_builder(data, M, N, K, threads):
         'iq4k_scale_h_ptr': data['iq4k_scale_h'], 'q8k_matrix_ptr': data['q8k_matrix'],
         'q8k_d_ptr': data['q8k_d'], 'output_ptr': data['output'],
         'M': M, 'N': N, 'K': K, 'num_threads': threads
-    }
-
-# -----------------------
-# iq2_q8k kernel 相关函数
-# -----------------------
-
-def iq2_gen_dataset(M, K, N, seed=42):
-    """生成 iq2_q8k 测试数据"""
-    torch.manual_seed(seed)
-    MR, NR, QK_K = 12, 16, 256
-    Mb, Nb, Ksup = M // MR, N // NR, K // QK_K
-    NUM_SUB_BLOCKS, SUB_BLOCK_SIZE = 8, 32
-
-    # q8k 数据: (M//MR, K//QK_K, MR, QK_K) int8
-    q8k_qs = torch.randint(-128, 127, (Mb, Ksup, MR, QK_K), dtype=torch.int8)
-    q8k_d = torch.rand((Mb, Ksup, MR), dtype=torch.float32)
-
-    # iq2 数据
-    # iq2_d: (N//NR, K//QK_K, NR) - FP16 scales
-    iq2_d = torch.rand((Nb, Ksup, NR), dtype=torch.float16)
-    # iq2_qs: (N//NR, K//QK_K, NUM_SB, NR, 4) - uint8
-    iq2_qs = torch.randint(0, 255, (Nb, Ksup, NUM_SUB_BLOCKS, NR, 4), dtype=torch.uint8)
-    # iq2_sign: (N//NR, K//QK_K, NUM_SB, NR, 4) - uint8
-    iq2_sign = torch.randint(0, 127, (Nb, Ksup, NUM_SUB_BLOCKS, NR, 4), dtype=torch.uint8)
-    # iq2_scale: (N//NR, K//QK_K, NUM_SB, NR) - uint8
-    iq2_scale = torch.randint(1, 16, (Nb, Ksup, NUM_SUB_BLOCKS, NR), dtype=torch.uint8)
-
-    # Lookup tables
-    ksigns = torch.tensor(KSIGNS_IQ2XS, dtype=torch.uint8)
-    iq2xxs_grid = torch.randint(-1, 2, (256,), dtype=torch.int8)
-
-    output = torch.empty((M, N), dtype=torch.float32)
-
-    return {
-        'iq2_d': iq2_d, 'iq2_qs': iq2_qs, 'iq2_sign': iq2_sign, 'iq2_scale': iq2_scale,
-        'q8k_qs': q8k_qs, 'q8k_d': q8k_d,
-        'ksigns': ksigns, 'iq2xxs_grid': iq2xxs_grid, 'output': output
-    }
-
-def iq2_estimate_ops(M, N, K):
-    """估算 iq2_q8k 的操作数"""
-    return 2.0 * M * N * K
-
-def iq2_grid(M, N, K):
-    """返回 iq2_q8k 的 grid 配置"""
-    return (M // 12, N // 16)
-
-def iq2_param_builder(data, M, N, K, threads):
-    """构建 iq2_q8k kernel 参数"""
-    return {
-        'iq2_d_ptr': data['iq2_d'], 'iq2_qs_ptr': data['iq2_qs'],
-        'iq2_sign_ptr': data['iq2_sign'], 'iq2_scale_ptr': data['iq2_scale'],
-        'q8_qs_ptr': data['q8k_qs'], 'q8_d_ptr': data['q8k_d'],
-        'ksigns_ptr': data['ksigns'], 'iq2xxs_grid_ptr': data['iq2xxs_grid'],
-        'output_ptr': data['output'],
-        'M': M, 'N': N, 'K': K,
-        'num_threads': threads
     }
 
 # -----------------------
@@ -298,7 +242,7 @@ KERNEL_SPECS = [
         estimate_ops=q40_estimate_ops,
         grid_fn=q40_grid,
         param_builder=q40_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 32},
+        constraints={'M': 4, 'N': 32, 'K': 32},
         compute_dtype='int16',
         dtype_width=16
     ),
@@ -309,7 +253,7 @@ KERNEL_SPECS = [
         estimate_ops=q4k_estimate_ops,
         grid_fn=q4k_grid,
         param_builder=q4k_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 256},
+        constraints={'M': 4, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
     ),
@@ -320,7 +264,7 @@ KERNEL_SPECS = [
         estimate_ops=q4k_estimate_ops,
         grid_fn=q4k_grid,
         param_builder=q4k_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 256},
+        constraints={'M': 4, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
     ),
@@ -331,7 +275,7 @@ KERNEL_SPECS = [
         estimate_ops=q4k_estimate_ops,
         grid_fn=q4k_grid,
         param_builder=q4k_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 256},
+        constraints={'M': 4, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
     ),
@@ -342,7 +286,7 @@ KERNEL_SPECS = [
         estimate_ops=q4k_estimate_ops,
         grid_fn=q4k_grid,
         param_builder=q4k_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 256},
+        constraints={'M': 4, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
     ),
@@ -353,7 +297,7 @@ KERNEL_SPECS = [
         estimate_ops=iq4k_estimate_ops,
         grid_fn=iq4k_grid,
         param_builder=iq4k_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 256},
+        constraints={'M': 4, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
     ),
@@ -364,7 +308,7 @@ KERNEL_SPECS = [
         estimate_ops=iq4k_estimate_ops,
         grid_fn=iq4k_grid,
         param_builder=iq4k_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 256},
+        constraints={'M': 4, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
     ),
@@ -375,7 +319,7 @@ KERNEL_SPECS = [
         estimate_ops=iq4k_estimate_ops,
         grid_fn=iq4k_grid,
         param_builder=iq4k_param_builder,
-        constraints={'M': 12, 'N': 32, 'K': 256},
+        constraints={'M': 4, 'N': 32, 'K': 256},
         compute_dtype='int16',
         dtype_width=16
     ),
