@@ -62,7 +62,7 @@ struct MergeTransposeIntoTransfer
     assert(rank == oldAffineMap.getNumResults());
     SmallVector<AffineExpr> newAffineMapExprs(rank);
     for (int64_t i = 0; i < rank; i++) {
-      newAffineMapExprs[i] = oldAffineMap.getResult(perm[i]);
+      newAffineMapExprs[perm[i]] = oldAffineMap.getResult(i);
     }
     auto newAffineMap = AffineMap::get(
         oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
@@ -103,7 +103,7 @@ struct MergeTransposeIntoTransfer
     assert(rank == oldAffineMap.getNumResults());
     SmallVector<AffineExpr> newAffineMapExprs(rank);
     for (int64_t i = 0; i < rank; i++) {
-      newAffineMapExprs[perm[i]] = oldAffineMap.getResult(i);
+      newAffineMapExprs[i] = oldAffineMap.getResult(perm[i]);
     }
     auto newAffineMap = AffineMap::get(
         oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
