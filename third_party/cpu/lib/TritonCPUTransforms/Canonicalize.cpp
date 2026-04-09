@@ -80,8 +80,8 @@ struct FoldReadShapeCast : public OpRewritePattern<vector::TransferReadOp> {
     if (failed(newAffineMap))
       return LogicalResult(newAffineMap);
 
-    auto newReadOp = rewriter.create<vector::TransferReadOp>(
-        op.getLoc(), reshape.getType(), op.getSource(), op.getIndices(),
+    auto newReadOp = vector::TransferReadOp::create(
+        rewriter, op.getLoc(), reshape.getType(), op.getBase(), op.getIndices(),
         *newAffineMap, op.getPadding(), op.getMask(),
         rewriter.getBoolArrayAttr(SmallVector(dstTy.getRank(), true)));
     rewriter.replaceOp(op, newReadOp);

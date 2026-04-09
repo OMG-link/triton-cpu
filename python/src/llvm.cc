@@ -75,6 +75,35 @@ template <> bool setLLVMOption<bool>(const std::string &name, bool value) {
   return original;
 }
 
+template <> int setLLVMOption<int>(const std::string &name, int value) {
+  auto options = llvm::cl::getRegisteredOptions();
+  auto it = options.find(name);
+  if (it == options.end())
+    return 0;
+
+  auto *opt = static_cast<llvm::cl::opt<int> *>(it->second);
+  int original = opt->getValue();
+
+  it->second->addOccurrence(1, name, std::to_string(value));
+
+  return original;
+}
+
+template <>
+unsigned setLLVMOption<unsigned>(const std::string &name, unsigned value) {
+  auto options = llvm::cl::getRegisteredOptions();
+  auto it = options.find(name);
+  if (it == options.end())
+    return 0;
+
+  auto *opt = static_cast<llvm::cl::opt<unsigned> *>(it->second);
+  unsigned original = opt->getValue();
+
+  it->second->addOccurrence(1, name, std::to_string(value));
+
+  return original;
+}
+
 template <>
 std::string setLLVMOption<std::string>(const std::string &name,
                                        std::string value) {
@@ -398,12 +427,8 @@ std::string translateLLVMIRToASM(
       }
     }
     if (vlen > 0) {
-      auto optMin = options.at("riscv-v-vector-bits-min");
-      auto optMax = options.at("riscv-v-vector-bits-max");
-      // llvm/lib/Target/RISCV/RISCVTargetMachine.cpp:66
-      static_cast<llvm::cl::opt<int> *>(optMin)->setValue(vlen);
-      // llvm/lib/Target/RISCV/RISCVTargetMachine.cpp:60
-      static_cast<llvm::cl::opt<unsigned> *>(optMax)->setValue(vlen);
+      setLLVMOption<int>("riscv-v-vector-bits-min", vlen);
+      setLLVMOption<unsigned>("riscv-v-vector-bits-max", vlen);
     }
   }
 

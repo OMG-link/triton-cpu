@@ -10,7 +10,6 @@ Triton-CPU is an experimental CPU backend for the Triton language and compiler. 
 
 ### Prerequisites
 - LLVM/MLIR must be built from source at the revision specified in `cmake/llvm-hash.txt`
-- The build requires the LLVM hash `adba14acea99cc6a17d837763a3248c9d4a2fadf`
 
 ### Building Triton
 

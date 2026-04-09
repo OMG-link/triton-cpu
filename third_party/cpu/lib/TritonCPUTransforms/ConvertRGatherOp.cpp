@@ -40,26 +40,26 @@ LogicalResult convertToVectorGather(RGatherOp op, PatternRewriter &rewriter) {
   // Move 'table' to stack so 'vector.gather' can gather data from memory.
   MemRefType tableMemRefTy =
       MemRefType::get(tableTy.getShape(), tableTy.getElementType());
-  Value tableMemRef = rewriter.create<memref::AllocaOp>(loc, tableMemRefTy);
+  Value tableMemRef = memref::AllocaOp::create(rewriter, loc, tableMemRefTy);
   auto transferWriteIndices = SmallVector<Value>(
-      tableTy.getRank(), rewriter.create<arith::ConstantIndexOp>(loc, 0));
-  rewriter.create<vector::TransferWriteOp>(loc, table, tableMemRef,
-                                           transferWriteIndices);
+      tableTy.getRank(), arith::ConstantIndexOp::create(rewriter, loc, 0));
+  vector::TransferWriteOp::create(rewriter, loc, table, tableMemRef,
+                                  transferWriteIndices);
 
   /// Create other arguments required by 'vector.gather'
   // Indices to index the starting point of gather. The starting point is always
   // the very beginning of table register.
   SmallVector<Value> indices(tableTy.getRank(),
-                             rewriter.create<arith::ConstantIndexOp>(loc, 0));
+                             arith::ConstantIndexOp::create(rewriter, loc, 0));
   // No mask is needed. Set every bit to 1.
   VectorType maskType =
       VectorType::get(resultTy.getShape(), rewriter.getI1Type());
   DenseElementsAttr maskAttr =
       DenseElementsAttr::get(maskType, rewriter.getBoolAttr(true));
   Value mask =
-      rewriter.create<mlir::arith::ConstantOp>(loc, maskType, maskAttr);
+      mlir::arith::ConstantOp::create(rewriter, loc, maskType, maskAttr);
   // No mask is needed. Value of 'passThru' does not matters.
-  Value passThru = rewriter.create<ub::PoisonOp>(loc, resultTy);
+  Value passThru = ub::PoisonOp::create(rewriter, loc, resultTy);
 
   rewriter.replaceOpWithNewOp<vector::GatherOp>(
       op, resultTy, tableMemRef, indices, indexVec, mask, passThru);
@@ -124,18 +124,18 @@ LogicalResult convertToRvvIntrinsic(RGatherOp op, PatternRewriter &rewriter) {
   VectorType indicesTy_scalable = resultTy_scalable.cloneWith(
       std::nullopt, indicesTy_fixed.getElementType());
   Value table_scalable =
-      convertToScalableVector(loc, rewriter, table_fixed, tableTy_scalable);
+      convertToScalableVector(rewriter, loc, table_fixed, tableTy_scalable);
   Value indices_scalable =
-      convertToScalableVector(loc, rewriter, indices_fixed, indicesTy_scalable);
+      convertToScalableVector(rewriter, loc, indices_fixed, indicesTy_scalable);
 
   // 'vl' limits the number of indices to be queried
-  Value vl = createI64(loc, rewriter, indicesTy_fixed.getDimSize(0));
+  Value vl = createI64(rewriter, loc, indicesTy_fixed.getDimSize(0));
 
   /// Create intrinsic
   Value result_scalable = rvv::intrinsic::createRgather(
-      loc, rewriter, table_scalable, indices_scalable, vl);
+      rewriter, loc, table_scalable, indices_scalable, vl);
   Value result_fixed =
-      convertToFixedVector(loc, rewriter, result_scalable, resultTy_fixed);
+      convertToFixedVector(rewriter, loc, result_scalable, resultTy_fixed);
   rewriter.replaceOp(op, result_fixed);
 
   LDBG("  RVV intrinsic lowering succeed.");

@@ -473,7 +473,7 @@ add_subdirectory(third_party/f2reduce)
 # add_subdirectory(bin)
 # TODO 依赖 bin 工具测试
 # add_subdirectory(test)
-add_subdirectory(examples)
+# add_subdirectory(examples)
 
 if(TRITON_BUILD_UT)
   add_subdirectory(unittest)

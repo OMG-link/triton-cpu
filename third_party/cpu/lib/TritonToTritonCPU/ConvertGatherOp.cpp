@@ -88,17 +88,19 @@ struct GatherOpConversion : public OpConversionPattern<triton::GatherOp> {
       VectorType baseTy = cast<VectorType>(baseVec.getType());
       VectorType indexTy = cast<VectorType>(indexVec.getType());
       if (baseTy.getRank() == 1) {
-        return rewriter.create<RGatherOp>(loc, baseVec, indexVec);
+        return RGatherOp::create(rewriter, loc, baseVec, indexVec);
       } else {
-        Value result = rewriter.create<ub::PoisonOp>(
-            loc, indexTy.cloneWith(std::nullopt, baseTy.getElementType()));
+        Value result = ub::PoisonOp::create(
+            rewriter, loc,
+            indexTy.cloneWith(std::nullopt, baseTy.getElementType()));
         for (int64_t i = 0; i < baseTy.getDimSize(0); i++) {
           Value subBaseVec =
-              rewriter.create<vector::ExtractOp>(loc, baseVec, i);
+              vector::ExtractOp::create(rewriter, loc, baseVec, i);
           Value subIndexVec =
-              rewriter.create<vector::ExtractOp>(loc, indexVec, i);
+              vector::ExtractOp::create(rewriter, loc, indexVec, i);
           Value subResult = build(build, subBaseVec, subIndexVec);
-          result = rewriter.create<vector::InsertOp>(loc, subResult, result, i);
+          result =
+              vector::InsertOp::create(rewriter, loc, subResult, result, i);
         }
         return result;
       }

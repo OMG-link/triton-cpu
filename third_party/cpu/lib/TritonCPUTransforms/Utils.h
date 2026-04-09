@@ -45,12 +45,13 @@ static inline int64_t getMinimumVlen() {
 }
 
 // Returns: VSCALE of type 'index'
-static inline Value getVscale(Location loc, PatternRewriter &rewriter) {
+static inline Value getVscale(PatternRewriter &rewriter, Location loc) {
   int vlen = getVlen();
   if (vlen > 0) {
-    return rewriter.create<arith::ConstantIndexOp>(loc, vlen / 64);
+    return arith::ConstantIndexOp::create(rewriter, loc, vlen / 64);
   } else {
-    return rewriter.create<vector::VectorScaleOp>(loc, rewriter.getIndexType());
+    return vector::VectorScaleOp::create(rewriter, loc,
+                                         rewriter.getIndexType());
   }
 }
 
@@ -59,12 +60,12 @@ static inline int64_t getBaseVlmax(Type elemTy) {
   return 64 / elemBits;
 }
 
-static inline Value getVlmax(Location loc, PatternRewriter &rewriter,
+static inline Value getVlmax(PatternRewriter &rewriter, Location loc,
                              Type elemTy) {
-  Value vscale = getVscale(loc, rewriter);
+  Value vscale = getVscale(rewriter, loc);
   int64_t baseVlmax = getBaseVlmax(elemTy);
   Value baseVlmax_cIndex =
-      rewriter.create<arith::ConstantIndexOp>(loc, baseVlmax);
+      arith::ConstantIndexOp::create(rewriter, loc, baseVlmax);
   Value vlmax =
       rewriter.createOrFold<arith::MulIOp>(loc, vscale, baseVlmax_cIndex);
   return vlmax;
@@ -75,21 +76,21 @@ FailureOr<VectorType> getSmallestScalableTypeThatHolds(VectorType vecTy);
 namespace intrinsic {
 
 Type getRvvTupleType(PatternRewriter &rewriter, Type vecTy, unsigned int size);
-Value insertToRvvTuple(Location loc, PatternRewriter &rewriter, Value tuple,
+Value insertToRvvTuple(PatternRewriter &rewriter, Location loc, Value tuple,
                        Value vec, int64_t index);
-Value extractFromRvvTuple(Location loc, PatternRewriter &rewriter, Value tuple,
+Value extractFromRvvTuple(PatternRewriter &rewriter, Location loc, Value tuple,
                           int64_t index);
 
-Value createLoad(Location loc, PatternRewriter &rewriter, VectorType resTy,
+Value createLoad(PatternRewriter &rewriter, Location loc, VectorType resTy,
                  Value basePtr, Value vl);
-void createStoreMasked(Location loc, PatternRewriter &rewriter, Value basePtr,
+void createStoreMasked(PatternRewriter &rewriter, Location loc, Value basePtr,
                        Value val, Value mask, Value vl);
-Value createRgather(Location loc, PatternRewriter &rewriter, Value table,
+Value createRgather(PatternRewriter &rewriter, Location loc, Value table,
                     Value indices, Value vl);
-Value createLoadStridedSegment(Location loc, PatternRewriter &rewriter,
+Value createLoadStridedSegment(PatternRewriter &rewriter, Location loc,
                                int64_t numFields, VectorType vecTy, Value base,
                                Value stride, Value vl);
-void createStoreStridedSegment(Location loc, PatternRewriter &rewriter,
+void createStoreStridedSegment(PatternRewriter &rewriter, Location loc,
                                Value valueToStore, Value base, Value stride,
                                Value vl);
 
@@ -100,23 +101,24 @@ void createStoreStridedSegment(Location loc, PatternRewriter &rewriter,
 std::string getCpuArch();
 std::set<std::string> getCpuFeatures();
 
-Value createBroadcast(Location loc, PatternRewriter &rewriter,
+Value createBroadcast(PatternRewriter &rewriter, Location loc,
                       VectorType vectorTy, Value scalar);
 
-Value createExtuiOrTrunc(Location loc, PatternRewriter &rewriter, Type targetTy,
+Value createExtuiOrTrunc(PatternRewriter &rewriter, Location loc, Type targetTy,
                          Value val);
 
-Value createMemRefToRawPtr(Location loc, PatternRewriter &rewriter,
+Value createMemRefToRawPtr(PatternRewriter &rewriter, Location loc,
                            Value memref);
 
-Value convertToScalableVector(Location loc, PatternRewriter &rewriter,
+Value convertToScalableVector(PatternRewriter &rewriter, Location loc,
                               Value fixedVector, VectorType scalableVecTy);
-Value convertToFixedVector(Location loc, PatternRewriter &rewriter,
+Value convertToFixedVector(PatternRewriter &rewriter, Location loc,
                            Value scalableVector, VectorType fixedVecTy);
 
-Value createI64(Location loc, PatternRewriter &rewriter, int64_t val);
+Value createI32(PatternRewriter &rewriter, Location loc, int32_t val);
+Value createI64(PatternRewriter &rewriter, Location loc, int64_t val);
 
-Value createGep(Location loc, PatternRewriter &rewriter, Value ptr, Type elemTy,
+Value createGep(PatternRewriter &rewriter, Location loc, Value ptr, Type elemTy,
                 Value index);
 
 } // namespace mlir::triton::cpu

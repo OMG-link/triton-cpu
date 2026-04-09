@@ -1,6 +1,7 @@
 #include "Utils.h"
 #include "cpu/include/TritonCPUTransforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -67,7 +68,7 @@ struct MergeTransposeIntoTransfer
     auto newAffineMap = AffineMap::get(
         oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
 
-    writeOp.getVectorMutable().set(input);
+    writeOp.getValueToStoreMutable().set(input);
     writeOp.setPermutationMap(newAffineMap);
 
     LDBG("  Success, new transfer_write: " << writeOp);
@@ -109,8 +110,8 @@ struct MergeTransposeIntoTransfer
         oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
 
     // Create new transfer_read
-    auto newReadOp = rewriter.create<vector::TransferReadOp>(
-        oldReadOp.getLoc(), output.getType(), oldReadOp.getSource(),
+    auto newReadOp = vector::TransferReadOp::create(
+        rewriter, oldReadOp.getLoc(), output.getType(), oldReadOp.getBase(),
         oldReadOp.getIndices(), newAffineMap, oldReadOp.getPadding(),
         oldReadOp.getMask(), oldReadOp.getInBounds());
     rewriter.replaceOp(transposeOp, newReadOp);
@@ -156,16 +157,18 @@ struct MergeTransposeIntoTransfer
       // Can we use a fixed-size buffer to avoid allocate large memory buffer?
       auto memRefTy =
           MemRefType::get(outputTy.getShape(), outputTy.getElementType());
-      Value memRef = rewriter.create<memref::AllocaOp>(
-          loc, memRefTy, rewriter.getI64IntegerAttr(64));
+      Value memRef = memref::AllocaOp::create(rewriter, loc, memRefTy,
+                                              rewriter.getI64IntegerAttr(64));
       LDBG("  Created a buffer for transpose: " << memRef);
       int64_t rank = outputTy.getRank();
-      Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value zeroIdx = arith::ConstantIndexOp::create(rewriter, loc, 0);
       SmallVector<Value> indices(rank, zeroIdx);
-      auto writeBufferOp = rewriter.create<vector::TransferWriteOp>(
-          loc, output, memRef, indices, SmallVector<bool>(rank, true));
-      auto readBufferOp = rewriter.create<vector::TransferReadOp>(
-          loc, outputTy, memRef, indices, SmallVector<bool>(rank, true));
+      auto writeBufferOp = vector::TransferWriteOp::create(
+          rewriter, loc, output, memRef, indices,
+          SmallVector<bool>(rank, true));
+      auto readBufferOp = vector::TransferReadOp::create(
+          rewriter, loc, outputTy, memRef, indices, std::nullopt,
+          SmallVector<bool>(rank, true));
       output.replaceUsesWithIf(readBufferOp.getResult(),
                                [&writeBufferOp](mlir::OpOperand &oper) -> bool {
                                  return oper.getOwner() != writeBufferOp;
@@ -189,7 +192,7 @@ bool isTransposedTransfer(VectorTransferOpInterface op) {
     LDBG("  Skipped: 'rank != 2'");
     return false;
   }
-  auto memRefTy = dyn_cast<MemRefType>(op.getSource().getType());
+  auto memRefTy = dyn_cast<MemRefType>(op.getBase().getType());
   if (!memRefTy) {
     LDBG("  Skipped: '!memRefTy'");
     return false;
@@ -218,12 +221,12 @@ bool isTransposedTransfer(VectorTransferOpInterface op) {
   return true;
 }
 
-static Value getLastDimStride(Location loc, PatternRewriter &rewriter,
+static Value getLastDimStride(PatternRewriter &rewriter, Location loc,
                               VectorTransferOpInterface op) {
-  auto memRef = op.getSource();
+  auto memRef = op.getBase();
   auto memRefTy = cast<MemRefType>(memRef.getType());
   auto memRefMetadata =
-      rewriter.create<memref::ExtractStridedMetadataOp>(loc, memRef);
+      memref::ExtractStridedMetadataOp::create(rewriter, loc, memRef);
   auto affineMap = op.getPermutationMap();
   assert(affineMap.getNumResults() == 2);
   auto lastDim = cast<AffineDimExpr>(affineMap.getResult(1)).getPosition();
@@ -244,7 +247,7 @@ struct LowerTransposedTransferReadOpToRvv
     Type matElemTy = matTy.getElementType();
     int64_t m = matTy.getDimSize(0);
     int64_t k = matTy.getDimSize(1);
-    Value memRef = op.getSource();
+    Value memRef = op.getBase();
     auto indices = op.getIndices();
     int64_t vlen = rvv::getMinimumVlen();
 
@@ -268,41 +271,41 @@ struct LowerTransposedTransferReadOpToRvv
     } else {
       rowType_scalable = *r;
     }
-    Value result = rewriter.create<ub::PoisonOp>(loc, matTy);
+    Value result = ub::PoisonOp::create(rewriter, loc, matTy);
 
     Value vl =
-        rewriter.create<arith::ConstantIntOp>(loc, k, rewriter.getI64Type());
-    Value stride_index = getLastDimStride(loc, rewriter, op);
-    Value stride_i64 = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI64Type(), stride_index);
+        arith::ConstantIntOp::create(rewriter, loc, rewriter.getI64Type(), k);
+    Value stride_index = getLastDimStride(rewriter, loc, op);
+    Value stride_i64 = arith::IndexCastOp::create(
+        rewriter, loc, rewriter.getI64Type(), stride_index);
 
     // Calculate the starting point of matrix
-    Value basePtr = createMemRefToRawPtr(loc, rewriter, memRef);
+    Value basePtr = createMemRefToRawPtr(rewriter, loc, memRef);
     auto strides =
-        rewriter.create<memref::ExtractStridedMetadataOp>(loc, memRef)
+        memref::ExtractStridedMetadataOp::create(rewriter, loc, memRef)
             .getStrides();
-    Value offset = createI64(loc, rewriter, 0);
+    Value offset = createI64(rewriter, loc, 0);
     for (int64_t i = 0; i < strides.size(); i++) {
-      auto thisOffset = rewriter.create<arith::IndexCastOp>(
-          loc, rewriter.getI64Type(),
-          rewriter.create<arith::MulIOp>(loc, indices[i], strides[i]));
+      auto thisOffset = arith::IndexCastOp::create(
+          rewriter, loc, rewriter.getI64Type(),
+          arith::MulIOp::create(rewriter, loc, indices[i], strides[i]));
       offset = rewriter.createOrFold<arith::AddIOp>(loc, offset, thisOffset);
     }
-    basePtr = createGep(loc, rewriter, basePtr, matElemTy, offset);
+    basePtr = createGep(rewriter, loc, basePtr, matElemTy, offset);
 
     for (int64_t i_m = 0; i_m < m; i_m += 4) {
       int64_t mr = std::min(m - i_m, int64_t(4));
-      Value ptr = createGep(loc, rewriter, basePtr, matElemTy,
-                            createI64(loc, rewriter, i_m));
+      Value ptr = createGep(rewriter, loc, basePtr, matElemTy,
+                            createI64(rewriter, loc, i_m));
       Value mrTuple = rvv::intrinsic::createLoadStridedSegment(
-          loc, rewriter, mr, rowType_scalable, ptr, stride_i64, vl);
+          rewriter, loc, mr, rowType_scalable, ptr, stride_i64, vl);
       for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
         Value row_scalable =
-            rvv::intrinsic::extractFromRvvTuple(loc, rewriter, mrTuple, i_mr);
+            rvv::intrinsic::extractFromRvvTuple(rewriter, loc, mrTuple, i_mr);
         Value row_fixed =
-            convertToFixedVector(loc, rewriter, row_scalable, rowType_fixed);
-        result = rewriter.create<vector::InsertOp>(loc, row_fixed, result,
-                                                   i_m + i_mr);
+            convertToFixedVector(rewriter, loc, row_scalable, rowType_fixed);
+        result = vector::InsertOp::create(rewriter, loc, row_fixed, result,
+                                          i_m + i_mr);
       }
     }
 
@@ -322,12 +325,12 @@ struct LowerTransposedTransferWriteOpToRvv
     if (!isTransposedTransfer(op))
       return failure();
     Location loc = op.getLoc();
-    Value mat = op.getVector();
-    VectorType matTy = op.getVector().getType();
+    Value mat = op.getValueToStore();
+    VectorType matTy = op.getValueToStore().getType();
     Type matElemTy = matTy.getElementType();
     int64_t m = matTy.getDimSize(0);
     int64_t k = matTy.getDimSize(1);
-    Value memRef = op.getSource();
+    Value memRef = op.getBase();
     auto indices = op.getIndices();
     int64_t vlen = rvv::getMinimumVlen();
 
@@ -353,42 +356,42 @@ struct LowerTransposedTransferWriteOpToRvv
     }
 
     Value vl =
-        rewriter.create<arith::ConstantIntOp>(loc, k, rewriter.getI64Type());
-    Value stride_index = getLastDimStride(loc, rewriter, op);
-    Value stride_i64 = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI64Type(), stride_index);
+        arith::ConstantIntOp::create(rewriter, loc, rewriter.getI64Type(), k);
+    Value stride_index = getLastDimStride(rewriter, loc, op);
+    Value stride_i64 = arith::IndexCastOp::create(
+        rewriter, loc, rewriter.getI64Type(), stride_index);
 
     // Calculate the starting point of matrix
-    Value basePtr = createMemRefToRawPtr(loc, rewriter, memRef);
+    Value basePtr = createMemRefToRawPtr(rewriter, loc, memRef);
     auto strides =
-        rewriter.create<memref::ExtractStridedMetadataOp>(loc, memRef)
+        memref::ExtractStridedMetadataOp::create(rewriter, loc, memRef)
             .getStrides();
-    Value offset = createI64(loc, rewriter, 0);
+    Value offset = createI64(rewriter, loc, 0);
     for (int64_t i = 0; i < strides.size(); i++) {
-      auto thisOffset = rewriter.create<arith::IndexCastOp>(
-          loc, rewriter.getI64Type(),
-          rewriter.create<arith::MulIOp>(loc, indices[i], strides[i]));
+      auto thisOffset = arith::IndexCastOp::create(
+          rewriter, loc, rewriter.getI64Type(),
+          arith::MulIOp::create(rewriter, loc, indices[i], strides[i]));
       offset = rewriter.createOrFold<arith::AddIOp>(loc, offset, thisOffset);
     }
-    basePtr = createGep(loc, rewriter, basePtr, matElemTy, offset);
+    basePtr = createGep(rewriter, loc, basePtr, matElemTy, offset);
 
     for (int64_t i_m = 0; i_m < m; i_m += 4) {
       int64_t mr = std::min(m - i_m, int64_t(4));
       Type tupleTy =
           rvv::intrinsic::getRvvTupleType(rewriter, rowType_scalable, mr);
-      Value matToStore = rewriter.create<ub::PoisonOp>(loc, tupleTy);
+      Value matToStore = ub::PoisonOp::create(rewriter, loc, tupleTy);
       // TODO: We have another intrinsic that can create a whole tuple at a time
       for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
         Value row_fixed =
-            rewriter.create<vector::ExtractOp>(loc, mat, i_m + i_mr);
+            vector::ExtractOp::create(rewriter, loc, mat, i_m + i_mr);
         Value row_scalable =
-            convertToScalableVector(loc, rewriter, row_fixed, rowType_scalable);
-        matToStore = rvv::intrinsic::insertToRvvTuple(loc, rewriter, matToStore,
+            convertToScalableVector(rewriter, loc, row_fixed, rowType_scalable);
+        matToStore = rvv::intrinsic::insertToRvvTuple(rewriter, loc, matToStore,
                                                       row_scalable, i_mr);
       }
-      Value ptr = createGep(loc, rewriter, basePtr, matElemTy,
-                            createI64(loc, rewriter, i_m));
-      rvv::intrinsic::createStoreStridedSegment(loc, rewriter, matToStore, ptr,
+      Value ptr = createGep(rewriter, loc, basePtr, matElemTy,
+                            createI64(rewriter, loc, i_m));
+      rvv::intrinsic::createStoreStridedSegment(rewriter, loc, matToStore, ptr,
                                                 stride_i64, vl);
     }
 
