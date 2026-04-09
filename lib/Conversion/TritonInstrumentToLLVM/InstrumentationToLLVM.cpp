@@ -1,8 +1,5 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
-#include "third_party/nvidia/include/TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
-#include "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -101,9 +98,12 @@ struct BufferDescriptorsOpConversion
     } else {
       assert(op.getMemType() == tti::MemType::TENSOR_MEM &&
              "Unsupported memory type");
+      assert(false && "Third-party GPU backends disabled!");
+      /*
       Value basePtr = nvgpu::TensorMemoryBaseAddress::create(rewriter, loc);
       Value base = b.ptrtoint(i64Ty, basePtr);
       baseTensor = triton::SplatOp::create(rewriter, loc, tensorType, base);
+      */
     }
 
     pointerTensor = arith::AddIOp::create(
@@ -172,6 +172,8 @@ struct LockAcquireOpConversion
     Block *whileBlock = b.splitBlock(prevBlock2, b.getInsertionPoint());
     Block *endBlock = b.splitBlock(whileBlock, whileBlock->begin());
     b.setInsertionPointToEnd(prevBlock2);
+    assert(false && "Third-party GPU backends disabled!");
+    /*
     Value elect = mlir::LLVM::NVIDIA::createElectPredicateWarp0(loc, b);
     if (op.getPred()) {
       elect = arith::AndIOp::create(b, loc, elect, op.getPred());
@@ -189,7 +191,7 @@ struct LockAcquireOpConversion
     // Inline PTX CAS: old = atom.global.acquire.gpu.cas.b32 [lock], 0, 1
     // Use converted lock pointer from adaptor for addressing
     PTXBuilder ptx;
-    auto *dstOpr = ptx.newOperand("=r", /*init=*/true);
+    auto *dstOpr = ptx.newOperand("=r", /|*init=*|/true);
     auto *ptrOpr = ptx.newAddrOperand(adaptor.getLock(), "l");
     auto *cmpOpr = ptx.newOperand(zero, "r");
     auto *valOpr = ptx.newOperand(one, "r");
@@ -209,6 +211,7 @@ struct LockAcquireOpConversion
                                        triton::gpu::AddrSpace::GlobalWrite);
     b.eraseOp(op);
     return success();
+    */
   }
 };
 

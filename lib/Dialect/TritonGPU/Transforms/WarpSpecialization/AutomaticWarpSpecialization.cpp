@@ -3,7 +3,6 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
-#include "third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
@@ -62,6 +61,8 @@ void multiBufferTMADescriptors(ModuleOp mod, int numStages) {
 void AutomaticWarpSpecialization::runOnOperation() {
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
+  assert(false && "Third-party GPU backends disabled!");
+  /*
   pm.addPass(createNVWSHoistTmemStore());
   pm.addPass(createNVWSInsertAref());
   pm.addPass(createNVWSInsertTmemAref());
@@ -80,4 +81,5 @@ void AutomaticWarpSpecialization::runOnOperation() {
   // Multi-buffer TMA descriptors. We cannot rely on SWP to do it, to support
   // desc updates in nested loops.
   multiBufferTMADescriptors(getOperation(), numStages);
+  */
 }

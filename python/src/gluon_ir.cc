@@ -9,7 +9,6 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Types.h"
-#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -31,7 +30,6 @@ namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace gluon = mlir::triton::gluon;
-namespace ttag = mlir::triton::amdgpu;
 
 static ttg::CGAEncodingAttr
 buildCgaLayoutAttr(MLIRContext *ctx,
@@ -647,13 +645,6 @@ void init_gluon_ir(py::module &&m) {
                  pointer, smem, mask, other, cacheModifier, evictionPolicy,
                  isVolatile);
            })
-      .def("create_async_copy_local_to_global",
-           [](GluonOpBuilder &self, Value smem, Value pointer, Value mask,
-              tt::CacheModifier cacheModifier,
-              tt::EvictionPolicy evictionPolicy) {
-             self.create<ttag::AsyncCopyLocalToGlobalOp>(
-                 smem, pointer, mask, cacheModifier, evictionPolicy);
-           })
       .def("create_async_copy_mbarrier_arrive",
            [](GluonOpBuilder &self, Value mbarrier, bool incrementCount) {
              self.create<ttng::AsyncCopyMbarrierArriveOp>(mbarrier,
@@ -987,101 +978,12 @@ void init_gluon_ir(py::module &&m) {
              return self.create<ttg::WarpSpecializeOp>(resultTypes,
                                                        partitionNumWarps);
            })
-      .def("create_buffer_load",
-           [](GluonOpBuilder &self, Type resultType, Value ptr, Value offsets,
-              Value mask, Value other, tt::CacheModifier cache) -> Value {
-             return self.create<ttag::BufferLoadOp>(resultType, ptr, offsets,
-                                                    Value() /*stride*/, cache,
-                                                    mask, other);
-           })
-      .def("create_buffer_store",
-           [](GluonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
-              Value mask, tt::CacheModifier cache) {
-             self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                              Value() /*stride*/, cache, mask);
-           })
-      .def("create_buffer_atomic_rmw",
-           [](GluonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
-              Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
-              Value mask) -> Value {
-             return self.create<ttag::BufferAtomicRMWOp>(
-                 value.getType(), op, ptr, offsets, value, Value() /*stride*/,
-                 sem, scope, mask);
-           })
-      .def("create_buffer_load_to_local",
-           [](GluonOpBuilder &self, Value dest, Value ptr, Value offsets,
-              Value mask, Value other, Value stride,
-              tt::CacheModifier cacheModifier) {
-             self.create<ttag::BufferLoadToLocalOp>(
-                 dest, ptr, offsets, mask, other, stride, cacheModifier);
-           })
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Type resultTy, Value &base,
               std::vector<Value> &shape, std::vector<Value> &strides,
               tt::PaddingOption paddingOption) -> Value {
              return self.create<tt::MakeTensorDescOp>(resultTy, base, shape,
                                                       strides, paddingOption);
-           })
-      .def("create_async_tdm_copy_global_to_local",
-           [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
-              Value result, Value pred, Value barrier) {
-             self.create<ttag::AsyncTDMCopyGlobalToLocalOp>(
-                 descPtr, indices, result, pred, barrier);
-           })
-      .def("create_async_tdm_copy_local_to_global",
-           [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
-              Value src, Value barrier) {
-             self.create<ttag::AsyncTDMCopyLocalToGlobalOp>(descPtr, indices,
-                                                            src, barrier);
-           })
-      .def("create_async_tdm_scatter",
-           [](GluonOpBuilder &self, Value descPtr, Value dstRowIndices,
-              Value dstColOffset, Value src, Value barrier) {
-             self.create<ttag::AsyncTDMScatterOp>(descPtr, dstRowIndices,
-                                                  dstColOffset, src, barrier);
-           })
-      .def("create_async_tdm_gather",
-           [](GluonOpBuilder &self, Value descPtr, Value srcRowIndices,
-              Value srcColOffset, Value dst, Value barrier) {
-             self.create<ttag::AsyncTDMGatherOp>(descPtr, srcRowIndices,
-                                                 srcColOffset, dst, barrier);
-           })
-      .def("create_tdm_prefetch",
-           [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
-              Value pred, bool speculative, bool returnOffsets) -> Value {
-             auto op = self.create<ttag::TDMPrefetchOp>(
-                 descPtr, indices, pred, speculative,
-                 returnOffsets ? UnitAttr::get(self.getContext()) : nullptr);
-             return returnOffsets ? op->getResult(0) : nullptr;
-           })
-      .def("create_async_tdm_wait",
-           [](GluonOpBuilder &self, int num) {
-             ValueRange tokens;
-             self.create<ttag::AsyncTDMWait>(tokens, num);
-           })
-      .def("create_async_copy_lds_barrier_arrive",
-           [](GluonOpBuilder &self, Value mbarrier) {
-             self.create<ttag::AsyncCopyMbarrierArriveOp>(mbarrier);
-           })
-      .def("create_lds_barrier_init",
-           [](GluonOpBuilder &self, Value memDesc, int count) {
-             self.create<ttag::InitBarrierOp>(memDesc, count);
-           })
-      .def("create_lds_barrier_wait",
-           [](GluonOpBuilder &self, Value memDesc, Value phase) {
-             self.create<ttag::WaitBarrierOp>(memDesc, phase);
-           })
-      .def("create_lds_barrier_arrive",
-           [](GluonOpBuilder &self, Value memDesc, int count) -> Value {
-             return self.create<ttag::ArriveBarrierOp>(memDesc, count);
-           })
-      .def("create_amd_cluster_arrive",
-           [](GluonOpBuilder &self) {
-             self.create<ttag::ClusterBarrierArriveOp>();
-           })
-      .def("create_amd_cluster_wait",
-           [](GluonOpBuilder &self) {
-             self.create<ttag::ClusterBarrierWaitOp>();
            })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker, int priority) {

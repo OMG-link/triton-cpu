@@ -6,8 +6,6 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
-#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
-#include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -419,6 +417,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   }
 
   SmallVector<int32_t> numWarps(numPartitions, lookupNumWarps(loop));
+  assert(false && "Third-party GPU backends disabled!");
+  /*
   auto wgOp = nvws::WarpGroupOp::create(topBuilder, resultTypes, numWarps,
                                         numPartitions);
 
@@ -509,6 +509,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     op->erase();
 
   return success();
+  */
 }
 
 //===----------------------------------------------------------------------===//

@@ -245,18 +245,6 @@ class CMakeBuild(build_ext):
             pybind11_include_dir = pybind11.get_include()
         return [f"-Dpybind11_INCLUDE_DIR='{pybind11_include_dir}'", f"-Dpybind11_DIR='{pybind11.get_cmake_dir()}'"]
 
-    def get_proton_cmake_args(self):
-        cmake_args = self.get_pybind11_cmake_args()
-        # cupti_include_dir = get_env_with_keys(["TRITON_CUPTI_INCLUDE_PATH"])
-        # if cupti_include_dir == "":
-        #     cupti_include_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "include")
-        # cmake_args += ["-DCUPTI_INCLUDE_DIR=" + cupti_include_dir]
-        # roctracer_include_dir = get_env_with_keys(["TRITON_ROCTRACER_INCLUDE_PATH"])
-        # if roctracer_include_dir == "":
-        #     roctracer_include_dir = os.path.join(get_base_dir(), "third_party", "amd", "backend", "include")
-        # cmake_args += ["-DROCTRACER_INCLUDE_DIR=" + roctracer_include_dir]
-        return cmake_args
-
     def build_extension(self, ext):
         lit_dir = shutil.which('lit')
         ninja_dir = shutil.which('ninja')
@@ -332,7 +320,6 @@ class CMakeBuild(build_ext):
 
         # environment variables we will pass through to cmake
         passthrough_args = [
-            "TRITON_BUILD_PROTON",
             "TRITON_BUILD_WITH_CCACHE",
             "TRITON_PARALLEL_LINK_JOBS",
             "TRITON_OFFLINE_BUILD",
@@ -350,11 +337,6 @@ class CMakeBuild(build_ext):
             "TRITON_PTXAS_BLACKWELL_PATH",
         ]
         cmake_args += [f"-D{option}={os.getenv(option)}" for option in passthrough_args if option in os.environ]
-
-        if len([b for b in backends if b.name in ["nvidia", "amd"]]) == 0:
-            cmake_args += ["-DTRITON_BUILD_PROTON=OFF"]
-        elif check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
-            cmake_args += self.get_proton_cmake_args()
 
         if is_offline_build():
             # unit test builds fetch googletests from GitHub
@@ -397,10 +379,6 @@ def get_package_dirs():
             for x in os.listdir(backend.tools_dir):
                 yield (f"triton.tools.extra.{x}", os.path.join(backend.tools_dir, x))
 
-    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
-        yield ("triton.profiler", "third_party/proton/proton")
-        yield ("triton.profiler.hooks", "third_party/proton/proton/hooks")
-
 
 def get_packages():
     yield from find_packages(where="python")
@@ -419,9 +397,6 @@ def get_packages():
             # `triton.tools.extra`.
             for x in os.listdir(backend.tools_dir):
                 yield f"triton.tools.extra.{x}"
-
-    if check_env_flag("TRITON_BUILD_PROTON", "ON") and len([b for b in backends if b.name in ["nvidia", "amd"]]) > 0:  # Default ON
-        yield "triton.profiler"
 
 
 def add_link_to_backends(external_only):
@@ -453,16 +428,8 @@ def add_link_to_backends(external_only):
                 update_symlink(install_dir, src_dir)
 
 
-def add_link_to_proton():
-    proton_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "proton", "proton"))
-    proton_install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "profiler")
-    update_symlink(proton_install_dir, proton_dir)
-
-
 def add_links(external_only):
     add_link_to_backends(external_only=external_only)
-    if not external_only and check_env_flag("TRITON_BUILD_PROTON", "ON") and len([b for b in backends if b.name in ["nvidia", "amd"]]) > 0:  # Default ON
-        add_link_to_proton()
 
 
 class plugin_bdist_wheel(bdist_wheel):
@@ -511,11 +478,6 @@ class plugin_sdist(sdist):
 
 def get_entry_points():
     entry_points = {}
-    if check_env_flag("TRITON_BUILD_PROTON", "ON") and len([b for b in backends if b.name in ["nvidia", "amd"]]) > 0:  # Default ON
-        entry_points["console_scripts"] = [
-            "proton-viewer = triton.profiler.viewer:main",
-            "proton = triton.profiler.proton:main",
-        ]
     entry_points["triton.backends"] = [f"{b.name} = triton.backends.{b.name}" for b in backends]
     return entry_points
 
