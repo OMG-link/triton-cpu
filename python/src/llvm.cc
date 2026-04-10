@@ -431,6 +431,7 @@ std::string translateLLVMIRToASM(
       setLLVMOption<unsigned>("riscv-v-vector-bits-max", vlen);
     }
   }
+  setLLVMOption<bool>("misched-cluster", false);
 
   // inline everything
   for (llvm::Function &f : module.functions())
