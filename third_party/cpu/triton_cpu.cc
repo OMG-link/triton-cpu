@@ -137,8 +137,8 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_convert_rgather_op", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createConvertRGatherOp());
   });
-  m.def("add_convert_transpose_op", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::cpu::createConvertTransposeOp());
+  m.def("add_lower_transfer_op", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cpu::createLowerTransferOp());
   });
   m.def("add_convert_unsupported_ops",
         [](mlir::PassManager &pm, bool promote_bf16_to_fp32,

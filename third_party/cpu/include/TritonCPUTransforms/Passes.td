@@ -163,14 +163,14 @@ def ConvertRGatherOp : Pass<"triton-cpu-convert-rgather-op", "mlir::ModuleOp"> {
                              "mlir::ub::UBDialect"];
 }
 
-def ConvertTransposeOp : Pass<"triton-cpu-convert-transpose-op", "mlir::ModuleOp"> {
-    let summary = "Lower vector.transpose op for specific backends.";
+def LowerTransferOp : Pass<"triton-cpu-lower-transfer-op", "mlir::ModuleOp"> {
+    let summary = "Lower transfer_read/write op if backend has specific instructions.";
     let description = [{
-        Lower vector.transpose if a high-performance transpose implementation for the
+        Lower transfer_read/write if a high-performance implementation for the
         target backend exists.
     }];
 
-    let constructor = "mlir::triton::cpu::createConvertTransposeOp()";
+    let constructor = "mlir::triton::cpu::createLowerTransferOp()";
     let dependentDialects = ["mlir::arith::ArithDialect",
                              "mlir::vector::VectorDialect",
                              "mlir::triton::cpu::TritonCPUDialect",

@@ -1,6 +1,7 @@
 #include "cpu/include/TritonCPUTransforms/OptCommon.h"
 #include "cpu/include/TritonCPUTransforms/Passes.h"
 
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/Pass.h"
@@ -8,6 +9,10 @@
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
+
+#define DEBUG_TYPE "triton-cpu-transforms-canonicalize"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir {
 namespace triton {
@@ -90,6 +95,129 @@ struct FoldReadShapeCast : public OpRewritePattern<vector::TransferReadOp> {
   }
 };
 
+struct MergeTransposeIntoTransfer
+    : public OpRewritePattern<vector::TransposeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult transposeWhenWriting(vector::TransposeOp transposeOp,
+                                     PatternRewriter &rewriter) const {
+    OpBuilder::InsertionGuard guard(rewriter);
+
+    Value input = transposeOp.getOperand();
+    Value output = transposeOp.getResult();
+    assert(output.hasOneUse());
+    auto writeOp = cast<vector::TransferWriteOp>(*output.user_begin());
+    LDBG("  Merging transpose into: " << writeOp);
+
+    // Make sure transfer_write has no complex attributes
+    if (writeOp.isMasked()) {
+      LDBG("  Failed: transfer_write is masked");
+      return failure();
+    }
+    if (writeOp.hasOutOfBoundsDim()) {
+      // FIXME: we actually can process this
+      LDBG("  Failed: transfer_write has out of bounds dims");
+      return failure();
+    }
+
+    int64_t rank = writeOp.getVectorType().getRank();
+    auto perm = transposeOp.getPermutation();
+    assert(rank == perm.size());
+
+    // Permute transfer_write.affine_map
+    auto oldAffineMap = writeOp.getPermutationMap();
+    assert(rank == oldAffineMap.getNumResults());
+    SmallVector<AffineExpr> newAffineMapExprs(rank);
+    for (int64_t i = 0; i < rank; i++) {
+      newAffineMapExprs[perm[i]] = oldAffineMap.getResult(i);
+    }
+    auto newAffineMap = AffineMap::get(
+        oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
+
+    writeOp.getValueToStoreMutable().set(input);
+    writeOp.setPermutationMap(newAffineMap);
+
+    LDBG("  Success, new transfer_write: " << writeOp);
+    return success();
+  }
+
+  LogicalResult transposeWhenReading(vector::TransposeOp transposeOp,
+                                     PatternRewriter &rewriter) const {
+    OpBuilder::InsertionGuard guard(rewriter);
+
+    Value input = transposeOp.getOperand();
+    Value output = transposeOp.getResult();
+    auto oldReadOp = cast<vector::TransferReadOp>(input.getDefiningOp());
+    LDBG("  Merging transpose into: " << oldReadOp);
+
+    // Make sure transfer_read has no complex attributes
+    if (oldReadOp.isMasked()) {
+      LDBG("  Failed: transfer_read is masked");
+      return failure();
+    }
+    if (oldReadOp.hasOutOfBoundsDim()) {
+      // FIXME: we actually can process this
+      LDBG("  Failed: transfer_read has out of bounds dims");
+      return failure();
+    }
+
+    int64_t rank = oldReadOp.getResult().getType().getRank();
+    auto perm = transposeOp.getPermutation();
+    assert(rank == perm.size());
+
+    // Permute transfer_read.affine_map
+    auto oldAffineMap = oldReadOp.getPermutationMap();
+    assert(rank == oldAffineMap.getNumResults());
+    SmallVector<AffineExpr> newAffineMapExprs(rank);
+    for (int64_t i = 0; i < rank; i++) {
+      newAffineMapExprs[i] = oldAffineMap.getResult(perm[i]);
+    }
+    auto newAffineMap = AffineMap::get(
+        oldAffineMap.getNumDims(), 0, newAffineMapExprs, rewriter.getContext());
+
+    // Create new transfer_read
+    auto newReadOp = vector::TransferReadOp::create(
+        rewriter, oldReadOp.getLoc(), output.getType(), oldReadOp.getBase(),
+        oldReadOp.getIndices(), newAffineMap, oldReadOp.getPadding(),
+        oldReadOp.getMask(), oldReadOp.getInBounds());
+    rewriter.replaceOp(transposeOp, newReadOp);
+
+    LDBG("  Success, new transfer_read: " << newReadOp);
+    return success();
+  }
+
+  LogicalResult matchAndRewrite(vector::TransposeOp transposeOp,
+                                PatternRewriter &rewriter) const override {
+    LDBG("Attempt to merge transpose with memory access: " << transposeOp);
+
+    Value input = transposeOp.getOperand();
+    VectorType inputTy = cast<VectorType>(input.getType());
+    Value output = transposeOp.getResult();
+    VectorType outputTy = cast<VectorType>(output.getType());
+
+    /// Try to merge transpose with transfer_write
+    // If transpose has multiple uses rather than a single transfer_write, it
+    // cannot be safely merged into a single transfer_write. Fallback to other
+    // strategies in such cases.
+    if (output.hasOneUse()) {
+      if (auto writeOp =
+              dyn_cast<vector::TransferWriteOp>(*output.user_begin())) {
+        return transposeWhenWriting(transposeOp, rewriter);
+      }
+    }
+
+    /// Try to merge transpose with transfer_read
+    // 'transposeWhenReading' creates a new transfer_read which will be used by
+    // users of transpose. Therefore, single use check is not required.
+    if (auto readOp = dyn_cast<vector::TransferReadOp>(input.getDefiningOp());
+        readOp) {
+      return transposeWhenReading(transposeOp, rewriter);
+    }
+
+    return failure();
+  }
+};
+
 struct Canonicalize : public triton::cpu::impl::CanonicalizeBase<Canonicalize> {
   Canonicalize() = default;
 
@@ -99,6 +227,7 @@ struct Canonicalize : public triton::cpu::impl::CanonicalizeBase<Canonicalize> {
 
     RewritePatternSet patterns(context);
     patterns.add<FoldReadShapeCast>(context);
+    patterns.add<MergeTransposeIntoTransfer>(context);
 
     if (failed(mlir::applyPatternsGreedily(mod, std::move(patterns))))
       return signalPassFailure();
