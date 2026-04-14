@@ -32,8 +32,6 @@ struct RvvDotOpCandidate {
   // Type of input and output element.
   Type inputElemTy;
   Type outputElemTy;
-  // True if outputElemTy.bitwidth = inputElemTy.bitwidth * 2
-  bool isWidening;
 
   // Matrix sizes. LHS = <m x k>; RHS = <k x n>; output = <m x n>
   int64_t m, k, n;
@@ -51,7 +49,7 @@ struct RvvDotOpCandidate {
 
 // Check if input types are same, and if output elemets types are same with
 // input or double-width relative to input. If success, inputElemTy and
-// isWidening in candidate are filled.
+// outputElemTy in candidate are filled.
 bool checkElemTypes(Type lhsElemTy, Type rhsElemTy, Type accElemTy,
                     Type resElemTy, RvvDotOpCandidate &candidate) {
   MLIRContext *ctx = lhsElemTy.getContext();
@@ -89,20 +87,6 @@ bool checkElemTypes(Type lhsElemTy, Type rhsElemTy, Type accElemTy,
     return false;
   }
   candidate.outputElemTy = outputElemTy;
-
-  // isWidening
-  if (inputElemTy.getIntOrFloatBitWidth() ==
-      outputElemTy.getIntOrFloatBitWidth()) {
-    candidate.isWidening = false;
-  } else if (inputElemTy.getIntOrFloatBitWidth() * 2 ==
-             outputElemTy.getIntOrFloatBitWidth()) {
-    candidate.isWidening = true;
-  } else {
-    LDBG("checkElemTypes failed: bitwidth of output is neither same nor double "
-         "of input. (inputElemTy)"
-         << inputElemTy << " (outputElemTy)" << outputElemTy);
-    return false;
-  }
 
   return true;
 }
@@ -435,7 +419,6 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   int64_t mat_m = candidate.m;
   int64_t mat_n = candidate.n;
   int64_t mat_k = candidate.k;
-  bool isWidening = candidate.isWidening;
 
   Location loc = dotOp.getLoc();
 
@@ -602,16 +585,13 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
   int64_t mat_m = candidate.m;
   int64_t mat_n = candidate.n;
   int64_t mat_k = candidate.k;
-  bool isWidening = candidate.isWidening;
 
   Location loc = dotOp.getLoc();
 
   int64_t inputElemBitWidth = inputElemTy.getIntOrFloatBitWidth();
+  int64_t outputElemBitWidth = outputElemTy.getIntOrFloatBitWidth();
   const int64_t baseVlen_i64 = 64;
-  const int64_t baseVlmax_i64 =
-      baseVlen_i64 / inputElemBitWidth / (isWidening ? 2 : 1);
-  assert(!(inputElemBitWidth == 64 && isWidening) &&
-         "Cannot widen 64-bit element.");
+  const int64_t baseVlmax_i64 = baseVlen_i64 / outputElemBitWidth;
   assert(baseVlmax_i64 > 0);
 
   Value baseVlmax_cIndex = index_cst(baseVlmax_i64);
@@ -813,7 +793,6 @@ struct ConvertDotToRVV
                                                               : "OUTER"));
           LDBG("  InputElemTy: " << candidate.inputElemTy);
           LDBG("  OutputElemTy: " << candidate.outputElemTy);
-          LDBG("  IsWidening: " << candidate.isWidening);
           if (!candidate.lhsBuf.empty()) {
             LDBG("  LhsBuf: " << candidate.lhsBuf.memRef);
             LDBG("  Transposed: " << candidate.lhsBuf.transposed);
