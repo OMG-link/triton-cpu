@@ -4,6 +4,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -29,32 +31,95 @@ using namespace mlir::triton::cpu;
 
 namespace {
 
+// Iterates over all matching pairs of “non-unit dimensions” in srcTy and dstTy.
+// - Dimensions of size 1 in srcTy are handled separately via onSrcUnitDim.
+// - Dimensions of size 1 in dstTy are skipped automatically.
+// - When a pair of non-unit dimensions is found, their sizes must match,
+//   and the pair is passed to onMatch for processing.
+// Returns failure() if any mismatch is encountered.
+template <typename OnMatch, typename OnSrcUnitDim>
+static LogicalResult walkReshapeDims(VectorType srcTy, VectorType dstTy,
+                                     OnMatch &&onMatch,
+                                     OnSrcUnitDim &&onSrcUnitDim) {
+  int64_t iDstTy = 0;
+
+  for (int64_t iSrcTy = 0; iSrcTy < srcTy.getRank(); ++iSrcTy) {
+    if (srcTy.getDimSize(iSrcTy) == 1) {
+      if (failed(onSrcUnitDim(iSrcTy)))
+        return failure();
+      continue;
+    }
+
+    while (true) {
+      if (iDstTy >= dstTy.getRank())
+        return failure();
+      if (dstTy.getDimSize(iDstTy) != 1)
+        break;
+      ++iDstTy;
+    }
+
+    if (srcTy.getDimSize(iSrcTy) != dstTy.getDimSize(iDstTy))
+      return failure();
+
+    if (failed(onMatch(iSrcTy, iDstTy)))
+      return failure();
+
+    ++iDstTy;
+  }
+
+  return success();
+}
+
 // Suppose srcTy matches the output of oldAffineMap, and will be reshaped to
 // dstTy. This function returns a new affine map that produces dstTy directly.
 static FailureOr<AffineMap> getAffineMapAfterReshape(MLIRContext *C,
-                                                     AffineMap oldAffineMap,
+                                                     AffineMap srcAffineMap,
                                                      VectorType srcTy,
                                                      VectorType dstTy) {
-  SmallVector<AffineExpr> newAffineMapExprs(dstTy.getRank(),
+  SmallVector<AffineExpr> dstAffineMapExprs(dstTy.getRank(),
                                             getAffineConstantExpr(0, C));
-  int64_t i_srcTy = 0;
-  int64_t i_dstTy = 0;
-  for (; i_srcTy < srcTy.getRank(); i_srcTy++) {
-    if (srcTy.getDimSize(i_srcTy) != 1) {
-      while (true) {
-        if (i_dstTy >= dstTy.getRank())
-          return failure();
-        if (dstTy.getDimSize(i_dstTy) != 1)
-          break;
-        i_dstTy++;
-      }
-      if (srcTy.getDimSize(i_srcTy) != dstTy.getDimSize(i_dstTy))
-        return failure();
-      newAffineMapExprs[i_dstTy] = oldAffineMap.getResult(i_srcTy);
-      i_dstTy++;
-    }
-  }
-  return AffineMap::get(oldAffineMap.getNumDims(), 0, newAffineMapExprs, C);
+
+  if (failed(walkReshapeDims(
+          srcTy, dstTy,
+          [&](int64_t iSrcTy, int64_t iDstTy) {
+            dstAffineMapExprs[iDstTy] = srcAffineMap.getResult(iSrcTy);
+            return success();
+          },
+          [&](int64_t) { return success(); })))
+    return failure();
+
+  return AffineMap::get(srcAffineMap.getNumDims(), 0, dstAffineMapExprs, C);
+}
+
+// Suppose the `in_bounds` attribute of srcTy is oldInBoundsAttr, and srcTy
+// will be reshaped to dstTy. This function returns the `in_bounds` attribute
+// of dstTy.
+static FailureOr<ArrayAttr> getInBoundsAfterReshape(MLIRContext *C,
+                                                    ArrayAttr srcInBoundsAttr,
+                                                    VectorType srcTy,
+                                                    VectorType dstTy) {
+  SmallVector<bool> srcInBounds = llvm::map_to_vector(
+      srcInBoundsAttr.getAsRange<BoolAttr>(),
+      [](BoolAttr attr) -> bool { return attr.getValue(); });
+
+  SmallVector<bool> dstInBounds(dstTy.getRank(), true);
+
+  if (failed(walkReshapeDims(
+          srcTy, dstTy,
+          [&](int64_t iSrcTy, int64_t iDstTy) {
+            dstInBounds[iDstTy] = srcInBounds[iSrcTy];
+            return success();
+          },
+          [&](int64_t iSrcTy) {
+            // Dimension of length 1 must always be in bounds.
+            return srcInBounds[iSrcTy] ? success() : failure();
+          })))
+    return failure();
+
+  return ArrayAttr::get(
+      C, llvm::map_to_vector(dstInBounds, [C](bool b) -> Attribute {
+        return BoolAttr::get(C, b);
+      }));
 }
 
 // Fold transfer write and the input shape cast that removes/inserts
@@ -70,25 +135,24 @@ struct FoldReadShapeCast : public OpRewritePattern<vector::TransferReadOp> {
     if (op.isMasked())
       return failure();
 
-    if (op.hasOutOfBoundsDim())
-      return failure();
-
     auto reshape = dyn_cast<vector::ShapeCastOp>(*op->user_begin());
     if (!reshape)
       return failure();
 
     VectorType srcTy = reshape.getSourceVectorType();
     VectorType dstTy = reshape.getResultVectorType();
-    auto oldPermMap = op.getPermutationMap();
-    auto newAffineMap = getAffineMapAfterReshape(rewriter.getContext(),
-                                                 oldPermMap, srcTy, dstTy);
-    if (failed(newAffineMap))
-      return LogicalResult(newAffineMap);
+    auto dstAffineMap = getAffineMapAfterReshape(
+        rewriter.getContext(), op.getPermutationMap(), srcTy, dstTy);
+    if (failed(dstAffineMap))
+      return LogicalResult(dstAffineMap);
+    auto dstInBoundsAttr = getInBoundsAfterReshape(
+        rewriter.getContext(), op.getInBoundsAttr(), srcTy, dstTy);
+    if (failed(dstInBoundsAttr))
+      return LogicalResult(dstInBoundsAttr);
 
     auto newReadOp = vector::TransferReadOp::create(
         rewriter, op.getLoc(), reshape.getType(), op.getBase(), op.getIndices(),
-        *newAffineMap, op.getPadding(), op.getMask(),
-        rewriter.getBoolArrayAttr(SmallVector(dstTy.getRank(), true)));
+        *dstAffineMap, op.getPadding(), op.getMask(), *dstInBoundsAttr);
     rewriter.replaceOp(op, newReadOp);
 
     return success();
