@@ -225,6 +225,7 @@ class CPUBackend(BaseBackend):
 
         if self.cpu_arch == 'riscv64' and 'v' in self.cpu_features:
             cpu.passes.ttcpuir.add_convert_dot_to_rvv(pm)
+            cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
 
         cpu.passes.ttcpuir.add_convert_dot_generic(pm)
         promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features 

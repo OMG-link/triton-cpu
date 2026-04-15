@@ -43,6 +43,11 @@ bool isTransposedTransfer(VectorTransferOpInterface op) {
     LDBG("  Skipped: 'rank != 2'");
     return false;
   }
+  if (op.getVectorType().getDimSize(0) <= 1 &&
+      op.getVectorType().getScalableDims()[0] == false) {
+    LDBG("  Skipped: size of first dimension should be at least 2");
+    return false;
+  }
   auto memRefTy = dyn_cast<MemRefType>(op.getBase().getType());
   if (!memRefTy) {
     LDBG("  Skipped: '!memRefTy'");

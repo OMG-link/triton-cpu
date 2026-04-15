@@ -2,11 +2,18 @@
 
 #include "cpu/include/TritonCPUTransforms/Passes.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/TritonCPU/IR/Dialect.h"
 
-#include "mlir/Conversion/LLVMCommon/Pattern.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/Support/FormatVariadic.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Location.h"
+#include "mlir/IR/Operation.h"
+#include "llvm/ADT/ArrayRef.h"
 
 namespace mlir {
 namespace triton {
@@ -39,12 +46,10 @@ struct RvvDotOpCandidate {
   // The way we do GEMM. Support: outer-product(OUTER), inner-product(INNER)
   DotStyle dotStyle;
 
-  // Memory buffer holding LHS. Can be empty if LHS is not a result of a
-  // simple load.
-  MemBuffer lhsBuf;
-  // Memory buffer holding RHS. Can be empty if RHS is not a result of a
-  // simple load.
-  MemBuffer rhsBuf;
+  // TransferReadOps that read input matrix.
+  // If any operand of dot is not a TransferReadOp, it will be stored to a
+  // temporary buffer and read out using TransferReadOp.
+  vector::TransferReadOp lhsReadOp, rhsReadOp;
 };
 
 // Check if input types are same, and if output elemets types are same with
@@ -109,14 +114,28 @@ bool checkInputShapes(VectorType lhsTy, VectorType resTy,
   return true;
 }
 
+vector::TransferReadOp findInputTransferRead(Value inputMat) {
+  if (auto transferReadOp =
+          dyn_cast<vector::TransferReadOp>(inputMat.getDefiningOp())) {
+    // FIXME: We should check if data over tramsfer_read.base may be overwriiten
+    // between transfer_read and dot. If so, this transfer_read is invalid.
+    return transferReadOp;
+  }
+  // Return an empty op which will be replaced later.
+  // We can't return an op that reads from temporary buffer because we don't
+  // have a rewriter here.
+  return vector::TransferReadOp();
+}
+
 // Returns the first dimension with stride 1, which is usually considered as
 // 'lowest' dimention.
+// The result would be -1 if no dimension with stride 1 were found.
 int64_t findLowestDim(MemRefType memRefType) {
   llvm::SmallVector<int64_t, 8> strides;
   int64_t offset = 0;
   if (succeeded(memRefType.getStridesAndOffset(strides, offset))) {
     // Find the dimension with stride 1
-    int64_t lowestDim = 0;
+    int64_t lowestDim = -1;
     for (size_t i = 0; i < strides.size(); ++i) {
       int64_t s = strides[i];
       if (s == 1) {
@@ -126,52 +145,64 @@ int64_t findLowestDim(MemRefType memRefType) {
     }
     return lowestDim;
   } else {
-    // Failed to get strides? Don't know what happened.
-    // Return the last dimension as default.
-    return memRefType.getRank() - 1;
+    return -1;
   }
 }
 
-int64_t findLowestDim(const MemBuffer &buf) {
-  if (buf.empty()) {
+/**
+ * Finds the dimension of the result of TransferReadOp that was read
+ * contiguously from memory.
+ *
+ * returns:
+ *  - -1 if the result is unknown
+ *  - any non-negative number indicating that the target dimension is the
+ *    result-th FROM THE END (0-based)
+ */
+int64_t findLowestDim(vector::TransferReadOp transferReadOp) {
+  if (!transferReadOp) {
     // storeToTempBuffer will make the last dimension continuous.
-    return static_cast<int64_t>(buf.indices.size()) - 1;
+    return 0;
   }
 
-  auto memRefType = dyn_cast<MemRefType>(buf.memRef.getType());
+  auto memRefType = dyn_cast<MemRefType>(transferReadOp.getBase().getType());
   if (!memRefType) {
     // Don't know how to find lowest dimension if memref is not memref.
-    return static_cast<int64_t>(buf.indices.size()) - 1;
+    // Return -1 that represents unknown.
+    return -1;
   }
 
-  int64_t lowestDim = findLowestDim(memRefType);
-  int64_t totalDim = memRefType.getRank();
-
-  // Process buf.transposed
-  if (lowestDim == totalDim - 1 && buf.transposed) {
-    lowestDim = totalDim - 2;
-  } else if (lowestDim == totalDim - 2 && buf.transposed) {
-    lowestDim = totalDim - 1;
+  // Firstly find the lowest dimension of memref
+  int64_t memLowestDim = findLowestDim(memRefType);
+  if (memLowestDim == -1) {
+    return -1;
   }
 
-  return lowestDim;
+  // Then find a dimension that was permuted to memLowestDim
+  auto permMap = transferReadOp.getPermutationMap();
+  auto memLowestDimExpr =
+      mlir::getAffineDimExpr(memLowestDim, permMap.getContext());
+  auto vecLowestDim = permMap.getResultPosition(memLowestDimExpr);
+
+  if (vecLowestDim.has_value()) {
+    return transferReadOp.getType().getRank() - vecLowestDim.value() - 1;
+  } else {
+    return -1;
+  }
 }
 
 // Determine dot style by input data layout.
 void determineDotStyle(Value a, Value b, RvvDotOpCandidate &candidate) {
-  candidate.lhsBuf = findInputBuffer(a, true);
-  candidate.rhsBuf = findInputBuffer(b, true);
-  int64_t lhsLowestDim =
-      findLowestDim(candidate.lhsBuf) - candidate.lhsBuf.indices.size();
-  int64_t rhsLowestDim =
-      findLowestDim(candidate.rhsBuf) - candidate.rhsBuf.indices.size();
-  if (rhsLowestDim == -1) {
+  candidate.lhsReadOp = findInputTransferRead(a);
+  candidate.rhsReadOp = findInputTransferRead(b);
+  int64_t lhsLowestDim = findLowestDim(candidate.lhsReadOp);
+  int64_t rhsLowestDim = findLowestDim(candidate.rhsReadOp);
+  if (rhsLowestDim == 0) {
     // When the last dimension of right operand(N) is continuous, we use
     // outer-product GEMM.
     LDBG("Last dimension of right operand is continuous. "
          "Recommend outer-product GEMM.");
     candidate.dotStyle = OUTER;
-  } else if (rhsLowestDim == -2 && lhsLowestDim == -1) {
+  } else if (rhsLowestDim == 1 && lhsLowestDim == 0) {
     // When the penultimate dimension of right operand(K) and the last dimension
     // of left operand(K) is continuous, we use inner-product GEMM.
     LDBG("Penultimate dimension of right operand is continuous and "
@@ -218,132 +249,93 @@ bool isRvvCandidate(cpu::DotOp op, RvvDotOpCandidate &candidate) {
   return true;
 }
 
-SmallVector<Value> shiftIndices(Location loc, ArrayRef<Value> indices,
-                                bool transposed, Value m, Value n,
-                                PatternRewriter &rewriter) {
-  SmallVector<Value> res(indices.begin(), indices.end() - 2);
-  if (transposed)
-    std::swap(m, n);
-  res.push_back(op_addi(*(indices.end() - 2), m));
-  res.push_back(op_addi(*(indices.end() - 1), n));
-  return res;
+/**
+ * Load a sub matrix of the given main matrix.
+ *
+ * @param mainReadOp: the given main matrix
+ * @param subShape: shape of sub matrix
+ * @param subIndices: offsets relative to the main matrix
+ */
+Value loadSubMat(PatternRewriter &rewriter, Location loc,
+                 vector::TransferReadOp mainReadOp, VectorType subMatTy,
+                 ArrayRef<Value> subIndices, ArrayRef<bool> subInBounds) {
+  assert(subIndices.size() == mainReadOp.getType().getRank());
+  assert(subInBounds.size() == mainReadOp.getType().getRank());
+
+  auto permMap = mainReadOp.getPermutationMap();
+
+  // Add offset relative to the main matrix
+  SmallVector<Value> mainOffIndices(mainReadOp.getIndices());
+  for (int i = 0; i < subIndices.size(); i++) {
+    auto expr = permMap.getResult(i);
+    if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+      int64_t memDim = dimExpr.getPosition();
+      mainOffIndices[memDim] = arith::AddIOp::create(
+          rewriter, loc, mainOffIndices[memDim], subIndices[i]);
+    } else if (auto constantExpr = dyn_cast<AffineConstantExpr>(expr)) {
+      int64_t constant = constantExpr.getValue();
+      assert(constant == 0);
+      assert(subMatTy.getDimSize(i) == 1);
+    } else {
+      assert(false && "Don't know how to process this permutation map");
+    }
+  }
+
+  // Apply inbounds attribute
+  auto mainOffInBounds = mainReadOp.getInBoundsValues();
+  for (int i = 0; i < subInBounds.size(); i++) {
+    mainOffInBounds[i] = (mainOffInBounds[i] & subInBounds[i]);
+  }
+
+  // Create new TransferReadOp
+  auto mainOffInBoundsAttr = rewriter.getBoolArrayAttr(mainOffInBounds);
+  auto subReadOp = vector::TransferReadOp::create(
+      rewriter, loc, subMatTy, mainReadOp.getBase(), mainOffIndices, permMap,
+      mainReadOp.getPadding(), mainReadOp.getMask(), mainOffInBoundsAttr);
+
+  return subReadOp;
 }
 
-SmallVector<Value> shiftIndices(Location loc, const MemBuffer &buf, Value m,
-                                Value n, PatternRewriter &rewriter) {
-  return shiftIndices(loc, buf.indices, buf.transposed, m, n, rewriter);
+// Load mat[m, n] directly from memory.
+Value loadScalar(PatternRewriter &rewriter, Location loc,
+                 vector::TransferReadOp matReadOp, Value m, Value n) {
+  auto subMatTy = VectorType::get(ArrayRef<int64_t>({1, 1}),
+                                  matReadOp.getType().getElementType());
+  auto mat = loadSubMat(rewriter, loc, matReadOp, subMatTy,
+                        ArrayRef<Value>{m, n}, ArrayRef<bool>{true, true});
+  auto scalar =
+      vector::ExtractOp::create(rewriter, loc, mat, ArrayRef<int64_t>({0, 0}));
+  return scalar;
 }
 
-Value loadScalar(PatternRewriter &rewriter, Location loc, const MemBuffer &buf,
-                 Value m, Value n) {
-  SmallVector<Value> indices = shiftIndices(loc, buf, m, n, rewriter);
-  return memref::LoadOp::create(rewriter, loc, buf.memRef, indices);
-}
-
-// Load vector at memRef[indices].
-// Result vector has type resTy, and will be read along the resDim-th dimesion.
-Value loadVec(PatternRewriter &rewriter, Location loc, VectorType resTy,
-              int64_t resDim, Value resLen, const Value &memRef,
-              ValueRange indices) {
+Value loadRow(PatternRewriter &rewriter, Location loc,
+              vector::TransferReadOp matReadOp, Value m, Value n,
+              VectorType resTy, bool inBounds) {
   assert(resTy.getRank() == 1);
-  AffineExpr resDimAffineExpr = rewriter.getAffineDimExpr(resDim);
-  AffineMap affineMap = AffineMap::get(indices.size(), 0, resDimAffineExpr);
-  Value padding = LLVM::UndefOp::create(rewriter, loc, resTy.getElementType());
-  VectorType maskType = resTy.cloneWith(std::nullopt, rewriter.getI1Type());
-  Value mask = vector::CreateMaskOp::create(rewriter, loc, maskType, resLen);
-  ArrayAttr inBounds = rewriter.getBoolArrayAttr({true});
-  return vector::TransferReadOp::create(rewriter, loc, resTy, memRef, indices,
-                                        affineMap, padding, mask, inBounds);
+  assert(resTy.getElementType() == matReadOp.getType().getElementType());
+  auto subMatTy = VectorType::get(ArrayRef<int64_t>({1, resTy.getDimSize(0)}),
+                                  matReadOp.getType().getElementType(),
+                                  ArrayRef<bool>({false, resTy.isScalable()}));
+  auto mat =
+      loadSubMat(rewriter, loc, matReadOp, subMatTy, ArrayRef<Value>({m, n}),
+                 ArrayRef<bool>({true, inBounds}));
+  auto vec = vector::ShapeCastOp::create(rewriter, loc, resTy, mat);
+  return vec;
 }
 
-Value loadRow(PatternRewriter &rewriter, Location loc, VectorType resTy,
-              Value resLen, const MemBuffer &buf, const Value &off2,
-              const Value &off1) {
-  assert(buf.indices.size() >= 2);
-  int64_t resDim;
-  SmallVector<Value> indices = buf.indices;
-  if (buf.transposed) {
-    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off2);
-    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off1);
-    resDim = static_cast<int64_t>(buf.indices.size()) - 2;
-  } else {
-    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off1);
-    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off2);
-    resDim = static_cast<int64_t>(buf.indices.size()) - 1;
-  }
-  return loadVec(rewriter, loc, resTy, resDim, resLen, buf.memRef, indices);
-}
-
-Value loadCol(PatternRewriter &rewriter, Location loc, VectorType resTy,
-              Value resLen, const MemBuffer &buf, const Value &off2,
-              const Value &off1) {
-  assert(buf.indices.size() >= 2);
-  int64_t resDim;
-  SmallVector<Value> indices = buf.indices;
-  if (buf.transposed) {
-    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off2);
-    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off1);
-    resDim = static_cast<int64_t>(buf.indices.size()) - 1;
-  } else {
-    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off1);
-    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off2);
-    resDim = static_cast<int64_t>(buf.indices.size()) - 2;
-  }
-  return loadVec(rewriter, loc, resTy, resDim, resLen, buf.memRef, indices);
-}
-
-SmallVector<Value> loadRows(Location loc, VectorType rowTy, int64_t rowNum,
-                            Value colNum, const MemBuffer &buf,
-                            const Value &subVecOff, PatternRewriter &rewriter) {
-  SmallVector<Value> vecs;
-  vecs.reserve(rowNum);
-  for (int64_t m = 0; m < rowNum; ++m) {
-    Value cIndex_m = index_cst(m);
-    vecs.push_back(
-        loadRow(rewriter, loc, rowTy, colNum, buf, cIndex_m, subVecOff));
-  }
-  return vecs;
-}
-
-void storeVec(PatternRewriter &rewriter, Location loc, Value vec,
-              int64_t resDim, Value resLen, const Value &memRef,
-              ValueRange indices) {
-  VectorType vecTy = cast<VectorType>(vec.getType());
-  assert(vecTy.getRank() == 1);
-  AffineExpr resDimAffineExpr = rewriter.getAffineDimExpr(resDim);
-  AffineMap affineMap = AffineMap::get(indices.size(), 0, resDimAffineExpr);
-  AffineMapAttr affineMapAttr = AffineMapAttr::get(affineMap);
-  ArrayAttr inBounds = rewriter.getBoolArrayAttr({true});
-  VectorType maskType = vecTy.cloneWith(std::nullopt, rewriter.getI1Type());
-  Value mask = vector::CreateMaskOp::create(rewriter, loc, maskType, resLen);
-  vector::TransferWriteOp::create(rewriter, loc, vec, memRef, indices,
-                                  affineMapAttr, mask, inBounds);
-}
-
-void storeRow(PatternRewriter &rewriter, Location loc, Value vec, Value resLen,
-              const MemBuffer &buf, const Value &off2, const Value &off1) {
-  assert(buf.indices.size() >= 2);
-  int64_t resDim;
-  SmallVector<Value> indices = buf.indices;
-  if (buf.transposed) {
-    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off2);
-    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off1);
-    resDim = static_cast<int64_t>(buf.indices.size()) - 2;
-  } else {
-    indices[indices.size() - 1] = op_addi(indices[indices.size() - 1], off1);
-    indices[indices.size() - 2] = op_addi(indices[indices.size() - 2], off2);
-    resDim = static_cast<int64_t>(buf.indices.size()) - 1;
-  }
-  storeVec(rewriter, loc, vec, resDim, resLen, buf.memRef, indices);
-}
-
-void storeRows(Location loc, const MemBuffer &buf, ArrayRef<Value> vecs,
-               Value colNum, const Value &subVecOff,
-               PatternRewriter &rewriter) {
-  for (size_t m = 0; m < vecs.size(); ++m) {
-    Value cIndex_m = index_cst(static_cast<int64_t>(m));
-    storeRow(rewriter, loc, vecs[m], colNum, buf, cIndex_m, subVecOff);
-  }
+Value loadCol(PatternRewriter &rewriter, Location loc,
+              vector::TransferReadOp matReadOp, Value m, Value n,
+              VectorType resTy, bool inBounds) {
+  assert(resTy.getRank() == 1);
+  assert(resTy.getElementType() == matReadOp.getType().getElementType());
+  auto subMatTy = VectorType::get(ArrayRef<int64_t>({resTy.getDimSize(0), 1}),
+                                  matReadOp.getType().getElementType(),
+                                  ArrayRef<bool>({resTy.isScalable(), false}));
+  auto mat =
+      loadSubMat(rewriter, loc, matReadOp, subMatTy, ArrayRef<Value>({m, n}),
+                 ArrayRef<bool>({inBounds, true}));
+  auto vec = vector::ShapeCastOp::create(rewriter, loc, resTy, mat);
+  return vec;
 }
 
 /**
@@ -412,8 +404,8 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
                                         PatternRewriter &rewriter,
                                         MemBuffer accBuf, bool isAccZeroInit) {
   cpu::DotOp dotOp = candidate.op;
-  MemBuffer lhsBuf = candidate.lhsBuf;
-  MemBuffer rhsBuf = candidate.rhsBuf;
+  vector::TransferReadOp lhsReadOp = candidate.lhsReadOp;
+  vector::TransferReadOp rhsReadOp = candidate.rhsReadOp;
   Type inputElemTy = candidate.inputElemTy;
   Type outputElemTy = candidate.outputElemTy;
   int64_t mat_m = candidate.m;
@@ -437,32 +429,46 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
 
   VectorType outputMatTy = cast<VectorType>(dotOp.getC().getType());
   VectorType inputSubVecTy, outputSubVecTy;
+  VectorType inputSubMatTy, outputSubMatTy;
   if (auto vscaleDefOp = vscale.getDefiningOp<arith::ConstantIndexOp>()) {
     inputSubVecTy = VectorType::get({baseVlmax * vscaleDefOp.value()},
                                     inputElemTy, {false});
     outputSubVecTy = VectorType::get({baseVlmax * vscaleDefOp.value()},
                                      outputElemTy, {false});
+    inputSubMatTy = VectorType::get({mat_m, baseVlmax * vscaleDefOp.value()},
+                                    inputElemTy, {false, false});
+    outputSubMatTy = VectorType::get({mat_m, baseVlmax * vscaleDefOp.value()},
+                                     outputElemTy, {false, false});
   } else {
     inputSubVecTy = VectorType::get({baseVlmax}, inputElemTy, {true});
     outputSubVecTy = VectorType::get({baseVlmax}, outputElemTy, {true});
+    inputSubMatTy =
+        VectorType::get({mat_m, baseVlmax}, inputElemTy, {false, true});
+    outputSubMatTy =
+        VectorType::get({mat_m, baseVlmax}, outputElemTy, {false, true});
   }
 
   // We will do GEMM by multiplying an <M x 1> vector with an <1 x N> vector.
   // To do so, we multiply <1 x 1> scalar with <1 x N> vector.
   // As N is given by the user, it can be too large for single vector register.
-  // We need to divide <1 x N> vector into <1 x VL> one, where VL is the number
-  // of elements single vector register can hold.
+  // We need to divide <1 x N> vector into <1 x VLMAX> one, where VLMAX is the
+  // number of elements single vector register can hold.
 
-  // Code generator that computes <M x K> x <K x VL>.
-  auto genForBodyN = [&](Value iv, Value vl) {
+  // Code generator that computes <M x K> x <K x VLMAX>.
+  auto genForBodyN = [&](Value iv, bool inBounds) {
     Value subVecOff = op_muli(iv, vlmax);
 
-    SmallVector<Value> accVecs;
+    SmallVector<Value> accIndices = accBuf.indices;
+    accIndices[1] =
+        arith::AddIOp::create(rewriter, loc, accIndices[1], subVecOff);
+
+    Value accMat;
     if (isAccZeroInit) {
-      accVecs.resize(mat_m);
+      accMat = ub::PoisonOp::create(rewriter, loc, outputSubMatTy);
     } else {
-      accVecs =
-          loadRows(loc, outputSubVecTy, mat_m, vl, accBuf, subVecOff, rewriter);
+      accMat = vector::TransferReadOp::create(
+          rewriter, loc, outputSubMatTy, accBuf.memRef, accIndices,
+          std::nullopt, ArrayRef<bool>({true, inBounds}));
     }
 
     auto doMul = [&](Value lhsScalar, Value rhsVec) -> Value {
@@ -502,58 +508,42 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
       }
     };
 
-    // k = 0
-    {
-      Value cIndex_k = index_cst(0);
-      Value rhsVec = loadRow(rewriter, loc, inputSubVecTy, vl, rhsBuf, cIndex_k,
-                             subVecOff);
+    for (int64_t k = 0; k < mat_k; k++) {
+      Value cIndex_k = index_cst(k);
+      Value rhsVec = loadRow(rewriter, loc, rhsReadOp, cIndex_k, subVecOff,
+                             inputSubVecTy, inBounds);
       for (int64_t m = 0; m < mat_m; ++m) {
         Value lhsScalar =
-            loadScalar(rewriter, loc, lhsBuf, index_cst(m), cIndex_k);
-        if (isAccZeroInit) {
-          accVecs[m] = doMul(lhsScalar, rhsVec);
+            loadScalar(rewriter, loc, lhsReadOp, index_cst(m), cIndex_k);
+        Value newAccVec;
+        if (isAccZeroInit && k == 0) {
+          newAccVec = doMul(lhsScalar, rhsVec);
         } else {
-          accVecs[m] = doMacc(accVecs[m], lhsScalar, rhsVec);
+          Value oldAccVec = vector::ExtractOp::create(rewriter, loc, accMat, m);
+          newAccVec = doMacc(oldAccVec, lhsScalar, rhsVec);
         }
+        accMat = vector::InsertOp::create(rewriter, loc, newAccVec, accMat, m);
       }
     }
-
-    // for k in [1, mat_k)
-    auto forOpK = scf::ForOp::create(rewriter, loc, index_cst(1),
-                                     index_cst(mat_k), index_cst(1), accVecs);
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(forOpK.getBody());
-
-      Value cIndex_k = forOpK.getInductionVar();
-      Value rhsVec = loadRow(rewriter, loc, inputSubVecTy, vl, rhsBuf, cIndex_k,
-                             subVecOff);
-
-      SmallVector<Value> accVecs(mat_m);
-      for (int64_t m = 0; m < mat_m; ++m) {
-        Value lhsScalar =
-            loadScalar(rewriter, loc, lhsBuf, index_cst(m), cIndex_k);
-        accVecs[m] = doMacc(forOpK.getRegionIterArg(m), lhsScalar, rhsVec);
-      }
-      scf::YieldOp::create(rewriter, loc, accVecs);
-    } // end of for-op-k
-    accVecs = forOpK.getResults();
-    storeRows(loc, accBuf, accVecs, vl, subVecOff, rewriter);
+    vector::TransferWriteOp::create(rewriter, loc, accMat, accBuf.memRef,
+                                    accIndices,
+                                    ArrayRef<bool>({true, inBounds}));
   };
 
-  // Divide <K x N> vector into <K x VL> ones.
+  // Divide <K x N> vector into <K x VLMAX> ones.
   // We do this first to achieve the best performance.
   Value numSubVec =
       arith::DivSIOp::create(rewriter, loc, index_cst(mat_n), vlmax);
   auto forOpN =
       scf::ForOp::create(rewriter, loc, index_cst(0), numSubVec, index_cst(1));
-  // Process each <M x K> x <K x VL> sub-matrix-product.
+  // Process each <M x K> x <K x VLMAX> sub-matrix-product.
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(forOpN.getBody());
-    genForBodyN(forOpN.getInductionVar(), vlmax);
+    genForBodyN(forOpN.getInductionVar(), true);
   }
-  // Process the remaining <K x (N % VL)> vector if N is not multiple of VL.
+  // Process the remaining <K x (N % VLMAX)> vector if N is not a multiple of
+  // VLMAX.
   Value nModVl = arith::RemSIOp::create(rewriter, loc, index_cst(mat_n), vlmax);
   auto ifOp = scf::IfOp::create(rewriter, loc,
                                 arith::CmpIOp::create(rewriter, loc,
@@ -563,7 +553,7 @@ LogicalResult convertToOuterProductGemm(RvvDotOpCandidate &candidate,
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(ifOp.getBody());
-    genForBodyN(numSubVec, nModVl);
+    genForBodyN(numSubVec, false);
   }
 
   // The result is in accBuf. We should load it and replace the original
@@ -578,8 +568,8 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
                                         PatternRewriter &rewriter,
                                         MemBuffer accBuf, bool isAccZeroInit) {
   cpu::DotOp dotOp = candidate.op;
-  MemBuffer lhsBuf = candidate.lhsBuf;
-  MemBuffer rhsBuf = candidate.rhsBuf;
+  vector::TransferReadOp lhsReadOp = candidate.lhsReadOp;
+  vector::TransferReadOp rhsReadOp = candidate.rhsReadOp;
   Type inputElemTy = candidate.inputElemTy;
   Type outputElemTy = candidate.outputElemTy;
   int64_t mat_m = candidate.m;
@@ -617,27 +607,29 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
   const int64_t MR = 4;
   const int64_t NR = 4;
 
-  for (int64_t m = 0; m < mat_m; m += MR) {
-    for (int64_t n = 0; n < mat_n; n += NR) {
-      const int mr = std::min(MR, mat_m - m);
-      const int nr = std::min(NR, mat_n - n);
+  for (int64_t i_mr = 0; i_mr < mat_m; i_mr += MR) {
+    for (int64_t i_nr = 0; i_nr < mat_n; i_nr += NR) {
+      const int mr = std::min(MR, mat_m - i_mr);
+      const int nr = std::min(NR, mat_n - i_nr);
 
       SmallVector<Value, MR * NR> sumVecs(
           mr * nr, arith::ConstantOp::create(
                        rewriter, loc, rewriter.getZeroAttr(outputSubVecTy)));
 
-      auto genForBodyK = [&](Value iv, Value vl) {
+      auto genForBodyK = [&](Value iv, bool inBounds) {
         Value subVecOff = op_muli(iv, vlmax);
         // Get operands
         SmallVector<Value, MR> lhsVecs(mr);
         SmallVector<Value, NR> rhsVecs(nr);
-        for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
-          lhsVecs[i_mr] = loadRow(rewriter, loc, inputSubVecTy, vl, lhsBuf,
-                                  index_cst(m + i_mr), subVecOff);
+        for (int64_t i_m = 0; i_m < mr; i_m++) {
+          lhsVecs[i_m] =
+              loadRow(rewriter, loc, lhsReadOp, index_cst(i_mr + i_m),
+                      subVecOff, inputSubVecTy, inBounds);
         }
-        for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
-          rhsVecs[i_nr] = loadCol(rewriter, loc, inputSubVecTy, vl, rhsBuf,
-                                  subVecOff, index_cst(n + i_nr));
+        for (int64_t i_n = 0; i_n < nr; i_n++) {
+          rhsVecs[i_n] =
+              loadCol(rewriter, loc, rhsReadOp, subVecOff,
+                      index_cst(i_nr + i_n), inputSubVecTy, inBounds);
         }
         // Update sumVec
         SmallVector<Value, MR * NR> newSumVecs(mr * nr);
@@ -675,7 +667,7 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
         rewriter.setInsertionPointToStart(forOp.getBody());
         sumVecs.assign(forOp.getRegionIterArgs().begin(),
                        forOp.getRegionIterArgs().end());
-        genForBodyK(forOp.getInductionVar(), vlmax);
+        genForBodyK(forOp.getInductionVar(), true);
       }
       sumVecs = forOp.getResults();
       // for k in [mat_k / vlmax * vlmax, mat_k)
@@ -692,7 +684,7 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
       {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(ifOp.thenBlock());
-        genForBodyK(numSubVec, kModVl);
+        genForBodyK(numSubVec, false);
       }
       {
         OpBuilder::InsertionGuard guard(rewriter);
@@ -702,24 +694,29 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
       sumVecs = ifOp.getResults();
 
       // Reduction: Sum the accumulated results horizontally.
-      for (int64_t i_mr = 0; i_mr < mr; i_mr++) {
-        for (int64_t i_nr = 0; i_nr < nr; i_nr++) {
-          const int64_t id_region_iter = i_mr * nr + i_nr;
+      for (int64_t i_m = 0; i_m < mr; i_m++) {
+        for (int64_t i_n = 0; i_n < nr; i_n++) {
+          const int64_t id_region_iter = i_m * nr + i_n;
           Value newRedSum;
           if (isAccZeroInit) {
             newRedSum = vector::ReductionOp::create(rewriter, loc,
                                                     vector::CombiningKind::ADD,
                                                     sumVecs[id_region_iter]);
           } else {
-            Value redsum = loadScalar(rewriter, loc, accBuf,
-                                      index_cst(m + i_mr), index_cst(n + i_nr));
+            SmallVector<Value> indices = accBuf.indices;
+            indices[0] = arith::AddIOp::create(rewriter, loc, indices[0],
+                                               index_cst(i_mr + i_m));
+            indices[1] = arith::AddIOp::create(rewriter, loc, indices[1],
+                                               index_cst(i_nr + i_n));
+            Value redsum =
+                memref::LoadOp::create(rewriter, loc, accBuf.memRef, indices);
             newRedSum = vector::ReductionOp::create(
                 rewriter, loc, vector::CombiningKind::ADD,
                 sumVecs[id_region_iter], redsum);
           }
           resMat = vector::InsertOp::create(
               rewriter, loc, newRedSum, resMat,
-              SmallVector<int64_t>({m + i_mr, n + i_nr}));
+              SmallVector<int64_t>({i_mr + i_m, i_nr + i_n}));
         }
       }
     }
@@ -727,6 +724,23 @@ LogicalResult convertToInnerProductGemm(RvvDotOpCandidate &candidate,
 
   rewriter.replaceOp(dotOp, resMat);
   return success();
+}
+
+vector::TransferReadOp storeToTmpBufferAndRead(PatternRewriter &rewriter,
+                                               Location loc,
+                                               Operation *allocaPoint,
+                                               cpu::DotOp dotOp, Value mat) {
+  auto matTy = cast<VectorType>(mat.getType());
+  auto buffer = allocateTmpBufferStack(loc, matTy, allocaPoint, rewriter);
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(dotOp);
+  auto writeOp = vector::TransferWriteOp::create(rewriter, loc, mat,
+                                                 buffer.memRef, buffer.indices);
+  auto readOp = vector::TransferReadOp::create(
+      rewriter, loc, matTy, buffer.memRef, buffer.indices, std::nullopt);
+
+  return readOp;
 }
 
 LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
@@ -738,14 +752,14 @@ LogicalResult convertRvvCandidate(RvvDotOpCandidate &candidate,
   while (!isa<triton::FuncOp>(allocaPoint->getParentOp()))
     allocaPoint = allocaPoint->getParentOp();
 
-  if (candidate.lhsBuf.empty()) {
-    Value lhs = op.getA();
-    candidate.lhsBuf = storeToTmpBuffer(loc, lhs, allocaPoint, rewriter);
+  if (!candidate.lhsReadOp) {
+    candidate.lhsReadOp =
+        storeToTmpBufferAndRead(rewriter, loc, allocaPoint, op, op.getA());
   }
 
-  if (candidate.rhsBuf.empty()) {
-    Value rhs = op.getB();
-    candidate.rhsBuf = storeToTmpBuffer(loc, rhs, allocaPoint, rewriter);
+  if (!candidate.rhsReadOp) {
+    candidate.rhsReadOp =
+        storeToTmpBufferAndRead(rewriter, loc, allocaPoint, op, op.getB());
   }
 
   Value acc = op.getC();
@@ -793,13 +807,11 @@ struct ConvertDotToRVV
                                                               : "OUTER"));
           LDBG("  InputElemTy: " << candidate.inputElemTy);
           LDBG("  OutputElemTy: " << candidate.outputElemTy);
-          if (!candidate.lhsBuf.empty()) {
-            LDBG("  LhsBuf: " << candidate.lhsBuf.memRef);
-            LDBG("  Transposed: " << candidate.lhsBuf.transposed);
+          if (candidate.lhsReadOp) {
+            LDBG("  LhsReadOp: " << candidate.lhsReadOp);
           }
-          if (!candidate.rhsBuf.empty()) {
-            LDBG("  RhsBuf: " << candidate.rhsBuf.memRef);
-            LDBG("  Transposed: " << candidate.rhsBuf.transposed);
+          if (candidate.rhsReadOp) {
+            LDBG("  RhsReadOp: " << candidate.rhsReadOp);
           }
         });
         candidates.push_back(candidate);
